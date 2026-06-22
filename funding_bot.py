@@ -467,7 +467,6 @@ class FundingBot:
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_donors_segment ON donors(segment)"
         )
-        self._ensure_column("donors", "segment", "TEXT NOT NULL DEFAULT 'unknown'")
         self.connection.commit()
 
     # Allowlist of table/column identifiers that _ensure_column is permitted to touch.

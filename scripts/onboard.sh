@@ -130,7 +130,7 @@ fi
 
 # ── Step 4: Run tests ────────────────────────────────────────────────────────
 info "Running test suite…"
-if python3 -m unittest discover -s tests -q 2>&1 | grep -q "OK"; then
+if python3 -m unittest discover -s tests -q 2>&1; then
   success "All tests passed."
 else
   warn "Some tests failed — check output above before proceeding to production."
