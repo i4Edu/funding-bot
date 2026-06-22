@@ -1,0 +1,15 @@
+# Persistent storage shared by the web deployment and daily summary job.
+# Adjust the storage class and size to match your cluster defaults.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: funding-bot-data
+  namespace: funding-bot
+  labels:
+    app: funding-bot
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi

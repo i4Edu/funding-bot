@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Nonprofit Funding Bot Dashboard</title>
+    <link
+      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
+      rel="stylesheet"
+      integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
+      crossorigin="anonymous"
+    >
+  </head>
+  <body class="bg-light">
+    <nav class="navbar navbar-expand-lg navbar-dark bg-success shadow-sm">
+      <div class="container-fluid">
+        <span class="navbar-brand mb-0 h1">Nonprofit Funding Bot</span>
+        <span class="navbar-text text-white-50">Role: {{ current_role }}</span>
+      </div>
+    </nav>
+
+    <main class="container py-4">
+      <div class="row g-4 mb-4">
+        <div class="col-md-6 col-xl-3">
+          <div class="card border-0 shadow-sm h-100">
+            <div class="card-body">
+              <h2 class="h6 text-muted">New Opportunities</h2>
+              <p class="display-6 mb-1">{{ new_opportunities_count }}</p>
+              <p class="text-muted mb-0">Found in the last 7 days</p>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-6 col-xl-3">
+          <div class="card border-0 shadow-sm h-100">
+            <div class="card-body">
+              <h2 class="h6 text-muted">Applications Submitted</h2>
+              <p class="display-6 mb-1">{{ applications_submitted_count }}</p>
+              <p class="text-muted mb-0">Tracked in the system</p>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-6 col-xl-3">
+          <div class="card border-0 shadow-sm h-100">
+            <div class="card-body">
+              <h2 class="h6 text-muted">Pending Applications</h2>
+              <p class="display-6 mb-1">{{ pending_applications_count }}</p>
+              <p class="text-muted mb-0">Awaiting next action</p>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-6 col-xl-3">
+          <div class="card border-0 shadow-sm h-100">
+            <div class="card-body">
+              <h2 class="h6 text-muted">Donor Communications</h2>
+              <p class="display-6 mb-1">{{ donor_communications_count }}</p>
+              <p class="text-muted mb-0">Emails logged</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row g-4">
+        <div class="col-lg-8">
+          <div class="card border-0 shadow-sm">
+            <div class="card-header bg-white">
+              <h3 class="h5 mb-0">Recent Opportunities</h3>
+            </div>
+            <div class="card-body p-0">
+              <div class="table-responsive">
+                <table class="table table-hover align-middle mb-0">
+                  <thead class="table-light">
+                    <tr>
+                      <th>Title</th>
+                      <th>Donor</th>
+                      <th>Status</th>
+                      <th>Discovered</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for opportunity in recent_opportunities %}
+                    <tr>
+                      <td>{{ opportunity.title }}</td>
+                      <td>{{ opportunity.donor_name }}</td>
+                      <td>
+                        <span class="badge text-bg-secondary">
+                          {{ opportunity.status.replace('_', ' ').title() }}
+                        </span>
+                      </td>
+                      <td>{{ opportunity.discovered_at }}</td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                      <td colspan="4" class="text-center text-muted py-4">No opportunities found.</td>
+                    </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-lg-4">
+          <div class="card border-0 shadow-sm">
+            <div class="card-header bg-white">
+              <h3 class="h5 mb-0">Recent Applications</h3>
+            </div>
+            <div class="card-body">
+              <div class="list-group list-group-flush">
+                {% for application in recent_applications %}
+                <div class="list-group-item px-0">
+                  <div class="fw-semibold">{{ application.title }}</div>
+                  <div class="small text-muted">{{ application.donor_name }}</div>
+                  <div class="small mt-1">
+                    <span class="badge text-bg-primary">{{ application.status.replace('_', ' ').title() }}</span>
+                  </div>
+                  <div class="small text-muted mt-2">{{ application.submitted_at }}</div>
+                  <div class="small">{{ application.next_action }}</div>
+                </div>
+                {% else %}
+                <div class="text-muted">No applications submitted yet.</div>
+                {% endfor %}
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </main>
+  </body>
+</html>

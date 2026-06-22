@@ -1,0 +1,7 @@
+# Dedicated namespace for the funding bot workload.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: funding-bot
+  labels:
+    app: funding-bot

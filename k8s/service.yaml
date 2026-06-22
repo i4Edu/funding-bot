@@ -1,0 +1,17 @@
+# Internal service exposing the Flask web process.
+apiVersion: v1
+kind: Service
+metadata:
+  name: funding-bot
+  namespace: funding-bot
+  labels:
+    app: funding-bot
+spec:
+  type: ClusterIP
+  selector:
+    app: funding-bot
+    component: web
+  ports:
+    - name: http
+      port: 5000
+      targetPort: http

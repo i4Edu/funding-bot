@@ -9,7 +9,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
-from typing import Any, Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol
 from xml.sax.saxutils import escape
 
 
@@ -46,6 +46,145 @@ class BrowserClient(Protocol):
         attachments: Iterable[str],
     ) -> str:
         """Submit an application and return a submission reference."""
+
+
+class PortalConnector(Protocol):
+    def fetch_opportunities(self, keywords: Iterable[str]) -> list[dict[str, Any]]:
+        """Fetch opportunities from an external portal."""
+
+
+class CredentialVault(Protocol):
+    def get_secret(self, name: str) -> str:
+        """Return a secret by name."""
+
+
+class AIClient(Protocol):
+    def generate(self, prompt: str) -> str:
+        """Generate a response for the supplied prompt."""
+
+
+class EnvVarVault:
+    """Resolve secrets from environment variables."""
+
+    def get_secret(self, name: str) -> str:
+        value = os.getenv(name)
+        if value is None:
+            raise CredentialNotFoundError(f"Environment variable {name!r} is not set.")
+        return value
+
+
+class FileVault:
+    """Resolve secrets from files inside a directory."""
+
+    def __init__(self, secrets_dir: str | os.PathLike[str]) -> None:
+        self.secrets_dir = Path(secrets_dir)
+
+    def get_secret(self, name: str) -> str:
+        path = self.secrets_dir / name
+        if not path.exists():
+            raise CredentialNotFoundError(f"Secret file {str(path)!r} does not exist.")
+        return path.read_text(encoding="utf-8").strip()
+
+
+class _BasePortalConnector:
+    """Common behavior for demo portal connectors."""
+
+    source_name = "Portal"
+    base_url = "https://example.org"
+
+    def __init__(self, http_client: Callable[..., Any] | None = None) -> None:
+        self.http_client = http_client
+
+    def fetch_opportunities(self, keywords: Iterable[str]) -> list[dict[str, Any]]:
+        keyword_list = [keyword.lower() for keyword in (keywords or [])]
+        opportunities = self._fetch_remote(keyword_list) if self.http_client else self._demo_data()
+        if not keyword_list:
+            return opportunities
+
+        filtered: list[dict[str, Any]] = []
+        for opportunity in opportunities:
+            searchable = " ".join(
+                [
+                    str(opportunity.get("title", "")),
+                    str(opportunity.get("summary", "")),
+                    str(opportunity.get("category", "")),
+                    " ".join(str(tag) for tag in opportunity.get("tags", [])),
+                ]
+            ).lower()
+            if any(keyword in searchable for keyword in keyword_list):
+                filtered.append(opportunity)
+        return filtered
+
+    def _fetch_remote(self, keywords: list[str]) -> list[dict[str, Any]]:
+        response = self.http_client(self.base_url, {"keywords": keywords})
+        if isinstance(response, dict):
+            payload = response.get("opportunities", [])
+        else:
+            payload = response
+        return [dict(item) for item in payload]
+
+    def _demo_data(self) -> list[dict[str, Any]]:
+        raise NotImplementedError
+
+
+class GrantsPortalConnector(_BasePortalConnector):
+    """Stub connector for grants portals."""
+
+    source_name = "Grants Portal"
+    base_url = "https://grants.example.org/opportunities"
+
+    def _demo_data(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "source": self.source_name,
+                "donor_name": "Global Education Fund",
+                "title": "Education Innovation Grant",
+                "portal_url": "https://grants.example.org/opportunities/education-innovation",
+                "summary": "Supports nonprofit education pilots with strong local impact.",
+                "category": "Education",
+                "tags": ["education", "innovation", "grant"],
+            }
+        ]
+
+
+class CSRNetworkConnector(_BasePortalConnector):
+    """Stub connector for CSR funding networks."""
+
+    source_name = "CSR Network"
+    base_url = "https://csr.example.org/opportunities"
+
+    def _demo_data(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "source": self.source_name,
+                "donor_name": "Acme Corporate Giving",
+                "title": "CSR Digital Learning Fund",
+                "portal_url": "https://csr.example.org/opportunities/digital-learning",
+                "summary": "Corporate social responsibility funding for digital learning programs.",
+                "category": "Corporate Partnerships",
+                "tags": ["csr", "digital learning", "corporate"],
+            }
+        ]
+
+
+class NGODirectoryConnector(_BasePortalConnector):
+    """Stub connector for NGO funding directories."""
+
+    source_name = "NGO Directory"
+    base_url = "https://directory.example.org/opportunities"
+
+    def _demo_data(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "source": self.source_name,
+                "donor_name": "Community Foundation Alliance",
+                "title": "Community Literacy Matching Grant",
+                "portal_url": "https://directory.example.org/opportunities/community-literacy",
+                "summary": "Institutional support for literacy and community engagement projects.",
+                "category": "Literacy",
+                "tags": ["community", "literacy", "institutional"],
+            }
+        ]
 
 
 class SMTPEmailSender:
@@ -132,9 +271,11 @@ class FundingBot:
         db_path: str | os.PathLike[str] = ":memory:",
         *,
         trusted_sources: Iterable[str] | None = None,
+        vault: CredentialVault | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.trusted_sources = {source.lower() for source in (trusted_sources or [])}
+        self.vault = vault
         self.connection = sqlite3.connect(self.db_path)
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.row_factory = sqlite3.Row
@@ -222,9 +363,65 @@ class FundingBot:
                 action TEXT NOT NULL,
                 details_json TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS outreach_templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                subject_template TEXT NOT NULL,
+                body_template TEXT NOT NULL,
+                segment TEXT NOT NULL DEFAULT '',
+                UNIQUE(name, segment)
+            );
+
+            CREATE TABLE IF NOT EXISTS outreach_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                communication_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL,
+                happened_at TEXT NOT NULL,
+                FOREIGN KEY (communication_id) REFERENCES communications(id)
+            );
             """
         )
+        self._ensure_column("donors", "segment", "TEXT NOT NULL DEFAULT 'unknown'")
         self.connection.commit()
+
+    # Allowlist of table/column identifiers that _ensure_column is permitted to touch.
+    # All calls are internal and use literals; the allowlist is an extra safety guard.
+    _ALLOWED_ALTER_TABLES = frozenset({"donors"})
+    _ALLOWED_ALTER_COLUMNS = frozenset({"segment"})
+
+    def _ensure_column(self, table_name: str, column_name: str, definition: str) -> None:
+        if table_name not in self._ALLOWED_ALTER_TABLES:
+            raise ValueError(f"_ensure_column: table {table_name!r} not in allowlist.")
+        if column_name not in self._ALLOWED_ALTER_COLUMNS:
+            raise ValueError(f"_ensure_column: column {column_name!r} not in allowlist.")
+        # definition is a TYPE+DEFAULT expression built only from string literals in this module.
+        # Use PRAGMA table_info to check existence first, avoiding f-string SQL when possible.
+        existing_columns = {
+            row["name"]
+            for row in self.connection.execute(
+                "PRAGMA table_info(" + table_name + ")"  # table_name validated above
+            ).fetchall()
+        }
+        if column_name in existing_columns:
+            return
+        # SQLite < 3.35 does not support ADD COLUMN IF NOT EXISTS; fall back gracefully.
+        try:
+            self.connection.execute(
+                "ALTER TABLE " + table_name + " ADD COLUMN " + column_name + " " + definition
+            )
+        except sqlite3.OperationalError as exc:
+            # Column may have been added by a concurrent writer; re-check before re-raising.
+            refreshed = {
+                row["name"]
+                for row in self.connection.execute(
+                    "PRAGMA table_info(" + table_name + ")"
+                ).fetchall()
+            }
+            if column_name not in refreshed:
+                raise sqlite3.OperationalError(
+                    f"Could not add column {column_name!r} to {table_name!r}: {exc}"
+                ) from exc
 
     @staticmethod
     def _utcnow() -> datetime:
@@ -240,6 +437,38 @@ class FundingBot:
     @staticmethod
     def _to_iso(timestamp: datetime | None = None) -> str:
         return FundingBot._as_utc(timestamp).isoformat()
+
+    @staticmethod
+    def _normalize_filter_timestamp(value: datetime | str | None, *, end: bool = False) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return FundingBot._to_iso(value)
+        normalized = value
+        if len(normalized) == 10:
+            suffix = "T23:59:59.999999+00:00" if end else "T00:00:00+00:00"
+            return f"{normalized}{suffix}"
+        return normalized
+
+    @staticmethod
+    def _parse_secret_payload(raw_value: str) -> dict[str, Any]:
+        try:
+            parsed = json.loads(raw_value)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        return {"secret": raw_value}
+
+    @staticmethod
+    def _validate_segment(segment: str | None) -> str:
+        normalized = (segment or "unknown").strip().lower()
+        allowed_segments = {"corporate", "institutional", "individual", "unknown"}
+        if normalized not in allowed_segments:
+            raise ValueError(
+                f"Invalid donor segment {segment!r}. Expected one of {sorted(allowed_segments)}."
+            )
+        return normalized
 
     def _log_action(self, action: str, **details: Any) -> None:
         self.connection.execute(
@@ -286,20 +515,17 @@ class FundingBot:
         if not row:
             raise CredentialNotFoundError(f"No credential alias registered for {alias!r}.")
 
-        raw_value = os.getenv(row["env_var_name"])
+        env_var_name = row["env_var_name"]
+        if self.vault is not None:
+            try:
+                return self._parse_secret_payload(self.vault.get_secret(env_var_name))
+            except CredentialNotFoundError:
+                pass
+
+        raw_value = os.getenv(env_var_name)
         if raw_value is None:
-            raise CredentialNotFoundError(
-                f"Environment variable {row['env_var_name']!r} is not set."
-            )
-
-        try:
-            parsed = json.loads(raw_value)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-
-        return {"secret": raw_value}
+            raise CredentialNotFoundError(f"Environment variable {env_var_name!r} is not set.")
+        return self._parse_secret_payload(raw_value)
 
     def upsert_donor(
         self,
@@ -308,20 +534,61 @@ class FundingBot:
         name: str,
         opted_out: bool = False,
         preferences: dict[str, Any] | None = None,
+        segment: str | None = None,
     ) -> None:
+        normalized_segment = self._validate_segment(segment) if segment is not None else None
         self.connection.execute(
             """
-            INSERT INTO donors (email, name, opted_out, preferences_json, last_contact_at)
-            VALUES (?, ?, ?, ?, COALESCE((SELECT last_contact_at FROM donors WHERE email = ?), NULL))
+            INSERT INTO donors (email, name, opted_out, preferences_json, last_contact_at, segment)
+            VALUES (
+                ?, ?, ?, ?, COALESCE((SELECT last_contact_at FROM donors WHERE email = ?), NULL),
+                COALESCE((SELECT segment FROM donors WHERE email = ?), COALESCE(?, 'unknown'))
+            )
             ON CONFLICT(email) DO UPDATE SET
                 name = excluded.name,
                 opted_out = excluded.opted_out,
-                preferences_json = excluded.preferences_json
+                preferences_json = excluded.preferences_json,
+                segment = CASE
+                    WHEN ? IS NULL THEN donors.segment
+                    ELSE excluded.segment
+                END
             """,
-            (email, name, int(opted_out), json.dumps(preferences or {}), email),
+            (
+                email,
+                name,
+                int(opted_out),
+                json.dumps(preferences or {}),
+                email,
+                email,
+                normalized_segment,
+                normalized_segment,
+            ),
         )
         self.connection.commit()
-        self._log_action("donor_upserted", email=email, opted_out=opted_out)
+        logged_segment = self.connection.execute(
+            "SELECT segment FROM donors WHERE email = ?",
+            (email,),
+        ).fetchone()["segment"]
+        self._log_action(
+            "donor_upserted",
+            email=email,
+            opted_out=opted_out,
+            segment=logged_segment,
+        )
+
+    def list_donors(self, segment: str | None = None) -> list[dict[str, Any]]:
+        """Return donor records, optionally filtered by segment."""
+        if segment is not None:
+            normalized_segment = self._validate_segment(segment)
+            rows = self.connection.execute(
+                "SELECT * FROM donors WHERE segment = ? ORDER BY name, email",
+                (normalized_segment,),
+            ).fetchall()
+        else:
+            rows = self.connection.execute(
+                "SELECT * FROM donors ORDER BY name, email"
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def set_donor_opt_out(self, email: str, opted_out: bool = True) -> None:
         self.connection.execute(
@@ -416,6 +683,25 @@ class FundingBot:
             rows = self.connection.execute(
                 "SELECT * FROM opportunities ORDER BY discovered_at DESC"
             ).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_audit_logs(
+        self,
+        *,
+        limit: int | None = None,
+        action: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return recent audit log entries."""
+        query = "SELECT * FROM audit_logs"
+        params: list[Any] = []
+        if action:
+            query += " WHERE action = ?"
+            params.append(action)
+        query += " ORDER BY happened_at DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = self.connection.execute(query, params).fetchall()
         return [dict(row) for row in rows]
 
     def _get_opportunity(self, signature: str) -> sqlite3.Row:
@@ -580,6 +866,72 @@ class FundingBot:
             next_action=next_action,
         )
 
+    def poll_application_status(
+        self,
+        opportunity_signature: str,
+        http_client: Callable[..., Any] | None,
+    ) -> dict[str, Any]:
+        """Poll a remote status endpoint and update local records if needed."""
+        application = self.connection.execute(
+            """
+            SELECT a.status, a.next_action, a.submission_reference, o.portal_url
+            FROM applications a
+            JOIN opportunities o ON o.signature = a.opportunity_signature
+            WHERE a.opportunity_signature = ?
+            """,
+            (opportunity_signature,),
+        ).fetchone()
+        if application is None:
+            raise FundingBotError(
+                f"No application exists for opportunity {opportunity_signature!r}."
+            )
+
+        if http_client is None:
+            remote_status = {
+                "status": (
+                    application["status"]
+                    if application["status"] in {"approved", "declined", "closed"}
+                    else "in_review"
+                ),
+                "next_action": "Continue monitoring remote application portal.",
+            }
+        else:
+            response = http_client(
+                f"{application['portal_url'].rstrip('/')}/status",
+                {
+                    "opportunity_signature": opportunity_signature,
+                    "submission_reference": application["submission_reference"],
+                },
+            )
+            remote_status = dict(response)
+
+        changed = (
+            remote_status.get("status") != application["status"]
+            or remote_status.get("next_action") != application["next_action"]
+        )
+        if changed:
+            self.update_application_status(
+                opportunity_signature,
+                status=str(remote_status.get("status", application["status"])),
+                next_action=str(
+                    remote_status.get("next_action", application["next_action"])
+                ),
+            )
+        self._log_action(
+            "application_status_polled",
+            opportunity_signature=opportunity_signature,
+            changed=changed,
+            remote_status=remote_status.get("status"),
+        )
+        return {
+            "opportunity_signature": opportunity_signature,
+            "status": str(remote_status.get("status", application["status"])),
+            "next_action": str(
+                remote_status.get("next_action", application["next_action"])
+            ),
+            "changed": changed,
+        }
+
     def send_outreach(
         self,
         *,
@@ -638,12 +990,19 @@ class FundingBot:
             sender(donor_email, subject, body)
 
         sent_iso = self._to_iso(send_time)
-        self.connection.execute(
+        cursor = self.connection.execute(
             """
             INSERT INTO communications (donor_email, donor_name, subject, body, channel, sent_at)
             VALUES (?, ?, ?, ?, 'email', ?)
             """,
             (donor_email, donor_name, subject, body, sent_iso),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO outreach_events (communication_id, event_type, happened_at)
+            VALUES (?, 'sent', ?)
+            """,
+            (cursor.lastrowid, sent_iso),
         )
         self.connection.execute(
             "UPDATE donors SET last_contact_at = ? WHERE email = ?",
@@ -652,6 +1011,207 @@ class FundingBot:
         self.connection.commit()
         self._log_action("outreach_sent", donor_email=donor_email, subject=subject)
         return {"email": donor_email, "subject": subject, "body": body, "sent_at": sent_iso}
+
+    def register_outreach_template(
+        self,
+        name: str,
+        subject_template: str,
+        body_template: str,
+        segment: str | None = None,
+    ) -> None:
+        """Store or replace an outreach template."""
+        segment_key = "" if segment is None else self._validate_segment(segment)
+        self.connection.execute(
+            "DELETE FROM outreach_templates WHERE name = ? AND segment = ?",
+            (name, segment_key),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO outreach_templates (name, subject_template, body_template, segment)
+            VALUES (?, ?, ?, ?)
+            """,
+            (name, subject_template, body_template, segment_key),
+        )
+        self.connection.commit()
+        self._log_action("outreach_template_registered", name=name, segment=segment_key or None)
+
+    def send_outreach_from_template(
+        self,
+        template_name: str,
+        donor_email: str,
+        donor_name: str,
+        context: dict[str, Any] | None = None,
+        sender: Any | None = None,
+        sent_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Send outreach using a stored template."""
+        donor = self.connection.execute(
+            "SELECT segment FROM donors WHERE email = ?",
+            (donor_email,),
+        ).fetchone()
+        donor_segment = donor["segment"] if donor else "unknown"
+        row = self.connection.execute(
+            """
+            SELECT subject_template, body_template, segment
+            FROM outreach_templates
+            WHERE name = ? AND segment IN (?, '')
+            ORDER BY CASE WHEN segment = ? THEN 0 ELSE 1 END
+            LIMIT 1
+            """,
+            (template_name, donor_segment, donor_segment),
+        ).fetchone()
+        if row is None:
+            raise FundingBotError(f"Unknown outreach template {template_name!r}.")
+        return self.send_outreach(
+            donor_email=donor_email,
+            donor_name=donor_name,
+            subject_template=row["subject_template"],
+            body_template=row["body_template"],
+            context=context,
+            sender=sender,
+            sent_at=sent_at,
+        )
+
+    def record_outreach_event(self, communication_id: int, event_type: str) -> None:
+        """Store an outreach engagement event."""
+        allowed = {"sent", "opened", "clicked", "bounced", "unsubscribed"}
+        normalized_event = event_type.strip().lower()
+        if normalized_event not in allowed:
+            raise ValueError(f"Invalid outreach event type {event_type!r}.")
+
+        communication = self.connection.execute(
+            "SELECT id FROM communications WHERE id = ?",
+            (communication_id,),
+        ).fetchone()
+        if communication is None:
+            raise FundingBotError(f"Unknown communication {communication_id!r}.")
+
+        self.connection.execute(
+            """
+            INSERT INTO outreach_events (communication_id, event_type, happened_at)
+            VALUES (?, ?, ?)
+            """,
+            (communication_id, normalized_event, self._to_iso()),
+        )
+        self.connection.commit()
+        self._log_action(
+            "outreach_event_recorded",
+            communication_id=communication_id,
+            event_type=normalized_event,
+        )
+
+    def get_outreach_analytics(self, donor_email: str | None = None) -> dict[str, int]:
+        """Return event counts grouped by type."""
+        query = """
+            SELECT oe.event_type, COUNT(*) AS total
+            FROM outreach_events oe
+            JOIN communications c ON c.id = oe.communication_id
+        """
+        params: list[Any] = []
+        if donor_email is not None:
+            query += " WHERE c.donor_email = ?"
+            params.append(donor_email)
+        query += " GROUP BY oe.event_type"
+        counts = {key: 0 for key in ("sent", "opened", "clicked", "bounced", "unsubscribed")}
+        for row in self.connection.execute(query, params).fetchall():
+            counts[row["event_type"]] = row["total"]
+        return counts
+
+    def gdpr_export(self, donor_email: str) -> dict[str, Any]:
+        """Export all donor-related records stored by the bot."""
+        donor = self.connection.execute(
+            "SELECT * FROM donors WHERE email = ?",
+            (donor_email,),
+        ).fetchone()
+        communications = self.connection.execute(
+            """
+            SELECT * FROM communications
+            WHERE donor_email = ?
+            ORDER BY sent_at DESC
+            """,
+            (donor_email,),
+        ).fetchall()
+        communication_ids = [row["id"] for row in communications]
+        events: list[dict[str, Any]] = []
+        if communication_ids:
+            # placeholders is built solely from "?" repeated len(communication_ids) times.
+            placeholders = ", ".join("?" for _ in communication_ids)
+            events = [
+                dict(row)
+                for row in self.connection.execute(
+                    "SELECT oe.* FROM outreach_events oe"
+                    " WHERE oe.communication_id IN (" + placeholders + ")"
+                    " ORDER BY oe.happened_at DESC",
+                    communication_ids,
+                ).fetchall()
+            ]
+        export = {
+            "donor": dict(donor) if donor else None,
+            "communications": [dict(row) for row in communications],
+            "outreach_events": events,
+            "audit_logs": [
+                dict(row)
+                for row in self.connection.execute(
+                    """
+                    SELECT * FROM audit_logs
+                    WHERE details_json LIKE ?
+                    ORDER BY happened_at DESC
+                    """,
+                    (f"%{donor_email}%",),
+                ).fetchall()
+            ],
+        }
+        self._log_action("gdpr_exported", donor_email=donor_email)
+        return export
+
+    def gdpr_delete(self, donor_email: str) -> None:
+        """Anonymize donor records and retain a deletion audit trail."""
+        donor = self.connection.execute(
+            "SELECT * FROM donors WHERE email = ?",
+            (donor_email,),
+        ).fetchone()
+        if donor is None:
+            raise FundingBotError(f"Unknown donor {donor_email!r}.")
+
+        anonymized_email = (
+            f"[deleted]-{hashlib.sha256(donor_email.encode('utf-8')).hexdigest()[:12]}"
+            "@deleted.invalid"
+        )
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE donors
+                SET email = ?, name = '[deleted]', opted_out = 1,
+                    preferences_json = '{}', last_contact_at = NULL, segment = 'unknown'
+                WHERE email = ?
+                """,
+                (anonymized_email, donor_email),
+            )
+            self.connection.execute(
+                """
+                UPDATE communications
+                SET donor_email = ?, donor_name = '[deleted]',
+                    subject = '[deleted]', body = '[deleted]'
+                WHERE donor_email = ?
+                """,
+                (anonymized_email, donor_email),
+            )
+            self.connection.execute(
+                """
+                UPDATE audit_logs
+                SET details_json = REPLACE(
+                    REPLACE(details_json, ?, '[deleted]'),
+                    ?, '[deleted]'
+                )
+                WHERE details_json LIKE ? OR details_json LIKE ?
+                """,
+                (donor_email, donor["name"], f"%{donor_email}%", f"%{donor['name']}%"),
+            )
+        self._log_action(
+            "gdpr_deleted",
+            donor_hash=hashlib.sha256(donor_email.encode("utf-8")).hexdigest(),
+            anonymized_email=anonymized_email,
+        )
 
     def generate_document(
         self,
@@ -781,6 +1341,141 @@ class FundingBot:
 """,
             )
             archive.writestr("word/document.xml", document_xml)
+
+    def draft_proposal(
+        self,
+        opportunity_signature: str,
+        ai_client: AIClient | None = None,
+    ) -> str:
+        """Draft a proposal using stored organization and opportunity data."""
+        opportunity = self._get_opportunity(opportunity_signature)
+        profile = self.load_organization_profile()
+        raw_data = json.loads(opportunity["raw_data_json"])
+        prompt = "\n".join(
+            [
+                "Draft a concise nonprofit funding proposal.",
+                f"Organization profile: {json.dumps(profile, sort_keys=True)}",
+                f"Opportunity: {json.dumps(raw_data, sort_keys=True)}",
+                "Include sections for Executive Summary, Organizational Fit, Program Plan,",
+                "Expected Outcomes, and Compliance Notes.",
+            ]
+        )
+        if ai_client is not None:
+            proposal = ai_client.generate(prompt).strip()
+        else:
+            proposal = "\n\n".join(
+                [
+                    f"# Proposal Draft: {opportunity['title']}",
+                    "\n".join(
+                        [
+                            "## Executive Summary",
+                            (
+                                f"{profile.get('name', 'Our organization')} seeks support from "
+                                f"{opportunity['donor_name']} for {opportunity['title'].lower()}."
+                            ),
+                            profile.get("mission", "Our mission statement is available on request."),
+                        ]
+                    ),
+                    "\n".join(
+                        [
+                            "## Organizational Fit",
+                            (
+                                f"This opportunity aligns with the {opportunity['category'] or 'strategic'} "
+                                "focus described in the notice."
+                            ),
+                            raw_data.get("summary", opportunity["summary"]),
+                        ]
+                    ),
+                    "\n".join(
+                        [
+                            "## Program Plan",
+                            "We will tailor program delivery, staffing, and reporting to donor requirements.",
+                            f"Portal: {opportunity['portal_url']}",
+                        ]
+                    ),
+                    "\n".join(
+                        [
+                            "## Expected Outcomes",
+                            "The proposed work will define measurable milestones, beneficiary reach, and impact reporting.",
+                        ]
+                    ),
+                    "\n".join(
+                        [
+                            "## Compliance Notes",
+                            f"Source: {opportunity['source']}",
+                            "Required attachments, budget, and due diligence items will be validated before submission.",
+                        ]
+                    ),
+                ]
+            ).strip()
+        self._log_action("proposal_drafted", opportunity_signature=opportunity_signature)
+        return proposal
+
+    def build_outreach_analytics_report(
+        self,
+        start_date: datetime | str | None = None,
+        end_date: datetime | str | None = None,
+    ) -> dict[str, Any]:
+        """Build an aggregate outreach analytics report."""
+        start_iso = self._normalize_filter_timestamp(start_date)
+        end_iso = self._normalize_filter_timestamp(end_date, end=True)
+        # Build filter params with explicit branching; no user-controlled SQL fragments.
+        params: list[Any] = []
+        if start_iso is not None and end_iso is not None:
+            date_filter = "WHERE c.sent_at >= ? AND c.sent_at <= ?"
+            params = [start_iso, end_iso]
+        elif start_iso is not None:
+            date_filter = "WHERE c.sent_at >= ?"
+            params = [start_iso]
+        elif end_iso is not None:
+            date_filter = "WHERE c.sent_at <= ?"
+            params = [end_iso]
+        else:
+            date_filter = ""
+            params = []
+
+        total_sent = self.connection.execute(
+            "SELECT COUNT(*) AS total FROM communications c " + date_filter,
+            params,
+        ).fetchone()["total"]
+        event_counts = self.connection.execute(
+            "SELECT oe.event_type, COUNT(*) AS total"
+            " FROM outreach_events oe"
+            " JOIN communications c ON c.id = oe.communication_id "
+            + date_filter
+            + " GROUP BY oe.event_type",
+            params,
+        ).fetchall()
+        counts = {row["event_type"]: row["total"] for row in event_counts}
+        top_donors = [
+            dict(row)
+            for row in self.connection.execute(
+                "SELECT c.donor_email, c.donor_name,"
+                " SUM(CASE WHEN oe.event_type = 'opened' THEN 1 ELSE 0 END) AS opened,"
+                " SUM(CASE WHEN oe.event_type = 'clicked' THEN 1 ELSE 0 END) AS clicked,"
+                " COUNT(oe.id) AS total_events"
+                " FROM communications c"
+                " LEFT JOIN outreach_events oe ON oe.communication_id = c.id "
+                + date_filter
+                + " GROUP BY c.donor_email, c.donor_name"
+                " HAVING"
+                "  SUM(CASE WHEN oe.event_type = 'opened' THEN 1 ELSE 0 END) > 0"
+                "  OR SUM(CASE WHEN oe.event_type = 'clicked' THEN 1 ELSE 0 END) > 0"
+                " ORDER BY clicked DESC, opened DESC, total_events DESC, MAX(c.sent_at) DESC"
+                " LIMIT 5",
+                params,
+            ).fetchall()
+        ]
+        opened = int(counts.get("opened", 0))
+        clicked = int(counts.get("clicked", 0))
+        bounced = int(counts.get("bounced", 0))
+        return {
+            "total_sent": int(total_sent),
+            "opened": opened,
+            "clicked": clicked,
+            "bounce_rate": (bounced / total_sent) if total_sent else 0.0,
+            "top_engaged_donors": top_donors,
+        }
 
     def build_daily_summary(
         self,
@@ -913,18 +1608,34 @@ class FundingBot:
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+def _print_rows(rows: Iterable[dict[str, Any]], columns: Iterable[str] | None = None) -> None:
+    """Print dictionaries as a simple tab-separated table."""
+    row_list = list(rows)
+    if not row_list:
+        print("No records found.")
+        return
+    column_list = list(columns or row_list[0].keys())
+    print("\t".join(column_list))
+    for row in row_list:
+        print("\t".join(str(row.get(column, "")) for column in column_list))
+
+
 def _build_arg_parser() -> "argparse.ArgumentParser":
     import argparse
 
+    default_db_path = os.environ.get("BOT_DB_PATH", "funding_bot.db")
     parser = argparse.ArgumentParser(
         prog="funding-bot",
         description="Nonprofit Funding Automation Bot – command-line interface",
     )
     parser.add_argument(
         "--db",
-        default="funding_bot.db",
+        default=default_db_path,
         metavar="PATH",
-        help="Path to the SQLite database file (default: funding_bot.db).",
+        help=(
+            "Path to the SQLite database file "
+            f"(default: {default_db_path}, overridable with BOT_DB_PATH)."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
 
@@ -943,6 +1654,50 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
         "--dry-run",
         action="store_true",
         help="Print the summary to stdout without sending it.",
+    )
+
+    opportunities_parser = subparsers.add_parser(
+        "list-opportunities",
+        help="List stored funding opportunities.",
+    )
+    opportunities_parser.add_argument(
+        "--status",
+        metavar="STATUS",
+        help="Filter opportunities by status.",
+    )
+    opportunities_parser.add_argument(
+        "--limit",
+        type=int,
+        metavar="N",
+        help="Limit the number of rows shown.",
+    )
+
+    audit_parser = subparsers.add_parser(
+        "audit-log",
+        help="List recent audit log entries.",
+    )
+    audit_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        metavar="N",
+        help="Limit the number of rows shown (default: 20).",
+    )
+    audit_parser.add_argument(
+        "--action",
+        metavar="ACTION",
+        help="Filter audit entries by action.",
+    )
+
+    donors_parser = subparsers.add_parser(
+        "list-donors",
+        help="List donor records.",
+    )
+    donors_parser.add_argument(
+        "--segment",
+        metavar="SEGMENT",
+        choices=["corporate", "institutional", "individual", "unknown"],
+        help="Filter donors by segment.",
     )
 
     return parser
@@ -968,6 +1723,24 @@ def main(argv: list[str] | None = None) -> None:
                 print(summary["body"])
             else:
                 print(f"Daily summary sent to {args.recipient}.")
+        elif args.command == "list-opportunities":
+            rows = bot.list_opportunities(status=args.status)
+            if args.limit is not None:
+                rows = rows[: args.limit]
+            _print_rows(
+                rows,
+                ["signature", "source", "donor_name", "title", "status", "discovered_at"],
+            )
+        elif args.command == "audit-log":
+            _print_rows(
+                bot.list_audit_logs(limit=args.limit, action=args.action),
+                ["happened_at", "action", "details_json"],
+            )
+        elif args.command == "list-donors":
+            _print_rows(
+                bot.list_donors(segment=args.segment),
+                ["email", "name", "segment", "opted_out", "last_contact_at"],
+            )
     finally:
         bot.close()
 

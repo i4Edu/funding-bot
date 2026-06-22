@@ -1,0 +1,14 @@
+# Non-secret runtime configuration shared by the web deployment and cron job.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: funding-bot-config
+  namespace: funding-bot
+  labels:
+    app: funding-bot
+data:
+  SMTP_HOST: "localhost"
+  SMTP_PORT: "587"
+  SMTP_USE_TLS: "1"
+  SMTP_FROM: ""
+  BOT_DB_PATH: "/app/data/funding_bot.db"

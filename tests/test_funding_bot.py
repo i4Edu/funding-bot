@@ -1,3 +1,5 @@
+import io
+import json
 import os
 import tempfile
 import unittest
@@ -314,6 +316,463 @@ class SendDailySummaryTests(unittest.TestCase):
         self.assertEqual(["donor@example.org"], calls)
 
 
+from funding_bot import (
+    CSRNetworkConnector,
+    FileVault,
+    GrantsPortalConnector,
+    NGODirectoryConnector,
+    main,
+)
+
+
+class PortalConnectorTests(unittest.TestCase):
+    """Tests for stub portal connector implementations."""
+
+    def test_stub_connectors_return_demo_records_and_filter_by_keyword(self):
+        grants = GrantsPortalConnector()
+        csr = CSRNetworkConnector()
+        ngo = NGODirectoryConnector()
+
+        grants_rows = grants.fetch_opportunities(["education"])
+        csr_rows = csr.fetch_opportunities(["digital learning"])
+        ngo_rows = ngo.fetch_opportunities(["literacy"])
+
+        self.assertEqual(1, len(grants_rows))
+        self.assertEqual("Grants Portal", grants_rows[0]["source"])
+        self.assertEqual("Education Innovation Grant", grants_rows[0]["title"])
+
+        self.assertEqual(1, len(csr_rows))
+        self.assertEqual("CSR Network", csr_rows[0]["source"])
+        self.assertEqual("CSR Digital Learning Fund", csr_rows[0]["title"])
+
+        self.assertEqual(1, len(ngo_rows))
+        self.assertEqual("NGO Directory", ngo_rows[0]["source"])
+        self.assertEqual("Community Literacy Matching Grant", ngo_rows[0]["title"])
+
+        self.assertEqual([], grants.fetch_opportunities(["health"]))
+
+
+class DonorSegmentationAndTemplateTests(unittest.TestCase):
+    """Tests donor segmentation and outreach templates."""
+
+    def setUp(self):
+        self.bot = FundingBot(trusted_sources={"Grants Portal"})
+        self.bot.store_organization_profile(
+            {"name": "i4Edu", "mission": "Expand access to equitable education."}
+        )
+
+    def tearDown(self):
+        self.bot.close()
+
+    def test_upsert_donor_persists_segment_and_list_donors_filters(self):
+        self.bot.upsert_donor(
+            email="corp@example.org",
+            name="Corporate Donor",
+            segment="corporate",
+        )
+        self.bot.upsert_donor(
+            email="inst@example.org",
+            name="Institutional Donor",
+            segment="institutional",
+        )
+        self.bot.upsert_donor(
+            email="corp@example.org",
+            name="Corporate Donor Updated",
+        )
+
+        corporate = self.bot.list_donors(segment="corporate")
+        all_donors = self.bot.list_donors()
+
+        self.assertEqual(1, len(corporate))
+        self.assertEqual("Corporate Donor Updated", corporate[0]["name"])
+        self.assertEqual("corporate", corporate[0]["segment"])
+        self.assertEqual({"corporate", "institutional"}, {row["segment"] for row in all_donors})
+        latest_upsert = self.bot.connection.execute(
+            "SELECT details_json FROM audit_logs WHERE action = 'donor_upserted' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual("corporate", json.loads(latest_upsert["details_json"])["segment"])
+
+    def test_send_outreach_from_template_prefers_segment_template_and_falls_back(self):
+        calls = []
+
+        def fake_sender(to_addr, subject, body):
+            calls.append({"to": to_addr, "subject": subject, "body": body})
+
+        self.bot.upsert_donor(
+            email="corp@example.org",
+            name="Corporate Donor",
+            segment="corporate",
+        )
+        self.bot.upsert_donor(
+            email="unknown@example.org",
+            name="Unknown Donor",
+        )
+        self.bot.register_outreach_template(
+            "intro",
+            "Support {organization_name}",
+            "Hello {donor_name},\n\n{mission}",
+        )
+        self.bot.register_outreach_template(
+            "intro",
+            "Corporate partnership with {organization_name}",
+            "Dear {donor_name},\n\nLet us discuss CSR support for {organization_name}.",
+            segment="corporate",
+        )
+
+        corporate_result = self.bot.send_outreach_from_template(
+            "intro",
+            "corp@example.org",
+            "Corporate Donor",
+            sender=fake_sender,
+            sent_at=datetime(2026, 6, 22, tzinfo=timezone.utc),
+        )
+        fallback_result = self.bot.send_outreach_from_template(
+            "intro",
+            "unknown@example.org",
+            "Unknown Donor",
+            sender=fake_sender,
+            sent_at=datetime(2026, 6, 23, tzinfo=timezone.utc),
+        )
+
+        self.assertIn("Corporate partnership", corporate_result["subject"])
+        self.assertIn("CSR support", corporate_result["body"])
+        self.assertEqual("Support i4Edu", fallback_result["subject"])
+        self.assertIn("Expand access to equitable education.", fallback_result["body"])
+        self.assertEqual(["corp@example.org", "unknown@example.org"], [call["to"] for call in calls])
+
+
+class OutreachAnalyticsAndGdprTests(unittest.TestCase):
+    """Tests outreach analytics reporting and GDPR workflows."""
+
+    def setUp(self):
+        self.bot = FundingBot(trusted_sources={"Grants Portal"})
+        self.bot.store_organization_profile(
+            {"name": "i4Edu", "mission": "Expand access to equitable education."}
+        )
+
+    def tearDown(self):
+        self.bot.close()
+
+    def test_outreach_events_analytics_and_report(self):
+        self.bot.send_outreach(
+            donor_email="engaged@example.org",
+            donor_name="Engaged Donor",
+            subject_template="Support {organization_name}",
+            body_template="Hello {donor_name}",
+            sent_at=datetime(2026, 6, 22, 9, 0, tzinfo=timezone.utc),
+        )
+        self.bot.send_outreach(
+            donor_email="bounce@example.org",
+            donor_name="Bounce Donor",
+            subject_template="Support {organization_name}",
+            body_template="Hello {donor_name}",
+            sent_at=datetime(2026, 6, 22, 10, 0, tzinfo=timezone.utc),
+        )
+
+        rows = self.bot.connection.execute(
+            "SELECT id, donor_email FROM communications ORDER BY id"
+        ).fetchall()
+        communication_ids = {row["donor_email"]: row["id"] for row in rows}
+
+        self.bot.record_outreach_event(communication_ids["engaged@example.org"], "opened")
+        self.bot.record_outreach_event(communication_ids["engaged@example.org"], "clicked")
+        self.bot.record_outreach_event(communication_ids["bounce@example.org"], "bounced")
+
+        all_analytics = self.bot.get_outreach_analytics()
+        donor_analytics = self.bot.get_outreach_analytics("engaged@example.org")
+        report = self.bot.build_outreach_analytics_report("2026-06-22", "2026-06-22")
+
+        self.assertEqual(2, all_analytics["sent"])
+        self.assertEqual(1, all_analytics["opened"])
+        self.assertEqual(1, all_analytics["clicked"])
+        self.assertEqual(1, all_analytics["bounced"])
+
+        self.assertEqual(1, donor_analytics["sent"])
+        self.assertEqual(1, donor_analytics["opened"])
+        self.assertEqual(1, donor_analytics["clicked"])
+        self.assertEqual(0, donor_analytics["bounced"])
+
+        self.assertEqual(2, report["total_sent"])
+        self.assertEqual(1, report["opened"])
+        self.assertEqual(1, report["clicked"])
+        self.assertEqual(0.5, report["bounce_rate"])
+        self.assertEqual("engaged@example.org", report["top_engaged_donors"][0]["donor_email"])
+
+    def test_outreach_analytics_report_orders_ties_by_latest_sent(self):
+        self.bot.send_outreach(
+            donor_email="earlier@example.org",
+            donor_name="Earlier Donor",
+            subject_template="Support {organization_name}",
+            body_template="Hello {donor_name}",
+            sent_at=datetime(2026, 6, 22, 9, 0, tzinfo=timezone.utc),
+        )
+        self.bot.send_outreach(
+            donor_email="later@example.org",
+            donor_name="Later Donor",
+            subject_template="Support {organization_name}",
+            body_template="Hello {donor_name}",
+            sent_at=datetime(2026, 6, 22, 11, 0, tzinfo=timezone.utc),
+        )
+
+        rows = self.bot.connection.execute(
+            "SELECT id, donor_email FROM communications ORDER BY id"
+        ).fetchall()
+        communication_ids = {row["donor_email"]: row["id"] for row in rows}
+        self.bot.record_outreach_event(communication_ids["earlier@example.org"], "opened")
+        self.bot.record_outreach_event(communication_ids["later@example.org"], "opened")
+
+        report = self.bot.build_outreach_analytics_report("2026-06-22", "2026-06-22")
+
+        self.assertEqual("later@example.org", report["top_engaged_donors"][0]["donor_email"])
+
+    def test_gdpr_export_and_delete_cover_related_records(self):
+        self.bot.upsert_donor(
+            email="privacy@example.org",
+            name="Privacy Donor",
+            preferences={"frequency": "monthly"},
+            segment="individual",
+        )
+        self.bot.send_outreach(
+            donor_email="privacy@example.org",
+            donor_name="Privacy Donor",
+            subject_template="Support {organization_name}",
+            body_template="Hello {donor_name}",
+            sent_at=datetime(2026, 6, 22, 11, 0, tzinfo=timezone.utc),
+        )
+        communication_id = self.bot.connection.execute(
+            "SELECT id FROM communications WHERE donor_email = ?",
+            ("privacy@example.org",),
+        ).fetchone()["id"]
+        self.bot.record_outreach_event(communication_id, "opened")
+
+        export = self.bot.gdpr_export("privacy@example.org")
+
+        self.assertEqual("Privacy Donor", export["donor"]["name"])
+        self.assertEqual("individual", export["donor"]["segment"])
+        self.assertEqual(1, len(export["communications"]))
+        self.assertEqual(
+            {"sent", "opened"},
+            {row["event_type"] for row in export["outreach_events"]},
+        )
+        self.assertTrue(export["audit_logs"])
+
+        self.bot.gdpr_delete("privacy@example.org")
+
+        donor_row = self.bot.connection.execute("SELECT * FROM donors").fetchone()
+        communication_row = self.bot.connection.execute(
+            "SELECT donor_email, donor_name, subject, body FROM communications"
+        ).fetchone()
+        audit_log_text = "\n".join(
+            row["details_json"]
+            for row in self.bot.connection.execute(
+                "SELECT details_json FROM audit_logs ORDER BY id"
+            ).fetchall()
+        )
+
+        self.assertEqual("[deleted]", donor_row["name"])
+        self.assertEqual("unknown", donor_row["segment"])
+        self.assertEqual(1, donor_row["opted_out"])
+        self.assertTrue(donor_row["email"].endswith("@deleted.invalid"))
+        self.assertEqual("[deleted]", communication_row["donor_name"])
+        self.assertEqual("[deleted]", communication_row["subject"])
+        self.assertEqual("[deleted]", communication_row["body"])
+        self.assertNotIn("privacy@example.org", audit_log_text)
+        self.assertNotIn("Privacy Donor", audit_log_text)
+
+
+class StatusPollingAndVaultTests(unittest.TestCase):
+    """Tests status polling and credential vault integrations."""
+
+    def setUp(self):
+        self.vault_dir = Path(".test_file_vault")
+        if self.vault_dir.exists():
+            for path in self.vault_dir.iterdir():
+                path.unlink()
+            self.vault_dir.rmdir()
+        self.vault_dir.mkdir()
+        self.bot = FundingBot(trusted_sources={"Grants Portal"}, vault=FileVault(self.vault_dir))
+        self.bot.store_organization_profile({"name": "i4Edu"})
+
+    def tearDown(self):
+        self.bot.close()
+        if self.vault_dir.exists():
+            for path in self.vault_dir.iterdir():
+                path.unlink()
+            self.vault_dir.rmdir()
+
+    def _discover_sample_opportunity(self):
+        return self.bot.discover_opportunities(
+            [
+                {
+                    "source": "Grants Portal",
+                    "donor_name": "UNICEF",
+                    "title": "UNICEF CSR Grant",
+                    "portal_url": "https://example.org/unicef",
+                    "summary": "CSR funding for nonprofit education programs.",
+                    "tags": ["CSR funding", "nonprofit grants"],
+                    "category": "Education",
+                }
+            ],
+            keywords=["csr funding"],
+        )[0]["signature"]
+
+    def test_file_vault_resolves_registered_credentials(self):
+        (self.vault_dir / "PORTAL_SECRET").write_text(
+            '{"username": "vault-user", "password": "vault-pass"}',
+            encoding="utf-8",
+        )
+        self.bot.register_credential("portal", "PORTAL_SECRET")
+
+        credentials = self.bot.resolve_credential("portal")
+
+        self.assertEqual("vault-user", credentials["username"])
+        self.assertEqual("vault-pass", credentials["password"])
+
+    def test_poll_application_status_uses_http_client_and_updates_records(self):
+        signature = self._discover_sample_opportunity()
+        self.bot.submit_application(
+            signature,
+            submission_reference="sub-123",
+            status="submitted",
+            next_action="Await donor review",
+        )
+        calls = []
+
+        def fake_http_client(url, payload):
+            calls.append({"url": url, "payload": payload})
+            return {
+                "status": "approved",
+                "next_action": "Prepare grant agreement",
+            }
+
+        result = self.bot.poll_application_status(signature, fake_http_client)
+
+        self.assertTrue(result["changed"])
+        self.assertEqual("approved", result["status"])
+        self.assertEqual("Prepare grant agreement", result["next_action"])
+        self.assertEqual(
+            "https://example.org/unicef/status",
+            calls[0]["url"],
+        )
+        self.assertEqual(signature, calls[0]["payload"]["opportunity_signature"])
+        self.assertEqual("sub-123", calls[0]["payload"]["submission_reference"])
+        self.assertEqual("approved", self.bot.list_opportunities()[0]["status"])
+
+
+class ProposalDraftingTests(unittest.TestCase):
+    """Tests AI-assisted proposal drafting."""
+
+    def setUp(self):
+        self.bot = FundingBot(trusted_sources={"Grants Portal"})
+        self.bot.store_organization_profile(
+            {"name": "i4Edu", "mission": "Expand access to equitable education."}
+        )
+        self.signature = self.bot.discover_opportunities(
+            [
+                {
+                    "source": "Grants Portal",
+                    "donor_name": "UNICEF",
+                    "title": "UNICEF CSR Grant",
+                    "portal_url": "https://example.org/unicef",
+                    "summary": "CSR funding for nonprofit education programs.",
+                    "tags": ["CSR funding", "nonprofit grants"],
+                    "category": "Education",
+                }
+            ],
+            keywords=["csr funding"],
+        )[0]["signature"]
+
+    def tearDown(self):
+        self.bot.close()
+
+    def test_draft_proposal_without_ai_uses_template_fallback(self):
+        proposal = self.bot.draft_proposal(self.signature)
+
+        self.assertIn("# Proposal Draft: UNICEF CSR Grant", proposal)
+        self.assertIn("## Executive Summary", proposal)
+        self.assertIn("## Organizational Fit", proposal)
+        self.assertIn("## Program Plan", proposal)
+        self.assertIn("## Expected Outcomes", proposal)
+        self.assertIn("## Compliance Notes", proposal)
+
+    def test_draft_proposal_with_ai_client_uses_generated_text(self):
+        class FakeAIClient:
+            def __init__(self):
+                self.prompts = []
+
+            def generate(self, prompt):
+                self.prompts.append(prompt)
+                return "AI proposal draft"
+
+        ai_client = FakeAIClient()
+
+        proposal = self.bot.draft_proposal(self.signature, ai_client=ai_client)
+
+        self.assertEqual("AI proposal draft", proposal)
+        self.assertEqual(1, len(ai_client.prompts))
+        self.assertIn("Organization profile:", ai_client.prompts[0])
+        self.assertIn("UNICEF CSR Grant", ai_client.prompts[0])
+
+
+class CliExtensionTests(unittest.TestCase):
+    """Tests CLI list commands added in newer versions."""
+
+    def setUp(self):
+        self.db_path = Path(".test_cli_commands.db")
+        if self.db_path.exists():
+            self.db_path.unlink()
+        bot = FundingBot(db_path=self.db_path, trusted_sources={"Grants Portal"})
+        bot.store_organization_profile({"name": "i4Edu"})
+        bot.discover_opportunities(
+            [
+                {
+                    "source": "Grants Portal",
+                    "donor_name": "UNICEF",
+                    "title": "UNICEF CSR Grant",
+                    "portal_url": "https://example.org/unicef",
+                    "summary": "CSR funding for nonprofit education programs.",
+                    "tags": ["CSR funding", "nonprofit grants"],
+                    "category": "Education",
+                }
+            ],
+            keywords=["csr funding"],
+        )
+        bot.upsert_donor(
+            email="corp@example.org",
+            name="Corporate Donor",
+            segment="corporate",
+        )
+        bot.close()
+
+    def tearDown(self):
+        if self.db_path.exists():
+            self.db_path.unlink()
+
+    def test_list_opportunities_command_prints_rows(self):
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(["--db", str(self.db_path), "list-opportunities", "--status", "new", "--limit", "1"])
+
+        output = stdout.getvalue()
+        self.assertIn("signature\tsource\tdonor_name\ttitle\tstatus\tdiscovered_at", output)
+        self.assertIn("UNICEF CSR Grant", output)
+
+    def test_audit_log_command_prints_filtered_rows(self):
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(["--db", str(self.db_path), "audit-log", "--action", "donor_upserted", "--limit", "5"])
+
+        output = stdout.getvalue()
+        self.assertIn("happened_at\taction\tdetails_json", output)
+        self.assertIn("donor_upserted", output)
+        self.assertIn("corp@example.org", output)
+
+    def test_list_donors_command_prints_segment_filter(self):
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(["--db", str(self.db_path), "list-donors", "--segment", "corporate"])
+
+        output = stdout.getvalue()
+        self.assertIn("email\tname\tsegment\topted_out\tlast_contact_at", output)
+        self.assertIn("corp@example.org\tCorporate Donor\tcorporate", output)
+
+
 if __name__ == "__main__":
     unittest.main()
-
