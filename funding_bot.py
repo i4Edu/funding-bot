@@ -56,6 +56,7 @@ class FundingBot:
         self.db_path = str(db_path)
         self.trusted_sources = {source.lower() for source in (trusted_sources or [])}
         self.connection = sqlite3.connect(self.db_path)
+        self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.row_factory = sqlite3.Row
         self._create_schema()
 
@@ -150,8 +151,15 @@ class FundingBot:
         return datetime.now(timezone.utc)
 
     @staticmethod
+    def _as_utc(timestamp: datetime | None = None) -> datetime:
+        normalized = timestamp or FundingBot._utcnow()
+        if normalized.tzinfo is None:
+            return normalized.replace(tzinfo=timezone.utc)
+        return normalized.astimezone(timezone.utc)
+
+    @staticmethod
     def _to_iso(timestamp: datetime | None = None) -> str:
-        return (timestamp or FundingBot._utcnow()).isoformat()
+        return FundingBot._as_utc(timestamp).isoformat()
 
     def _log_action(self, action: str, **details: Any) -> None:
         self.connection.execute(
@@ -427,7 +435,7 @@ class FundingBot:
                     form_data,
                     attachment_list,
                 )
-            except Exception as exc:  # pragma: no cover - exercised via tests
+            except Exception as exc:
                 last_error = str(exc)
                 self.connection.execute(
                     """
@@ -470,15 +478,21 @@ class FundingBot:
         status: str,
         next_action: str,
     ) -> None:
-        self.connection.execute(
-            "UPDATE applications SET status = ?, next_action = ? WHERE opportunity_signature = ?",
-            (status, next_action, opportunity_signature),
-        )
-        self.connection.execute(
-            "UPDATE opportunities SET status = ? WHERE signature = ?",
-            (status, opportunity_signature),
-        )
-        self.connection.commit()
+        with self.connection:
+            updated_application = self.connection.execute(
+                "UPDATE applications SET status = ?, next_action = ? WHERE opportunity_signature = ?",
+                (status, next_action, opportunity_signature),
+            )
+            if updated_application.rowcount == 0:
+                raise FundingBotError(
+                    f"No application exists for opportunity {opportunity_signature!r}."
+                )
+            updated_opportunity = self.connection.execute(
+                "UPDATE opportunities SET status = ? WHERE signature = ?",
+                (status, opportunity_signature),
+            )
+            if updated_opportunity.rowcount == 0:
+                raise OpportunityNotFoundError(f"Unknown opportunity {opportunity_signature!r}.")
         self._log_action(
             "application_status_updated",
             opportunity_signature=opportunity_signature,
@@ -508,13 +522,14 @@ class FundingBot:
                 (donor_email,),
             ).fetchone()
 
-        assert donor is not None
+        if donor is None:
+            raise FundingBotError(f"Unable to load donor record for {donor_email!r}.")
         if donor["opted_out"]:
             raise OptOutError(f"{donor_email} has opted out of outreach.")
 
-        send_time = sent_at or self._utcnow()
+        send_time = self._as_utc(sent_at)
         if donor["last_contact_at"]:
-            last_contact = datetime.fromisoformat(donor["last_contact_at"])
+            last_contact = self._as_utc(datetime.fromisoformat(donor["last_contact_at"]))
             if send_time - last_contact < timedelta(days=7):
                 raise OutreachThrottledError(
                     f"{donor_email} was contacted less than seven days ago."

@@ -7,6 +7,7 @@ from pathlib import Path
 from funding_bot import (
     DuplicateSubmissionError,
     FundingBot,
+    FundingBotError,
     OptOutError,
     OutreachThrottledError,
 )
@@ -137,6 +138,42 @@ class FundingBotTests(unittest.TestCase):
                 subject_template="Support {organization_name}",
                 body_template="Hello {donor_name}",
             )
+
+    def test_outreach_normalizes_naive_sent_at_for_throttle(self):
+        self.bot.send_outreach(
+            donor_email="donor@example.org",
+            donor_name="Donor",
+            subject_template="Support {organization_name}",
+            body_template="Hello {donor_name}",
+            sent_at=datetime(2026, 6, 22, tzinfo=timezone.utc),
+        )
+
+        with self.assertRaises(OutreachThrottledError):
+            self.bot.send_outreach(
+                donor_email="donor@example.org",
+                donor_name="Donor",
+                subject_template="Support {organization_name}",
+                body_template="Hello {donor_name}",
+                sent_at=datetime(2026, 6, 25),
+            )
+
+    def test_update_application_status_requires_existing_application(self):
+        signature = self._discover_sample_opportunity()
+
+        with self.assertRaises(FundingBotError):
+            self.bot.update_application_status(
+                signature,
+                status="pending",
+                next_action="Awaiting confirmation",
+            )
+
+        self.assertEqual("new", self.bot.list_opportunities()[0]["status"])
+
+    def test_sqlite_foreign_keys_are_enabled(self):
+        self.assertEqual(
+            1,
+            self.bot.connection.execute("PRAGMA foreign_keys").fetchone()[0],
+        )
 
     def test_document_generation_and_daily_summary(self):
         signature = self._discover_sample_opportunity()
