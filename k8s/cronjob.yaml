@@ -1,0 +1,51 @@
+# Daily job that sends the funding summary at 09:00 UTC.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: funding-bot-daily-summary
+  namespace: funding-bot
+  labels:
+    app: funding-bot
+spec:
+  schedule: "0 9 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: funding-bot
+            component: bot
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: funding-bot
+              image: funding-bot:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - python
+                - -m
+                - funding_bot
+                - send-daily-summary
+              envFrom:
+                - configMapRef:
+                    name: funding-bot-config
+                - secretRef:
+                    name: funding-bot-secrets
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+              volumeMounts:
+                - name: bot-data
+                  mountPath: /app/data
+          volumes:
+            # Reuse the same claim so scheduled jobs operate on the shared SQLite data.
+            - name: bot-data
+              persistentVolumeClaim:
+                claimName: funding-bot-data

@@ -1,0 +1,41 @@
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: funding-bot:latest
+    command: ["python", "-m", "funding_bot", "send-daily-summary"]
+    env_file:
+      - .env.example
+    volumes:
+      - bot_data:/app/data
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: funding-bot:latest
+    command:
+      [
+        "python",
+        "-m",
+        "flask",
+        "--app",
+        "web.app",
+        "run",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "5000",
+      ]
+    env_file:
+      - .env.example
+    depends_on:
+      - bot
+    ports:
+      - "5000:5000"
+    volumes:
+      - bot_data:/app/data
+
+volumes:
+  bot_data:
