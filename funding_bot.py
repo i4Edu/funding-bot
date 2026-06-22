@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import smtplib
 import sqlite3
 import zipfile
 from datetime import datetime, timedelta, timezone
+from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any, Iterable, Protocol
 from xml.sax.saxutils import escape
@@ -44,6 +46,79 @@ class BrowserClient(Protocol):
         attachments: Iterable[str],
     ) -> str:
         """Submit an application and return a submission reference."""
+
+
+class SMTPEmailSender:
+    """Send plain-text emails via SMTP.
+
+    Environment variables used by :meth:`from_env`:
+
+    - ``SMTP_HOST``      – mail server hostname (default: ``localhost``)
+    - ``SMTP_PORT``      – port number (default: ``587``)
+    - ``SMTP_USERNAME``  – login username
+    - ``SMTP_PASSWORD``  – login password
+    - ``SMTP_USE_TLS``   – ``"0"`` to disable STARTTLS (enabled by default)
+    - ``SMTP_FROM``      – envelope ``From`` address (defaults to username)
+    """
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        username: str,
+        password: str,
+        *,
+        use_tls: bool = True,
+        from_address: str | None = None,
+    ) -> None:
+        self.host = host
+        self.port = port
+        self.username = username
+        self.password = password
+        self.use_tls = use_tls
+        self.from_address = from_address or username
+
+    @classmethod
+    def from_env(cls) -> "SMTPEmailSender":
+        """Build an :class:`SMTPEmailSender` from environment variables."""
+        host = os.environ.get("SMTP_HOST", "localhost")
+        port = int(os.environ.get("SMTP_PORT", "587"))
+        username = os.environ.get("SMTP_USERNAME", "")
+        password = os.environ.get("SMTP_PASSWORD", "")
+        use_tls = os.environ.get("SMTP_USE_TLS", "1") != "0"
+        from_address = os.environ.get("SMTP_FROM") or username
+        return cls(
+            host,
+            port,
+            username,
+            password,
+            use_tls=use_tls,
+            from_address=from_address,
+        )
+
+    def __call__(self, to_address: str, subject: str, body: str) -> None:
+        """Send a plain-text email.
+
+        This method matches the ``sender`` callable signature expected by
+        :meth:`FundingBot.send_outreach` and :meth:`FundingBot.send_daily_summary`.
+        """
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = subject
+        msg["From"] = self.from_address
+        msg["To"] = to_address
+
+        if self.use_tls:
+            server: smtplib.SMTP = smtplib.SMTP(self.host, self.port)
+            server.starttls()
+        else:
+            server = smtplib.SMTP(self.host, self.port)
+
+        try:
+            if self.username:
+                server.login(self.username, self.password)
+            server.sendmail(self.from_address, [to_address], msg.as_string())
+        finally:
+            server.quit()
 
 
 class FundingBot:
@@ -789,3 +864,102 @@ class FundingBot:
         subject = f"Daily Nonprofit Funding Report – {date}"
         self._log_action("daily_summary_built", recipient=recipient, report_date=date)
         return {"subject": subject, "body": body}
+
+    def send_daily_summary(
+        self,
+        *,
+        recipient: str = "lupael@i4e.com.bd",
+        sender: Any | None = None,
+        report_date: datetime | None = None,
+    ) -> dict[str, str]:
+        """Build and optionally dispatch the daily funding summary email.
+
+        Parameters
+        ----------
+        recipient:
+            The email address that receives the report (defaults to
+            ``lupael@i4e.com.bd`` as specified in the project brief).
+        sender:
+            A callable ``(to_addr, subject, body) -> None`` used to transmit
+            the email.  Pass an :class:`SMTPEmailSender` instance (or any
+            compatible callable) to actually deliver the message.  When
+            ``None`` the summary is built and returned but not sent.
+        report_date:
+            The date for which the report is generated.  Defaults to today.
+        """
+        summary = self.build_daily_summary(recipient=recipient, report_date=report_date)
+        if sender is not None:
+            sender(recipient, summary["subject"], summary["body"])
+            self._log_action(
+                "daily_summary_sent",
+                recipient=recipient,
+                subject=summary["subject"],
+            )
+        return summary
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+def _build_arg_parser() -> "argparse.ArgumentParser":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="funding-bot",
+        description="Nonprofit Funding Automation Bot – command-line interface",
+    )
+    parser.add_argument(
+        "--db",
+        default="funding_bot.db",
+        metavar="PATH",
+        help="Path to the SQLite database file (default: funding_bot.db).",
+    )
+    subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
+
+    # send-daily-summary
+    summary_parser = subparsers.add_parser(
+        "send-daily-summary",
+        help="Build and email the daily funding report.",
+    )
+    summary_parser.add_argument(
+        "--recipient",
+        default="lupael@i4e.com.bd",
+        metavar="EMAIL",
+        help="Recipient email address (default: lupael@i4e.com.bd).",
+    )
+    summary_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the summary to stdout without sending it.",
+    )
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> None:
+    import argparse
+
+    parser = _build_arg_parser()
+    args = parser.parse_args(argv)
+
+    if args.command is None:
+        parser.print_help()
+        return
+
+    bot = FundingBot(db_path=args.db)
+    try:
+        if args.command == "send-daily-summary":
+            sender = None if args.dry_run else SMTPEmailSender.from_env()
+            summary = bot.send_daily_summary(recipient=args.recipient, sender=sender)
+            if args.dry_run:
+                print(f"Subject: {summary['subject']}\n")
+                print(summary["body"])
+            else:
+                print(f"Daily summary sent to {args.recipient}.")
+    finally:
+        bot.close()
+
+
+if __name__ == "__main__":
+    main()
