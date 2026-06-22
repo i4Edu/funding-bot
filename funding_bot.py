@@ -101,22 +101,27 @@ class SMTPEmailSender:
 
         This method matches the ``sender`` callable signature expected by
         :meth:`FundingBot.send_outreach` and :meth:`FundingBot.send_daily_summary`.
+
+        Raises :class:`smtplib.SMTPException` (with added context) if the
+        message cannot be delivered.
         """
         msg = MIMEText(body, "plain", "utf-8")
         msg["Subject"] = subject
         msg["From"] = self.from_address
         msg["To"] = to_address
 
+        server: smtplib.SMTP = smtplib.SMTP(self.host, self.port)
         if self.use_tls:
-            server: smtplib.SMTP = smtplib.SMTP(self.host, self.port)
             server.starttls()
-        else:
-            server = smtplib.SMTP(self.host, self.port)
 
         try:
             if self.username:
                 server.login(self.username, self.password)
             server.sendmail(self.from_address, [to_address], msg.as_string())
+        except smtplib.SMTPException as exc:
+            raise smtplib.SMTPException(
+                f"Failed to send email to {to_address!r} via {self.host}:{self.port}: {exc}"
+            ) from exc
         finally:
             server.quit()
 
@@ -868,7 +873,7 @@ class FundingBot:
     def send_daily_summary(
         self,
         *,
-        recipient: str = "lupael@i4e.com.bd",
+        recipient: str | None = None,
         sender: Any | None = None,
         report_date: datetime | None = None,
     ) -> dict[str, str]:
@@ -877,8 +882,10 @@ class FundingBot:
         Parameters
         ----------
         recipient:
-            The email address that receives the report (defaults to
-            ``lupael@i4e.com.bd`` as specified in the project brief).
+            The email address that receives the report.  When omitted, the
+            value is read from the ``summary_recipient`` key of the stored
+            organization profile; if that key is also absent it falls back to
+            ``"lupael@i4e.com.bd"`` as specified in the project brief.
         sender:
             A callable ``(to_addr, subject, body) -> None`` used to transmit
             the email.  Pass an :class:`SMTPEmailSender` instance (or any
@@ -887,6 +894,10 @@ class FundingBot:
         report_date:
             The date for which the report is generated.  Defaults to today.
         """
+        if recipient is None:
+            profile = self.load_organization_profile()
+            recipient = profile.get("summary_recipient", "lupael@i4e.com.bd")
+
         summary = self.build_daily_summary(recipient=recipient, report_date=report_date)
         if sender is not None:
             sender(recipient, summary["subject"], summary["body"])
