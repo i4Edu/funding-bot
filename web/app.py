@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hmac
 import json
 import os
 import sys
@@ -26,13 +27,19 @@ from funding_bot import (  # noqa: E402
 app = Flask(__name__, template_folder=str(Path(__file__).resolve().parent / "templates"))
 app.config["JSON_SORT_KEYS"] = False
 
-BOT = FundingBot(db_path=os.environ.get("BOT_DB_PATH", "funding_bot.db"))
-
 ROLE_PASSWORD_ENV_VARS = {
     "admin": "ADMIN_PASSWORD",
     "staff": "STAFF_PASSWORD",
     "auditor": "AUDITOR_PASSWORD",
 }
+
+
+def _bot() -> FundingBot:
+    bot = g.get("_bot")
+    if bot is None:
+        bot = FundingBot(db_path=os.environ.get("BOT_DB_PATH", "funding_bot.db"))
+        g._bot = bot
+    return bot
 
 
 def _json_error(message: str, status_code: int, *, headers: dict[str, str] | None = None) -> Response:
@@ -71,7 +78,7 @@ def _get_authenticated_role() -> str:
         raise PermissionError("Invalid authentication credentials")
 
     expected_password = os.environ.get(ROLE_PASSWORD_ENV_VARS[role])
-    if not expected_password or password != expected_password:
+    if not expected_password or not hmac.compare_digest(password, expected_password):
         raise PermissionError("Invalid authentication credentials")
 
     return role
@@ -152,7 +159,7 @@ def _serialize_submission_attempt(row: Any) -> dict[str, Any]:
 
 
 def _fetch_opportunity(signature: str) -> dict[str, Any]:
-    row = BOT.connection.execute(
+    row = _bot().connection.execute(
         "SELECT * FROM opportunities WHERE signature = ?",
         (signature,),
     ).fetchone()
@@ -162,7 +169,7 @@ def _fetch_opportunity(signature: str) -> dict[str, Any]:
 
 
 def _fetch_donor(email: str) -> dict[str, Any] | None:
-    row = BOT.connection.execute("SELECT * FROM donors WHERE email = ?", (email,)).fetchone()
+    row = _bot().connection.execute("SELECT * FROM donors WHERE email = ?", (email,)).fetchone()
     return _serialize_donor(row) if row else None
 
 
@@ -177,29 +184,29 @@ def _dashboard_context() -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     recent_cutoff = (now - timedelta(days=7)).isoformat()
 
-    new_opportunities_count = BOT.connection.execute(
+    new_opportunities_count = _bot().connection.execute(
         "SELECT COUNT(*) FROM opportunities WHERE discovered_at >= ?",
         (recent_cutoff,),
     ).fetchone()[0]
-    applications_submitted_count = BOT.connection.execute(
+    applications_submitted_count = _bot().connection.execute(
         "SELECT COUNT(*) FROM applications",
     ).fetchone()[0]
-    pending_applications_count = BOT.connection.execute(
+    pending_applications_count = _bot().connection.execute(
         "SELECT COUNT(*) FROM applications WHERE status IN ('pending', 'submitted', 'in_review')",
     ).fetchone()[0]
-    donor_communications_count = BOT.connection.execute(
+    donor_communications_count = _bot().connection.execute(
         "SELECT COUNT(*) FROM communications",
     ).fetchone()[0]
 
     recent_opportunities = [
         _serialize_opportunity(row)
-        for row in BOT.connection.execute(
+        for row in _bot().connection.execute(
             "SELECT * FROM opportunities ORDER BY discovered_at DESC LIMIT 10"
         ).fetchall()
     ]
     recent_applications = [
         _serialize_application(row)
-        for row in BOT.connection.execute(
+        for row in _bot().connection.execute(
             """
             SELECT
                 applications.opportunity_signature,
@@ -276,6 +283,13 @@ def handle_unexpected_error(exc: Exception) -> Response:
     return _json_error("Internal server error", 500)
 
 
+@app.teardown_appcontext
+def close_bot(_: Any) -> None:
+    bot = g.pop("_bot", None)
+    if bot is not None:
+        bot.close()
+
+
 @app.get("/")
 def index() -> Response:
     return redirect(url_for("dashboard"))
@@ -290,7 +304,7 @@ def dashboard() -> str:
 @app.get("/opportunities")
 @require_role("staff", "admin", "auditor")
 def list_opportunities() -> Response:
-    opportunities = [_serialize_opportunity(row) for row in BOT.connection.execute(
+    opportunities = [_serialize_opportunity(row) for row in _bot().connection.execute(
         "SELECT * FROM opportunities ORDER BY discovered_at DESC"
     ).fetchall()]
     return jsonify(opportunities)
@@ -300,13 +314,13 @@ def list_opportunities() -> Response:
 @require_role("staff", "admin", "auditor")
 def get_opportunity(signature: str) -> Response:
     opportunity = _fetch_opportunity(signature)
-    application_row = BOT.connection.execute(
+    application_row = _bot().connection.execute(
         "SELECT * FROM applications WHERE opportunity_signature = ?",
         (signature,),
     ).fetchone()
     attempts = [
         _serialize_submission_attempt(row)
-        for row in BOT.connection.execute(
+        for row in _bot().connection.execute(
             """
             SELECT attempt_number, succeeded, error_message, happened_at
             FROM submission_attempts
@@ -341,7 +355,7 @@ def submit_opportunity(signature: str) -> Response:
 
     # CSRF protection is intentionally not implemented to keep this Flask app
     # limited to Flask + stdlib. Use flask-wtf or equivalent in production.
-    result = BOT.submit_application(
+    result = _bot().submit_application(
         signature,
         submission_reference=submission_reference,
         status=status,
@@ -353,7 +367,7 @@ def submit_opportunity(signature: str) -> Response:
 @app.get("/donors")
 @require_role("admin", "auditor")
 def list_donors() -> Response:
-    donors = [_serialize_donor(row) for row in BOT.connection.execute(
+    donors = [_serialize_donor(row) for row in _bot().connection.execute(
         "SELECT * FROM donors ORDER BY name COLLATE NOCASE ASC, email ASC"
     ).fetchall()]
     return jsonify(donors)
@@ -377,7 +391,7 @@ def upsert_donor() -> Response:
     if not isinstance(preferences, dict):
         raise ValueError("Field 'preferences' must be an object.")
 
-    BOT.upsert_donor(
+    _bot().upsert_donor(
         email=email,
         name=name,
         opted_out=opted_out,
@@ -394,7 +408,7 @@ def opt_out_donor(email: str) -> Response:
     if donor is None:
         return _json_error("Donor not found", 404)
 
-    BOT.set_donor_opt_out(email, opted_out=True)
+    _bot().set_donor_opt_out(email, opted_out=True)
     updated_donor = _fetch_donor(email)
     return jsonify(updated_donor)
 
@@ -402,14 +416,14 @@ def opt_out_donor(email: str) -> Response:
 @app.get("/analytics")
 @require_role("admin", "auditor")
 def get_analytics() -> Response:
-    stats = BOT.get_outreach_analytics()
+    stats = _bot().get_outreach_analytics()
     return jsonify({"stats": stats})
 
 
 @app.get("/audit-log")
 @require_role("admin", "auditor")
 def audit_log() -> Response:
-    logs = [_serialize_audit_log(row) for row in BOT.connection.execute(
+    logs = [_serialize_audit_log(row) for row in _bot().connection.execute(
         """
         SELECT id, happened_at, action, details_json
         FROM audit_logs

@@ -6,7 +6,7 @@ services:
     image: funding-bot:latest
     command: ["python", "-m", "funding_bot", "send-daily-summary"]
     env_file:
-      - .env.example
+      - .env
     volumes:
       - bot_data:/app/data
 
@@ -29,7 +29,7 @@ services:
         "5000",
       ]
     env_file:
-      - .env.example
+      - .env
     depends_on:
       - bot
     ports:

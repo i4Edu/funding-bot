@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import tempfile
 import unittest
@@ -386,6 +387,10 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
         self.assertEqual("Corporate Donor Updated", corporate[0]["name"])
         self.assertEqual("corporate", corporate[0]["segment"])
         self.assertEqual({"corporate", "institutional"}, {row["segment"] for row in all_donors})
+        latest_upsert = self.bot.connection.execute(
+            "SELECT details_json FROM audit_logs WHERE action = 'donor_upserted' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual("corporate", json.loads(latest_upsert["details_json"])["segment"])
 
     def test_send_outreach_from_template_prefers_segment_template_and_falls_back(self):
         calls = []
@@ -492,6 +497,33 @@ class OutreachAnalyticsAndGdprTests(unittest.TestCase):
         self.assertEqual(1, report["clicked"])
         self.assertEqual(0.5, report["bounce_rate"])
         self.assertEqual("engaged@example.org", report["top_engaged_donors"][0]["donor_email"])
+
+    def test_outreach_analytics_report_orders_ties_by_latest_sent(self):
+        self.bot.send_outreach(
+            donor_email="earlier@example.org",
+            donor_name="Earlier Donor",
+            subject_template="Support {organization_name}",
+            body_template="Hello {donor_name}",
+            sent_at=datetime(2026, 6, 22, 9, 0, tzinfo=timezone.utc),
+        )
+        self.bot.send_outreach(
+            donor_email="later@example.org",
+            donor_name="Later Donor",
+            subject_template="Support {organization_name}",
+            body_template="Hello {donor_name}",
+            sent_at=datetime(2026, 6, 22, 11, 0, tzinfo=timezone.utc),
+        )
+
+        rows = self.bot.connection.execute(
+            "SELECT id, donor_email FROM communications ORDER BY id"
+        ).fetchall()
+        communication_ids = {row["donor_email"]: row["id"] for row in rows}
+        self.bot.record_outreach_event(communication_ids["earlier@example.org"], "opened")
+        self.bot.record_outreach_event(communication_ids["later@example.org"], "opened")
+
+        report = self.bot.build_outreach_analytics_report("2026-06-22", "2026-06-22")
+
+        self.assertEqual("later@example.org", report["top_engaged_donors"][0]["donor_email"])
 
     def test_gdpr_export_and_delete_cover_related_records(self):
         self.bot.upsert_donor(

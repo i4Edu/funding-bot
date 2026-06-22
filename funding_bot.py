@@ -565,11 +565,15 @@ class FundingBot:
             ),
         )
         self.connection.commit()
+        logged_segment = self.connection.execute(
+            "SELECT segment FROM donors WHERE email = ?",
+            (email,),
+        ).fetchone()["segment"]
         self._log_action(
             "donor_upserted",
             email=email,
             opted_out=opted_out,
-            segment=normalized_segment or "unknown",
+            segment=logged_segment,
         )
 
     def list_donors(self, segment: str | None = None) -> list[dict[str, Any]]:
@@ -1457,7 +1461,7 @@ class FundingBot:
                 " HAVING"
                 "  SUM(CASE WHEN oe.event_type = 'opened' THEN 1 ELSE 0 END) > 0"
                 "  OR SUM(CASE WHEN oe.event_type = 'clicked' THEN 1 ELSE 0 END) > 0"
-                " ORDER BY clicked DESC, opened DESC, total_events DESC, c.sent_at DESC"
+                " ORDER BY clicked DESC, opened DESC, total_events DESC, MAX(c.sent_at) DESC"
                 " LIMIT 5",
                 params,
             ).fetchall()
