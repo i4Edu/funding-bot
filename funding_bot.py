@@ -694,6 +694,7 @@ class FundingBot:
         report_date: datetime | None = None,
     ) -> dict[str, str]:
         date = (report_date or self._utcnow()).date().isoformat()
+        recipient_name = recipient.split("@", 1)[0].replace(".", " ").replace("_", " ").title()
         new_opportunities = self.connection.execute(
             """
             SELECT title, status FROM opportunities
@@ -750,7 +751,7 @@ class FundingBot:
             [
                 f"To: {recipient}",
                 "",
-                "Hello Lupael,",
+                f"Hello {recipient_name or 'there'},",
                 "",
                 "Here is today’s funding activity summary:",
                 "",

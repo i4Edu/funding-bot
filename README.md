@@ -15,12 +15,11 @@ described in the project brief:
 
 ## Files
 
-- `/home/runner/work/funding-bot/funding-bot/funding_bot.py` – bot logic
-- `/home/runner/work/funding-bot/funding-bot/tests/test_funding_bot.py` – focused unit tests
+- `funding_bot.py` – bot logic
+- `tests/test_funding_bot.py` – focused unit tests
 
 ## Run tests
 
 ```bash
-cd /home/runner/work/funding-bot/funding-bot
 python -m unittest discover -s tests
 ```
