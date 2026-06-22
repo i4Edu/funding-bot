@@ -3,14 +3,57 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import smtplib
 import sqlite3
+import time
 import zipfile
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
 from xml.sax.saxutils import escape
+
+# ---------------------------------------------------------------------------
+# Simple TTL cache for repeated portal queries
+# ---------------------------------------------------------------------------
+
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+def _validate_email(email: str) -> str:
+    """Return the stripped email or raise ValueError if it looks invalid."""
+    stripped = email.strip()
+    if not _EMAIL_RE.match(stripped):
+        raise ValueError(f"Invalid email address: {stripped!r}")
+    return stripped
+
+
+class _TTLCache:
+    """A minimal thread-unsafe TTL cache keyed by arbitrary hashable keys."""
+
+    def __init__(self, ttl_seconds: float = 300) -> None:
+        self._ttl = ttl_seconds
+        self._store: dict[Any, tuple[Any, float]] = {}
+
+    def get(self, key: Any) -> tuple[bool, Any]:
+        entry = self._store.get(key)
+        if entry is None:
+            return False, None
+        value, expires_at = entry
+        if time.monotonic() > expires_at:
+            del self._store[key]
+            return False, None
+        return True, value
+
+    def set(self, key: Any, value: Any) -> None:
+        self._store[key] = (value, time.monotonic() + self._ttl)
+
+    def invalidate(self, key: Any) -> None:
+        self._store.pop(key, None)
+
+    def clear(self) -> None:
+        self._store.clear()
 
 
 class FundingBotError(Exception):
@@ -92,12 +135,34 @@ class _BasePortalConnector:
     source_name = "Portal"
     base_url = "https://example.org"
 
-    def __init__(self, http_client: Callable[..., Any] | None = None) -> None:
+    def __init__(
+        self,
+        http_client: Callable[..., Any] | None = None,
+        *,
+        cache_ttl: float | None = None,
+    ) -> None:
         self.http_client = http_client
+        if cache_ttl is None:
+            raw_ttl = os.environ.get("PORTAL_CACHE_TTL", "300")
+            try:
+                cache_ttl = float(raw_ttl)
+            except ValueError:
+                cache_ttl = 300
+            if cache_ttl <= 0:
+                cache_ttl = 300
+        self._cache = _TTLCache(ttl_seconds=cache_ttl)
 
     def fetch_opportunities(self, keywords: Iterable[str]) -> list[dict[str, Any]]:
         keyword_list = [keyword.lower() for keyword in (keywords or [])]
+        cache_key = (self.base_url, tuple(sorted(keyword_list)))
+        if self._cache is not None:
+            hit, cached = self._cache.get(cache_key)
+            if hit:
+                return list(cached)
+
         opportunities = self._fetch_remote(keyword_list) if self.http_client else self._demo_data()
+        if self._cache is not None:
+            self._cache.set(cache_key, list(opportunities))
         if not keyword_list:
             return opportunities
 
@@ -380,9 +445,33 @@ class FundingBot:
                 happened_at TEXT NOT NULL,
                 FOREIGN KEY (communication_id) REFERENCES communications(id)
             );
+
+            -- Performance indexes for v1.0
+            CREATE INDEX IF NOT EXISTS idx_opportunities_discovered_at
+                ON opportunities(discovered_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_opportunities_status
+                ON opportunities(status);
+            CREATE INDEX IF NOT EXISTS idx_applications_status
+                ON applications(status);
+            CREATE INDEX IF NOT EXISTS idx_applications_submitted_at
+                ON applications(submitted_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_happened_at
+                ON audit_logs(happened_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_audit_logs_action
+                ON audit_logs(action);
+            CREATE INDEX IF NOT EXISTS idx_communications_donor_email
+                ON communications(donor_email);
+            CREATE INDEX IF NOT EXISTS idx_communications_sent_at
+                ON communications(sent_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_outreach_events_communication_id
+                ON outreach_events(communication_id);
             """
         )
         self._ensure_column("donors", "segment", "TEXT NOT NULL DEFAULT 'unknown'")
+        # Index on donors.segment must be created after the column is guaranteed to exist.
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_donors_segment ON donors(segment)"
+        )
         self.connection.commit()
 
     # Allowlist of table/column identifiers that _ensure_column is permitted to touch.
@@ -536,6 +625,7 @@ class FundingBot:
         preferences: dict[str, Any] | None = None,
         segment: str | None = None,
     ) -> None:
+        email = _validate_email(email)
         normalized_segment = self._validate_segment(segment) if segment is not None else None
         self.connection.execute(
             """
@@ -943,6 +1033,7 @@ class FundingBot:
         sender: Any | None = None,
         sent_at: datetime | None = None,
     ) -> dict[str, Any]:
+        donor_email = _validate_email(donor_email)
         donor = self.connection.execute(
             "SELECT * FROM donors WHERE email = ?",
             (donor_email,),
@@ -1603,10 +1694,109 @@ class FundingBot:
             )
         return summary
 
+    def build_monthly_audit_report(
+        self,
+        *,
+        year: int | None = None,
+        month: int | None = None,
+    ) -> dict[str, Any]:
+        """Generate a GDPR/ISO-style monthly compliance audit report.
 
-# ---------------------------------------------------------------------------
-# CLI entry point
-# ---------------------------------------------------------------------------
+        Parameters
+        ----------
+        year:
+            Four-digit year (defaults to the current UTC year).
+        month:
+            Month number 1–12 (defaults to the current UTC month).
+        """
+        now = self._utcnow()
+        report_year = year if year is not None else now.year
+        report_month = month if month is not None else now.month
+
+        period_start = f"{report_year:04d}-{report_month:02d}-01"
+        if report_month == 12:
+            period_end = f"{report_year + 1:04d}-01-01"
+        else:
+            period_end = f"{report_year:04d}-{report_month + 1:02d}-01"
+
+        # Audit log summary grouped by action
+        action_counts: dict[str, int] = {}
+        for row in self.connection.execute(
+            """
+            SELECT action, COUNT(*) AS total FROM audit_logs
+            WHERE happened_at >= ? AND happened_at < ?
+            GROUP BY action ORDER BY total DESC
+            """,
+            (period_start, period_end),
+        ).fetchall():
+            action_counts[row["action"]] = row["total"]
+
+        # GDPR-sensitive actions
+        gdpr_actions = {
+            k: v
+            for k, v in action_counts.items()
+            if k in {"gdpr_exported", "gdpr_deleted", "donor_opt_out_updated"}
+        }
+
+        # Application outcomes
+        app_by_status: dict[str, int] = {}
+        for row in self.connection.execute(
+            """
+            SELECT status, COUNT(*) AS total FROM applications
+            WHERE submitted_at >= ? AND submitted_at < ?
+            GROUP BY status
+            """,
+            (period_start, period_end),
+        ).fetchall():
+            app_by_status[row["status"]] = row["total"]
+
+        # Outreach statistics
+        outreach_stats = self.build_outreach_analytics_report(
+            start_date=period_start,
+            end_date=f"{report_year:04d}-{report_month:02d}-{_last_day_of_month(report_year, report_month):02d}",
+        )
+
+        # New donors
+        new_donors_count = self.connection.execute(
+            """
+            SELECT COUNT(*) FROM audit_logs
+            WHERE action = 'donor_upserted'
+              AND happened_at >= ? AND happened_at < ?
+            """,
+            (period_start, period_end),
+        ).fetchone()[0]
+
+        # Opted-out donors total
+        opted_out_total = self.connection.execute(
+            "SELECT COUNT(*) FROM donors WHERE opted_out = 1"
+        ).fetchone()[0]
+
+        report = {
+            "report_type": "monthly_compliance_audit",
+            "period": f"{report_year:04d}-{report_month:02d}",
+            "generated_at": self._to_iso(),
+            "audit_log_entries": action_counts,
+            "gdpr_operations": gdpr_actions,
+            "application_outcomes": app_by_status,
+            "outreach_summary": outreach_stats,
+            "new_donors_registered": new_donors_count,
+            "opted_out_donors_total": opted_out_total,
+        }
+        self._log_action(
+            "monthly_audit_report_generated",
+            period=report["period"],
+        )
+        return report
+
+
+def _last_day_of_month(year: int, month: int) -> int:
+    """Return the last calendar day of the given month."""
+    if month == 12:
+        next_month = datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+    else:
+        next_month = datetime(year, month + 1, 1, tzinfo=timezone.utc)
+    last_day = (next_month - timedelta(days=1)).day
+    return last_day
 
 def _print_rows(rows: Iterable[dict[str, Any]], columns: Iterable[str] | None = None) -> None:
     """Print dictionaries as a simple tab-separated table."""
@@ -1700,6 +1890,29 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
         help="Filter donors by segment.",
     )
 
+    monthly_parser = subparsers.add_parser(
+        "monthly-audit-report",
+        help="Generate a monthly GDPR/compliance audit report.",
+    )
+    monthly_parser.add_argument(
+        "--year",
+        type=int,
+        metavar="YEAR",
+        help="Four-digit year (default: current UTC year).",
+    )
+    monthly_parser.add_argument(
+        "--month",
+        type=int,
+        metavar="MONTH",
+        choices=range(1, 13),
+        help="Month number 1–12 (default: current UTC month).",
+    )
+    monthly_parser.add_argument(
+        "--output",
+        metavar="FILE",
+        help="Write the report as JSON to FILE instead of printing it.",
+    )
+
     return parser
 
 
@@ -1741,6 +1954,16 @@ def main(argv: list[str] | None = None) -> None:
                 bot.list_donors(segment=args.segment),
                 ["email", "name", "segment", "opted_out", "last_contact_at"],
             )
+        elif args.command == "monthly-audit-report":
+            report = bot.build_monthly_audit_report(year=args.year, month=args.month)
+            report_json = json.dumps(report, indent=2)
+            if args.output:
+                output_path = Path(args.output)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(report_json, encoding="utf-8")
+                print(f"Monthly audit report written to {args.output}.")
+            else:
+                print(report_json)
     finally:
         bot.close()
 

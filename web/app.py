@@ -6,6 +6,7 @@ import hmac
 import json
 import os
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
@@ -22,16 +23,21 @@ from funding_bot import (  # noqa: E402
     FundingBot,
     FundingBotError,
     OpportunityNotFoundError,
+    _validate_email,
 )
 
 app = Flask(__name__, template_folder=str(Path(__file__).resolve().parent / "templates"))
 app.config["JSON_SORT_KEYS"] = False
+MAX_FEEDBACK_MESSAGE_LENGTH = 2000
 
 ROLE_PASSWORD_ENV_VARS = {
     "admin": "ADMIN_PASSWORD",
     "staff": "STAFF_PASSWORD",
     "auditor": "AUDITOR_PASSWORD",
 }
+
+# Track server start time for the uptime metric.
+_APP_START_TIME = time.time()
 
 
 def _bot() -> FundingBot:
@@ -386,6 +392,8 @@ def upsert_donor() -> Response:
         raise ValueError("Field 'email' is required.")
     if not name:
         raise ValueError("Field 'name' is required.")
+    # Validate email format before passing to the bot layer.
+    email = _validate_email(email)
     if preferences is None:
         preferences = {}
     if not isinstance(preferences, dict):
@@ -437,6 +445,102 @@ def audit_log() -> Response:
 @app.get("/health")
 def health() -> Response:
     return jsonify({"status": "ok"})
+
+
+@app.get("/metrics")
+@require_role("admin", "auditor")
+def metrics() -> Response:
+    """Prometheus-compatible text metrics endpoint.
+
+    Exposes basic operational counters so that a Prometheus scraper or
+    Grafana agent can ingest them without an external library.
+    """
+    bot = _bot()
+    conn = bot.connection
+
+    opportunities_total = conn.execute("SELECT COUNT(*) FROM opportunities").fetchone()[0]
+    applications_total = conn.execute("SELECT COUNT(*) FROM applications").fetchone()[0]
+    pending_applications = conn.execute(
+        "SELECT COUNT(*) FROM applications WHERE status IN ('pending','submitted','in_review')"
+    ).fetchone()[0]
+    donors_total = conn.execute("SELECT COUNT(*) FROM donors").fetchone()[0]
+    opted_out_donors = conn.execute("SELECT COUNT(*) FROM donors WHERE opted_out = 1").fetchone()[0]
+    audit_log_total = conn.execute("SELECT COUNT(*) FROM audit_logs").fetchone()[0]
+    communications_total = conn.execute("SELECT COUNT(*) FROM communications").fetchone()[0]
+    uptime_seconds = time.time() - _APP_START_TIME
+
+    lines = [
+        "# HELP funding_bot_opportunities_total Total funding opportunities discovered",
+        "# TYPE funding_bot_opportunities_total counter",
+        f"funding_bot_opportunities_total {opportunities_total}",
+        "# HELP funding_bot_applications_total Total grant applications recorded",
+        "# TYPE funding_bot_applications_total counter",
+        f"funding_bot_applications_total {applications_total}",
+        "# HELP funding_bot_pending_applications Applications awaiting a decision",
+        "# TYPE funding_bot_pending_applications gauge",
+        f"funding_bot_pending_applications {pending_applications}",
+        "# HELP funding_bot_donors_total Total donor records",
+        "# TYPE funding_bot_donors_total gauge",
+        f"funding_bot_donors_total {donors_total}",
+        "# HELP funding_bot_opted_out_donors Donors who have opted out of outreach",
+        "# TYPE funding_bot_opted_out_donors gauge",
+        f"funding_bot_opted_out_donors {opted_out_donors}",
+        "# HELP funding_bot_audit_log_entries_total Total audit log entries",
+        "# TYPE funding_bot_audit_log_entries_total counter",
+        f"funding_bot_audit_log_entries_total {audit_log_total}",
+        "# HELP funding_bot_communications_total Total outreach emails logged",
+        "# TYPE funding_bot_communications_total counter",
+        f"funding_bot_communications_total {communications_total}",
+        "# HELP funding_bot_uptime_seconds Seconds since the web process started",
+        "# TYPE funding_bot_uptime_seconds gauge",
+        f"funding_bot_uptime_seconds {uptime_seconds:.3f}",
+    ]
+    return Response("\n".join(lines) + "\n", mimetype="text/plain; version=0.0.4")
+
+
+@app.post("/feedback")
+@require_role("staff", "admin")
+def submit_feedback() -> Response:
+    """Accept partner feature-request feedback.
+
+    Expected JSON body::
+
+        {
+            "category": "feature_request" | "bug_report" | "general",
+            "message":  "Free-text feedback from the partner.",
+            "contact":  "optional-reply-to@example.org"
+        }
+
+    The entry is stored in the audit log under the ``partner_feedback``
+    action so it can be reviewed during monthly compliance reports.
+    """
+    payload = _get_request_json()
+    category = str(payload.get("category", "general")).strip().lower()
+    message = str(payload.get("message", "")).strip()
+    contact = str(payload.get("contact", "")).strip() or None
+
+    allowed_categories = {"feature_request", "bug_report", "general"}
+    if category not in allowed_categories:
+        raise ValueError(
+            f"Field 'category' must be one of {sorted(allowed_categories)}."
+        )
+    if not message:
+        raise ValueError("Field 'message' is required.")
+    if len(message) > MAX_FEEDBACK_MESSAGE_LENGTH:
+        raise ValueError(
+            f"Field 'message' must not exceed {MAX_FEEDBACK_MESSAGE_LENGTH} characters."
+        )
+    if contact:
+        contact = _validate_email(contact)
+
+    _bot()._log_action(
+        "partner_feedback",
+        category=category,
+        message=message,
+        contact=contact,
+        submitted_by_role=getattr(g, "current_role", None),
+    )
+    return jsonify({"status": "received", "category": category}), 201
 
 
 if __name__ == "__main__":

@@ -12,20 +12,22 @@
     >
   </head>
   <body class="bg-light">
-    <nav class="navbar navbar-expand-lg navbar-dark bg-success shadow-sm">
+    <a class="visually-hidden-focusable" href="#main-content">Skip to main content</a>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-success shadow-sm" role="navigation" aria-label="Primary navigation">
       <div class="container-fluid">
         <span class="navbar-brand mb-0 h1">Nonprofit Funding Bot</span>
-        <span class="navbar-text text-white-50">Role: {{ current_role }}</span>
+        <span class="navbar-text text-white-50" aria-label="Signed in as {{ current_role }}">Role: {{ current_role }}</span>
       </div>
     </nav>
 
-    <main class="container py-4">
-      <div class="row g-4 mb-4">
+    <main id="main-content" class="container py-4">
+      <h1 class="visually-hidden">Operations Dashboard</h1>
+      <div class="row g-4 mb-4" role="region" aria-label="Summary statistics">
         <div class="col-md-6 col-xl-3">
           <div class="card border-0 shadow-sm h-100">
             <div class="card-body">
-              <h2 class="h6 text-muted">New Opportunities</h2>
-              <p class="display-6 mb-1">{{ new_opportunities_count }}</p>
+              <h2 class="h6 text-muted" id="stat-new-opps">New Opportunities</h2>
+              <p class="display-6 mb-1" aria-labelledby="stat-new-opps">{{ new_opportunities_count }}</p>
               <p class="text-muted mb-0">Found in the last 7 days</p>
             </div>
           </div>
@@ -33,8 +35,8 @@
         <div class="col-md-6 col-xl-3">
           <div class="card border-0 shadow-sm h-100">
             <div class="card-body">
-              <h2 class="h6 text-muted">Applications Submitted</h2>
-              <p class="display-6 mb-1">{{ applications_submitted_count }}</p>
+              <h2 class="h6 text-muted" id="stat-apps-submitted">Applications Submitted</h2>
+              <p class="display-6 mb-1" aria-labelledby="stat-apps-submitted">{{ applications_submitted_count }}</p>
               <p class="text-muted mb-0">Tracked in the system</p>
             </div>
           </div>
@@ -42,8 +44,8 @@
         <div class="col-md-6 col-xl-3">
           <div class="card border-0 shadow-sm h-100">
             <div class="card-body">
-              <h2 class="h6 text-muted">Pending Applications</h2>
-              <p class="display-6 mb-1">{{ pending_applications_count }}</p>
+              <h2 class="h6 text-muted" id="stat-pending-apps">Pending Applications</h2>
+              <p class="display-6 mb-1" aria-labelledby="stat-pending-apps">{{ pending_applications_count }}</p>
               <p class="text-muted mb-0">Awaiting next action</p>
             </div>
           </div>
@@ -51,8 +53,8 @@
         <div class="col-md-6 col-xl-3">
           <div class="card border-0 shadow-sm h-100">
             <div class="card-body">
-              <h2 class="h6 text-muted">Donor Communications</h2>
-              <p class="display-6 mb-1">{{ donor_communications_count }}</p>
+              <h2 class="h6 text-muted" id="stat-donor-comms">Donor Communications</h2>
+              <p class="display-6 mb-1" aria-labelledby="stat-donor-comms">{{ donor_communications_count }}</p>
               <p class="text-muted mb-0">Emails logged</p>
             </div>
           </div>
@@ -63,17 +65,17 @@
         <div class="col-lg-8">
           <div class="card border-0 shadow-sm">
             <div class="card-header bg-white">
-              <h3 class="h5 mb-0">Recent Opportunities</h3>
+              <h2 class="h5 mb-0" id="recent-opps-heading">Recent Opportunities</h2>
             </div>
             <div class="card-body p-0">
               <div class="table-responsive">
-                <table class="table table-hover align-middle mb-0">
+                <table class="table table-hover align-middle mb-0" aria-labelledby="recent-opps-heading">
                   <thead class="table-light">
                     <tr>
-                      <th>Title</th>
-                      <th>Donor</th>
-                      <th>Status</th>
-                      <th>Discovered</th>
+                      <th scope="col">Title</th>
+                      <th scope="col">Donor</th>
+                      <th scope="col">Status</th>
+                      <th scope="col">Discovered</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -103,12 +105,12 @@
         <div class="col-lg-4">
           <div class="card border-0 shadow-sm">
             <div class="card-header bg-white">
-              <h3 class="h5 mb-0">Recent Applications</h3>
+              <h2 class="h5 mb-0" id="recent-apps-heading">Recent Applications</h2>
             </div>
             <div class="card-body">
-              <div class="list-group list-group-flush">
+              <ul class="list-group list-group-flush" aria-labelledby="recent-apps-heading">
                 {% for application in recent_applications %}
-                <div class="list-group-item px-0">
+                <li class="list-group-item px-0">
                   <div class="fw-semibold">{{ application.title }}</div>
                   <div class="small text-muted">{{ application.donor_name }}</div>
                   <div class="small mt-1">
@@ -116,11 +118,11 @@
                   </div>
                   <div class="small text-muted mt-2">{{ application.submitted_at }}</div>
                   <div class="small">{{ application.next_action }}</div>
-                </div>
+                </li>
                 {% else %}
-                <div class="text-muted">No applications submitted yet.</div>
+                <li class="list-group-item px-0 text-muted">No applications submitted yet.</li>
                 {% endfor %}
-              </div>
+              </ul>
             </div>
           </div>
         </div>

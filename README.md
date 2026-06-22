@@ -147,6 +147,7 @@ Command reference:
 | `list-opportunities` | `v0.3.0` | `--status STATUS` | List discovered opportunities, optionally filtered by status. | Available |
 | `audit-log` | `v0.3.0` | `--limit N`, `--action ACTION` | Review recent audit events for compliance and operational troubleshooting. | Available |
 | `list-donors` | `v0.3.0` | `--segment {corporate,institutional,individual,unknown}` | List donor records and segment membership. | Available |
+| `monthly-audit-report` | `v1.0.0` | `--year YEAR`, `--month MONTH`, `--output FILE` | Generate a monthly GDPR/ISO compliance audit report as JSON. | Available |
 
 ## SMTP Configuration
 
@@ -173,6 +174,10 @@ pip install flask
 python -m flask --app web.app run
 ```
 
+### Dashboard screenshot
+
+![Funding Bot dashboard](docs/images/dashboard-screenshot.png)
+
 ### Role-based authentication
 
 The dashboard uses HTTP Basic Auth. Use one of these usernames as the role name:
@@ -188,7 +193,7 @@ The dashboard uses HTTP Basic Auth. Use one of these usernames as the role name:
 | Route | Method | Roles | Purpose |
 | --- | --- | --- | --- |
 | `/` | `GET` | Public | Redirect to `/dashboard`. |
-| `/dashboard` | `GET` | `staff`, `admin`, `auditor` | HTML operations dashboard. |
+| `/dashboard` | `GET` | `staff`, `admin`, `auditor` | HTML operations dashboard (WCAG 2.1 accessible). |
 | `/opportunities` | `GET` | `staff`, `admin`, `auditor` | List opportunities as JSON. |
 | `/opportunities/<signature>` | `GET` | `staff`, `admin`, `auditor` | Show one opportunity, linked application, and submission attempts. |
 | `/opportunities/<signature>/submit` | `POST` | `admin` | Record a submission result for an opportunity. |
@@ -196,7 +201,40 @@ The dashboard uses HTTP Basic Auth. Use one of these usernames as the role name:
 | `/donors/<email>/opt-out` | `POST` | `admin` | Mark a donor as opted out. |
 | `/analytics` | `GET` | `admin`, `auditor` | Return outreach analytics data. |
 | `/audit-log` | `GET` | `admin`, `auditor` | Return the latest audit log entries. |
+| `/feedback` | `POST` | `staff`, `admin` | Submit partner feature-request or bug-report feedback. |
+| `/metrics` | `GET` | `admin`, `auditor` | Prometheus-compatible text metrics for Grafana scraping. |
 | `/health` | `GET` | Public | Health-check endpoint. |
+
+### Prometheus metrics
+
+The `/metrics` endpoint exposes the following gauges and counters in the Prometheus text exposition format:
+
+| Metric | Type | Description |
+| --- | --- | --- |
+| `funding_bot_opportunities_total` | counter | Total opportunities discovered |
+| `funding_bot_applications_total` | counter | Total grant applications recorded |
+| `funding_bot_pending_applications` | gauge | Applications awaiting a decision |
+| `funding_bot_donors_total` | gauge | Total donor records |
+| `funding_bot_opted_out_donors` | gauge | Donors who have opted out |
+| `funding_bot_audit_log_entries_total` | counter | Total audit log entries |
+| `funding_bot_communications_total` | counter | Total outreach emails logged |
+| `funding_bot_uptime_seconds` | gauge | Seconds since the web process started |
+
+Add a scrape target pointing to `http://<host>:5000/metrics` in your Prometheus configuration or Grafana Agent config, and authenticate with an `admin` or `auditor` dashboard role.
+
+### Partner feedback
+
+Staff and admin users can submit feedback for the feature backlog:
+
+```bash
+curl -u staff:$STAFF_PASSWORD \
+  -X POST http://localhost:5000/feedback \
+  -H "Content-Type: application/json" \
+  -d '{"category": "feature_request", "message": "Add CSV export for audit logs.", "contact": "partner@ngo.org"}'
+```
+
+Allowed categories: `feature_request`, `bug_report`, `general`.
+The `message` field must be non-empty and at most 2000 characters.
 
 ## Docker Deployment
 
@@ -256,6 +294,49 @@ Use a system cron job to send the report every day at 9 AM:
 ```
 
 For Kubernetes deployments, mirror this schedule with a `CronJob` that runs the same CLI command inside the bot container.
+
+## Partner Onboarding
+
+Use the included onboarding script to set up a new NGO partner environment in a single step:
+
+```bash
+bash scripts/onboard.sh
+```
+
+The script:
+1. Verifies Python 3.11+ and Docker prerequisites.
+2. Copies `.env.example` to `.env` and prompts for SMTP credentials and dashboard passwords (passwords are not echoed).
+3. Installs Python dependencies.
+4. Runs the test suite.
+5. Builds and starts the Docker Compose stack (pass `--skip-docker` to skip).
+6. Smoke-tests the `/health` endpoint.
+
+Options:
+
+| Option | Description |
+| --- | --- |
+| `--env-file PATH` | Path to write the `.env` file (default: `.env`). When Docker is enabled, the script links `.env` to this file so Compose uses the same values. |
+| `--db-path PATH` | SQLite database path written into `.env` (default: `/app/data/funding_bot.db`). |
+| `--skip-docker` | Set up the Python environment only; do not start Docker. |
+
+## Compliance Reports
+
+Generate a monthly audit report for any period:
+
+```bash
+# Print to stdout (JSON)
+python -m funding_bot monthly-audit-report
+
+# Save to a file for a specific month
+python -m funding_bot monthly-audit-report --year 2025 --month 6 --output reports/2025-06-audit.json
+```
+
+The report includes:
+- Audit log entries grouped by action type
+- GDPR operations (exports, deletions, opt-outs)
+- Application outcome counts by status
+- Outreach analytics (sent, opened, clicked, bounce rate)
+- New donor registrations and total opted-out count
 
 ## Roadmap
 
