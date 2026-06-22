@@ -1,6 +1,7 @@
 import os
 import tempfile
 import unittest
+import unittest.mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from funding_bot import (
     FundingBotError,
     OptOutError,
     OutreachThrottledError,
+    SMTPEmailSender,
 )
 
 
@@ -218,5 +220,100 @@ class FundingBotTests(unittest.TestCase):
         self.assertIn("Pending Applications: 1", summary["body"])
 
 
+class SMTPEmailSenderTests(unittest.TestCase):
+    def test_from_env_reads_environment_variables(self):
+        env = {
+            "SMTP_HOST": "mail.example.org",
+            "SMTP_PORT": "465",
+            "SMTP_USERNAME": "bot@example.org",
+            "SMTP_PASSWORD": "s3cr3t",
+            "SMTP_USE_TLS": "1",
+            "SMTP_FROM": "noreply@example.org",
+        }
+        with unittest.mock.patch.dict(os.environ, env, clear=False):
+            sender = SMTPEmailSender.from_env()
+
+        self.assertEqual("mail.example.org", sender.host)
+        self.assertEqual(465, sender.port)
+        self.assertEqual("bot@example.org", sender.username)
+        self.assertEqual("s3cr3t", sender.password)
+        self.assertTrue(sender.use_tls)
+        self.assertEqual("noreply@example.org", sender.from_address)
+
+    def test_from_env_defaults(self):
+        # Remove relevant vars so we test defaults
+        clean_env = {
+            k: v for k, v in os.environ.items()
+            if k not in ("SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
+                         "SMTP_USE_TLS", "SMTP_FROM")
+        }
+        with unittest.mock.patch.dict(os.environ, clean_env, clear=True):
+            sender = SMTPEmailSender.from_env()
+
+        self.assertEqual("localhost", sender.host)
+        self.assertEqual(587, sender.port)
+        self.assertTrue(sender.use_tls)
+
+    def test_from_env_tls_disabled(self):
+        with unittest.mock.patch.dict(os.environ, {"SMTP_USE_TLS": "0"}, clear=False):
+            sender = SMTPEmailSender.from_env()
+        self.assertFalse(sender.use_tls)
+
+
+class SendDailySummaryTests(unittest.TestCase):
+    def setUp(self):
+        self.bot = FundingBot(trusted_sources={"Grants Portal"})
+        self.bot.store_organization_profile(
+            {"name": "i4Edu", "mission": "Expand access to equitable education."}
+        )
+
+    def tearDown(self):
+        self.bot.close()
+
+    def test_send_daily_summary_calls_sender(self):
+        calls = []
+
+        def fake_sender(to_addr, subject, body):
+            calls.append({"to": to_addr, "subject": subject, "body": body})
+
+        summary = self.bot.send_daily_summary(
+            recipient="lupael@i4e.com.bd",
+            sender=fake_sender,
+            report_date=datetime(2026, 6, 22, 9, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual("lupael@i4e.com.bd", calls[0]["to"])
+        self.assertIn("Daily Nonprofit Funding Report – 2026-06-22", calls[0]["subject"])
+        self.assertEqual(summary["subject"], calls[0]["subject"])
+        self.assertEqual(summary["body"], calls[0]["body"])
+
+    def test_send_daily_summary_no_sender_returns_summary_without_sending(self):
+        summary = self.bot.send_daily_summary(
+            recipient="lupael@i4e.com.bd",
+            report_date=datetime(2026, 6, 22, 9, 0, tzinfo=timezone.utc),
+        )
+        self.assertIn("Daily Nonprofit Funding Report", summary["subject"])
+        self.assertIn("body", summary)
+
+    def test_outreach_sender_callable_is_invoked(self):
+        calls = []
+
+        def fake_sender(to_addr, subject, body):
+            calls.append(to_addr)
+
+        self.bot.send_outreach(
+            donor_email="donor@example.org",
+            donor_name="Donor",
+            subject_template="Support {organization_name}",
+            body_template="Hello {donor_name}",
+            sender=fake_sender,
+            sent_at=datetime(2026, 6, 22, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(["donor@example.org"], calls)
+
+
 if __name__ == "__main__":
     unittest.main()
+
