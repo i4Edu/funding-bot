@@ -28,6 +28,7 @@ from funding_bot import (  # noqa: E402
 
 app = Flask(__name__, template_folder=str(Path(__file__).resolve().parent / "templates"))
 app.config["JSON_SORT_KEYS"] = False
+MAX_FEEDBACK_MESSAGE_LENGTH = 2000
 
 ROLE_PASSWORD_ENV_VARS = {
     "admin": "ADMIN_PASSWORD",
@@ -447,6 +448,7 @@ def health() -> Response:
 
 
 @app.get("/metrics")
+@require_role("admin", "auditor")
 def metrics() -> Response:
     """Prometheus-compatible text metrics endpoint.
 
@@ -524,6 +526,10 @@ def submit_feedback() -> Response:
         )
     if not message:
         raise ValueError("Field 'message' is required.")
+    if len(message) > MAX_FEEDBACK_MESSAGE_LENGTH:
+        raise ValueError(
+            f"Field 'message' must not exceed {MAX_FEEDBACK_MESSAGE_LENGTH} characters."
+        )
     if contact:
         contact = _validate_email(contact)
 

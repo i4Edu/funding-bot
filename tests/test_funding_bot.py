@@ -773,6 +773,106 @@ class CliExtensionTests(unittest.TestCase):
         self.assertIn("email\tname\tsegment\topted_out\tlast_contact_at", output)
         self.assertIn("corp@example.org\tCorporate Donor\tcorporate", output)
 
+    def test_monthly_audit_report_command_prints_json_to_stdout(self):
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(["--db", str(self.db_path), "monthly-audit-report", "--year", "2026", "--month", "6"])
+
+        report = json.loads(stdout.getvalue())
+        self.assertEqual("monthly_compliance_audit", report["report_type"])
+        self.assertEqual("2026-06", report["period"])
+
+    def test_monthly_audit_report_command_writes_output_file_with_missing_parent_dir(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_path = Path(tmpdir) / "reports" / "2026-06-audit.json"
+            with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                main(
+                    [
+                        "--db",
+                        str(self.db_path),
+                        "monthly-audit-report",
+                        "--year",
+                        "2026",
+                        "--month",
+                        "6",
+                        "--output",
+                        str(output_path),
+                    ]
+                )
+
+            self.assertTrue(output_path.exists())
+            report = json.loads(output_path.read_text(encoding="utf-8"))
+            self.assertEqual("2026-06", report["period"])
+            self.assertIn(str(output_path), stdout.getvalue())
+
+
+class MonthlyAuditReportTests(unittest.TestCase):
+    def setUp(self):
+        self.bot = FundingBot(trusted_sources={"Grants Portal"})
+        self.bot.store_organization_profile({"name": "i4Edu"})
+
+    def tearDown(self):
+        self.bot.close()
+
+    def test_build_monthly_audit_report_summarizes_expected_sections(self):
+        self.bot.connection.execute(
+            """
+            INSERT INTO audit_logs (happened_at, action, details_json)
+            VALUES (?, 'gdpr_exported', ?)
+            """,
+            ("2026-06-10T12:00:00+00:00", json.dumps({"subject_email": "privacy@example.org"})),
+        )
+        self.bot.connection.execute(
+            """
+            INSERT INTO audit_logs (happened_at, action, details_json)
+            VALUES (?, 'donor_upserted', ?)
+            """,
+            ("2026-06-12T10:00:00+00:00", json.dumps({"email": "new@example.org"})),
+        )
+        self.bot.connection.execute(
+            """
+            INSERT INTO donors (email, name, segment, opted_out)
+            VALUES (?, ?, ?, ?)
+            """,
+            ("optout@example.org", "Opt Out", "unknown", 1),
+        )
+        signature = self.bot.discover_opportunities(
+            [
+                {
+                    "source": "Grants Portal",
+                    "donor_name": "UNICEF",
+                    "title": "UNICEF CSR Grant",
+                    "portal_url": "https://example.org/unicef",
+                    "summary": "CSR funding for nonprofit education programs.",
+                    "tags": ["CSR funding", "nonprofit grants"],
+                    "category": "Education",
+                }
+            ],
+            keywords=["csr funding"],
+        )[0]["signature"]
+        self.bot.submit_application(
+            signature,
+            submission_reference="ref-1",
+            status="submitted",
+            next_action="Await donor review",
+            submitted_at=datetime(2026, 6, 9, 9, 0, tzinfo=timezone.utc),
+        )
+        self.bot.connection.commit()
+
+        report = self.bot.build_monthly_audit_report(year=2026, month=6)
+
+        self.assertEqual("monthly_compliance_audit", report["report_type"])
+        self.assertEqual("2026-06", report["period"])
+        self.assertEqual(1, report["audit_log_entries"]["gdpr_exported"])
+        self.assertEqual(1, report["gdpr_operations"]["gdpr_exported"])
+        self.assertEqual(1, report["application_outcomes"]["submitted"])
+        self.assertEqual(1, report["new_donors_registered"])
+        self.assertEqual(1, report["opted_out_donors_total"])
+        latest_audit = self.bot.connection.execute(
+            "SELECT action, details_json FROM audit_logs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual("monthly_audit_report_generated", latest_audit["action"])
+        self.assertEqual("2026-06", json.loads(latest_audit["details_json"])["period"])
+
 
 if __name__ == "__main__":
     unittest.main()

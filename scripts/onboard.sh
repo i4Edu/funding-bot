@@ -48,7 +48,7 @@ prompt_secret() {
   local value
   read -rsp "  ${description}: " value
   echo
-  echo "${var_name}=${value}" >> "$ENV_FILE"
+  set_env_var "$var_name" "$value"
 }
 
 prompt_value() {
@@ -58,7 +58,42 @@ prompt_value() {
   local value
   read -rp "  ${description} [${default_val}]: " value
   value="${value:-$default_val}"
-  echo "${var_name}=${value}" >> "$ENV_FILE"
+  set_env_var "$var_name" "$value"
+}
+
+set_env_var() {
+  local var_name="$1"
+  local value="$2"
+  python3 - "$ENV_FILE" "$var_name" "$value" <<'PY'
+from pathlib import Path
+import sys
+
+env_path = Path(sys.argv[1])
+key = sys.argv[2]
+value = sys.argv[3]
+escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+replacement = f'{key}="{escaped}"'
+
+if env_path.exists():
+    lines = env_path.read_text(encoding="utf-8").splitlines()
+else:
+    lines = []
+
+updated: list[str] = []
+replaced = False
+prefix = f"{key}="
+for line in lines:
+    if line.startswith(prefix):
+        if not replaced:
+            updated.append(replacement)
+            replaced = True
+        continue
+    updated.append(line)
+if not replaced:
+    updated.append(replacement)
+
+env_path.write_text("\n".join(updated) + "\n", encoding="utf-8")
+PY
 }
 
 # ── Step 1: Prerequisites ────────────────────────────────────────────────────
@@ -99,6 +134,7 @@ else
     error ".env.example not found. Run this script from the repository root."
   fi
   cp ".env.example" "$ENV_FILE"
+  chmod 600 "$ENV_FILE"
   info "Created ${ENV_FILE} from .env.example."
   echo ""
   echo "Please supply your configuration values."
@@ -115,6 +151,7 @@ else
   prompt_secret "ADMIN_PASSWORD"   "Admin dashboard password"
   prompt_secret "STAFF_PASSWORD"   "Staff dashboard password"
   prompt_secret "AUDITOR_PASSWORD" "Auditor dashboard password"
+  chmod 600 "$ENV_FILE"
   success "${ENV_FILE} written."
 fi
 
@@ -138,6 +175,10 @@ fi
 
 # ── Step 5: Docker Compose ───────────────────────────────────────────────────
 if [[ "$SKIP_DOCKER" == false ]]; then
+  if [[ "$ENV_FILE" != ".env" ]]; then
+    ln -sf "$(realpath "$ENV_FILE")" ".env"
+    info "Linked .env to ${ENV_FILE} for Docker Compose service env_file compatibility."
+  fi
   info "Building and starting Docker Compose stack…"
   docker compose --env-file "$ENV_FILE" up --build -d
   success "Stack started."

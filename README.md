@@ -174,6 +174,10 @@ pip install flask
 python -m flask --app web.app run
 ```
 
+### Dashboard screenshot
+
+![Funding Bot dashboard](docs/images/dashboard-screenshot.png)
+
 ### Role-based authentication
 
 The dashboard uses HTTP Basic Auth. Use one of these usernames as the role name:
@@ -198,7 +202,7 @@ The dashboard uses HTTP Basic Auth. Use one of these usernames as the role name:
 | `/analytics` | `GET` | `admin`, `auditor` | Return outreach analytics data. |
 | `/audit-log` | `GET` | `admin`, `auditor` | Return the latest audit log entries. |
 | `/feedback` | `POST` | `staff`, `admin` | Submit partner feature-request or bug-report feedback. |
-| `/metrics` | `GET` | Public | Prometheus-compatible text metrics for Grafana scraping. |
+| `/metrics` | `GET` | `admin`, `auditor` | Prometheus-compatible text metrics for Grafana scraping. |
 | `/health` | `GET` | Public | Health-check endpoint. |
 
 ### Prometheus metrics
@@ -216,7 +220,7 @@ The `/metrics` endpoint exposes the following gauges and counters in the Prometh
 | `funding_bot_communications_total` | counter | Total outreach emails logged |
 | `funding_bot_uptime_seconds` | gauge | Seconds since the web process started |
 
-Add a scrape target pointing to `http://<host>:5000/metrics` in your Prometheus configuration or Grafana Agent config.
+Add a scrape target pointing to `http://<host>:5000/metrics` in your Prometheus configuration or Grafana Agent config, and authenticate with an `admin` or `auditor` dashboard role.
 
 ### Partner feedback
 
@@ -230,6 +234,7 @@ curl -u staff:$STAFF_PASSWORD \
 ```
 
 Allowed categories: `feature_request`, `bug_report`, `general`.
+The `message` field must be non-empty and at most 2000 characters.
 
 ## Docker Deployment
 
@@ -310,7 +315,7 @@ Options:
 
 | Option | Description |
 | --- | --- |
-| `--env-file PATH` | Path to write the `.env` file (default: `.env`). |
+| `--env-file PATH` | Path to write the `.env` file (default: `.env`). When Docker is enabled, the script links `.env` to this file so Compose uses the same values. |
 | `--db-path PATH` | SQLite database path written into `.env` (default: `/app/data/funding_bot.db`). |
 | `--skip-docker` | Set up the Python environment only; do not start Docker. |
 

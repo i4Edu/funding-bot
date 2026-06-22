@@ -135,16 +135,21 @@ class _BasePortalConnector:
     source_name = "Portal"
     base_url = "https://example.org"
 
-    # Shared per-class cache: subclasses each get their own instance via _get_cache().
-    _cache: _TTLCache | None = None
-
     def __init__(
         self,
         http_client: Callable[..., Any] | None = None,
         *,
-        cache_ttl: float = 300,
+        cache_ttl: float | None = None,
     ) -> None:
         self.http_client = http_client
+        if cache_ttl is None:
+            raw_ttl = os.environ.get("PORTAL_CACHE_TTL", "300")
+            try:
+                cache_ttl = float(raw_ttl)
+            except ValueError:
+                cache_ttl = 300
+            if cache_ttl <= 0:
+                cache_ttl = 300
         self._cache = _TTLCache(ttl_seconds=cache_ttl)
 
     def fetch_opportunities(self, keywords: Iterable[str]) -> list[dict[str, Any]]:
@@ -1953,7 +1958,9 @@ def main(argv: list[str] | None = None) -> None:
             report = bot.build_monthly_audit_report(year=args.year, month=args.month)
             report_json = json.dumps(report, indent=2)
             if args.output:
-                Path(args.output).write_text(report_json, encoding="utf-8")
+                output_path = Path(args.output)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(report_json, encoding="utf-8")
                 print(f"Monthly audit report written to {args.output}.")
             else:
                 print(report_json)
