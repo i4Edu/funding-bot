@@ -23,6 +23,7 @@ from funding_bot import (  # noqa: E402
     FundingBot,
     FundingBotError,
     OpportunityNotFoundError,
+    SMTPEmailSender,
     _validate_email,
 )
 
@@ -440,6 +441,131 @@ def audit_log() -> Response:
         """
     ).fetchall()]
     return jsonify(logs)
+
+
+@app.get("/settings")
+@require_role("staff", "admin", "auditor")
+def settings_page() -> str:
+    bot = _bot()
+    smtp_configured = SMTPEmailSender.is_configured()
+    context = {
+        "current_role": getattr(g, "current_role", None),
+        "organization_profile": bot.load_organization_profile(),
+        "search_settings": bot.load_search_settings(),
+        "credentials": bot.list_credentials(),
+        "smtp_configured": smtp_configured,
+        "smtp_host": os.environ.get("SMTP_HOST", ""),
+    }
+    return render_template("settings.html", **context)
+
+
+@app.post("/settings/organization")
+@require_role("admin")
+def update_organization_settings() -> Response:
+    payload = _get_request_json()
+    if not payload:
+        raise ValueError(
+            "Request body must contain at least one profile field, e.g. "
+            "'name', 'mission', or 'registration_number'."
+        )
+    _bot().store_organization_profile(payload)
+    return jsonify({"organization_profile": _bot().load_organization_profile()})
+
+
+@app.post("/settings/search")
+@require_role("admin")
+def update_search_settings() -> Response:
+    payload = _get_request_json()
+    keywords = payload.get("keywords", [])
+    trusted_sources = payload.get("trusted_sources", [])
+    if isinstance(keywords, str):
+        keywords = [item.strip() for item in keywords.split(",") if item.strip()]
+    if isinstance(trusted_sources, str):
+        trusted_sources = [item.strip() for item in trusted_sources.split(",") if item.strip()]
+    if not isinstance(keywords, list) or not isinstance(trusted_sources, list):
+        raise ValueError(
+            "Fields 'keywords' and 'trusted_sources' must be lists (e.g. "
+            "[\"education\", \"csr\"]) or comma-separated strings (e.g. \"education,csr\")."
+        )
+
+    settings = _bot().store_search_settings(keywords=keywords, trusted_sources=trusted_sources)
+    return jsonify({"search_settings": settings})
+
+
+@app.post("/settings/credentials")
+@require_role("admin")
+def register_credential_route() -> Response:
+    payload = _get_request_json()
+    alias = str(payload.get("alias", "")).strip()
+    env_var_name = str(payload.get("env_var_name", "")).strip()
+    if not alias:
+        raise ValueError("Field 'alias' is required.")
+    if not env_var_name:
+        raise ValueError("Field 'env_var_name' is required.")
+
+    _bot().register_credential(alias, env_var_name)
+    return jsonify({"credentials": _bot().list_credentials()}), 201
+
+
+@app.post("/settings/discover")
+@require_role("admin")
+def run_discovery_now() -> Response:
+    """Trigger a live search across configured donation sources.
+
+    Demonstrates the bot's donation-search capability directly from the
+    admin panel: it queries every configured portal connector, filters by
+    the saved keyword/source settings (or an ad-hoc override), and persists
+    any newly discovered opportunities.
+    """
+    payload = request.get_json(silent=True) or {}
+    keywords = payload.get("keywords")
+    trusted_sources = payload.get("trusted_sources")
+    if isinstance(keywords, str):
+        keywords = [item.strip() for item in keywords.split(",") if item.strip()]
+    if isinstance(trusted_sources, str):
+        trusted_sources = [item.strip() for item in trusted_sources.split(",") if item.strip()]
+
+    found = _bot().run_discovery(keywords=keywords, trusted_sources=trusted_sources)
+    return jsonify({"new_opportunities": found, "count": len(found)})
+
+
+@app.post("/settings/test-outreach")
+@require_role("admin")
+def send_test_outreach() -> Response:
+    """Compose (and optionally send) a donor outreach email from the panel.
+
+    This demonstrates the bot's ability to communicate with a donor without
+    requiring CLI access: by default the email is only composed and logged
+    (``dry_run``); set ``"dry_run": false`` to actually deliver it via the
+    configured SMTP credentials.
+    """
+    payload = _get_request_json()
+    email = str(payload.get("email", "")).strip()
+    name = str(payload.get("name", "")).strip()
+    dry_run = _coerce_bool(payload.get("dry_run", True), "dry_run")
+    subject_template = payload.get(
+        "subject_template", "Thank you for supporting {organization_name}"
+    )
+    body_template = payload.get(
+        "body_template",
+        "Dear {donor_name},\n\nThank you for your continued interest in {organization_name}.",
+    )
+
+    if not email:
+        raise ValueError("Field 'email' is required.")
+    if not name:
+        raise ValueError("Field 'name' is required.")
+
+    sender = None if dry_run else SMTPEmailSender.from_env()
+    result = _bot().send_outreach(
+        donor_email=email,
+        donor_name=name,
+        subject_template=subject_template,
+        body_template=body_template,
+        sender=sender,
+    )
+    result["dry_run"] = dry_run
+    return jsonify(result), 201
 
 
 @app.get("/health")

@@ -874,5 +874,141 @@ class MonthlyAuditReportTests(unittest.TestCase):
         self.assertEqual("2026-06", json.loads(latest_audit["details_json"])["period"])
 
 
+class SearchSettingsAndDiscoveryTests(unittest.TestCase):
+    """Tests for persisted settings and end-to-end discovery orchestration."""
+
+    def setUp(self):
+        self.bot = FundingBot(db_path=":memory:")
+
+    def tearDown(self):
+        self.bot.close()
+
+    def test_store_and_load_search_settings(self):
+        saved = self.bot.store_search_settings(
+            keywords=[" Education ", "csr", "csr"],
+            trusted_sources=["Grants Portal", ""],
+        )
+        self.assertEqual(["Education", "csr"], saved["keywords"])
+        self.assertEqual(["Grants Portal"], saved["trusted_sources"])
+
+        loaded = self.bot.load_search_settings()
+        self.assertEqual(saved, loaded)
+
+    def test_load_search_settings_defaults_when_unset(self):
+        self.assertEqual({"keywords": [], "trusted_sources": []}, self.bot.load_search_settings())
+
+    def test_register_credential_and_list_credentials(self):
+        self.bot.register_credential("smtp", "SMTP_PASSWORD")
+        self.assertEqual(
+            [{"alias": "smtp", "env_var_name": "SMTP_PASSWORD"}],
+            self.bot.list_credentials(),
+        )
+
+    def test_store_organization_profile_round_trips_through_generic_settings(self):
+        self.bot.store_organization_profile({"name": "i4Edu", "mission": "Educate"})
+        self.assertEqual({"name": "i4Edu", "mission": "Educate"}, self.bot.load_organization_profile())
+        # It is addressable via the generic setting API too.
+        self.assertEqual({"name": "i4Edu", "mission": "Educate"}, self.bot.load_setting("profile"))
+
+    def test_run_discovery_uses_connectors_and_persists_new_opportunities(self):
+        found = self.bot.run_discovery(
+            [GrantsPortalConnector(), CSRNetworkConnector(), NGODirectoryConnector()],
+            keywords=["education"],
+        )
+        self.assertEqual(1, len(found))
+        self.assertEqual("Education Innovation Grant", found[0]["title"])
+
+        stored = self.bot.list_opportunities()
+        self.assertEqual(1, len(stored))
+
+        # Re-running should not duplicate the already-discovered opportunity.
+        found_again = self.bot.run_discovery(
+            [GrantsPortalConnector(), CSRNetworkConnector(), NGODirectoryConnector()],
+            keywords=["education"],
+        )
+        self.assertEqual([], found_again)
+
+    def test_run_discovery_falls_back_to_stored_search_settings(self):
+        self.bot.store_search_settings(keywords=["csr"])
+        found = self.bot.run_discovery([GrantsPortalConnector(), CSRNetworkConnector()])
+        self.assertEqual(1, len(found))
+        self.assertEqual("CSR Digital Learning Fund", found[0]["title"])
+
+    def test_run_discovery_defaults_to_builtin_connectors(self):
+        found = self.bot.run_discovery(keywords=["literacy"])
+        self.assertEqual(1, len(found))
+        self.assertEqual("NGO Directory", found[0]["source"])
+
+
+class CliSearchAndSettingsCommandsTests(unittest.TestCase):
+    """Tests for the settings/discovery/outreach CLI commands."""
+
+    def setUp(self):
+        self.db_path = Path(".test_cli_settings.db")
+        if self.db_path.exists():
+            self.db_path.unlink()
+
+    def tearDown(self):
+        if self.db_path.exists():
+            self.db_path.unlink()
+
+    def test_discover_command_prints_new_opportunities(self):
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(["--db", str(self.db_path), "discover", "--keywords", "education"])
+
+        output = stdout.getvalue()
+        self.assertIn("Education Innovation Grant", output)
+
+    def test_discover_command_reports_no_results(self):
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(["--db", str(self.db_path), "discover", "--keywords", "no-such-keyword"])
+
+        self.assertIn("No new opportunities found.", stdout.getvalue())
+
+    def test_send_outreach_command_dry_run_does_not_send_but_logs(self):
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(
+                [
+                    "--db",
+                    str(self.db_path),
+                    "send-outreach",
+                    "--email",
+                    "donor@example.org",
+                    "--name",
+                    "Donor",
+                    "--dry-run",
+                ]
+            )
+
+        output = stdout.getvalue()
+        self.assertIn("dry run", output)
+
+        bot = FundingBot(db_path=self.db_path)
+        try:
+            communications = bot.connection.execute("SELECT * FROM communications").fetchall()
+            self.assertEqual(1, len(communications))
+            self.assertEqual("donor@example.org", communications[0]["donor_email"])
+        finally:
+            bot.close()
+
+    def test_set_organization_profile_and_show_settings_commands(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            profile_path = Path(tmpdir) / "profile.json"
+            profile_path.write_text(json.dumps({"name": "i4Edu"}), encoding="utf-8")
+            main(["--db", str(self.db_path), "set-organization-profile", "--file", str(profile_path)])
+
+        main(["--db", str(self.db_path), "register-credential", "--alias", "smtp", "--env-var", "SMTP_PASSWORD"])
+
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(["--db", str(self.db_path), "show-settings"])
+
+        output = stdout.getvalue()
+        json_blob, _, table_output = output.partition("Credential aliases")
+        settings = json.loads(json_blob)
+        self.assertEqual({"name": "i4Edu"}, settings["organization_profile"])
+        self.assertIn("smtp", table_output)
+        self.assertIn("SMTP_PASSWORD", table_output)
+
+
 if __name__ == "__main__":
     unittest.main()
