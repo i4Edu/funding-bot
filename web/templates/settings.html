@@ -17,7 +17,7 @@
       <div class="container-fluid">
         <span class="navbar-brand mb-0 h1">Nonprofit Funding Bot</span>
         <a class="nav-link text-white" href="{{ url_for('dashboard') }}">Dashboard</a>
-        <span class="navbar-text text-white-50" aria-label="Signed in as {{ current_role }}">Role: {{ current_role }}</span>
+        <span class="navbar-text text-white-50">Role: {{ current_role }}</span>
       </div>
     </nav>
 
@@ -85,14 +85,14 @@
               </ul>
               <form id="credential-form" class="row g-2">
                 <div class="col-5">
-                  <label class="visually-hidden" for="credential-alias">Credential alias</label>
-                  <input class="form-control" id="credential-alias" name="alias" placeholder="alias">
+                  <label class="form-label small mb-1" for="credential-alias">Alias</label>
+                  <input class="form-control" id="credential-alias" name="alias" placeholder="e.g. smtp">
                 </div>
                 <div class="col-5">
-                  <label class="visually-hidden" for="credential-env-var">Environment variable name</label>
-                  <input class="form-control" id="credential-env-var" name="env_var_name" placeholder="ENV_VAR_NAME">
+                  <label class="form-label small mb-1" for="credential-env-var">Environment variable name</label>
+                  <input class="form-control" id="credential-env-var" name="env_var_name" placeholder="e.g. SMTP_PASSWORD">
                 </div>
-                <div class="col-2">
+                <div class="col-2 d-flex align-items-end">
                   <button type="submit" class="btn btn-success w-100" {{ "disabled" if current_role != "admin" }}>Add</button>
                 </div>
               </form>

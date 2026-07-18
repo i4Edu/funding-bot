@@ -2163,15 +2163,16 @@ def main(argv: list[str] | None = None) -> None:
             print("Organization profile updated.")
         elif args.command == "register-credential":
             bot.register_credential(args.alias, args.env_var)
-            print(f"Registered credential alias {args.alias!r} -> env var {args.env_var!r}.")
+            print(f"Registered credential alias {args.alias!r}.")
         elif args.command == "show-settings":
-            print(json.dumps(
+            settings_json = json.dumps(
                 {
                     "organization_profile": bot.load_organization_profile(),
                     "search_settings": bot.load_search_settings(),
                 },
                 indent=2,
-            ))
+            )
+            print(settings_json)
             print()
             print("Credential aliases (env var *names* only — never the secret values):")
             _print_rows(bot.list_credentials(), ["alias", "env_var_name"])
