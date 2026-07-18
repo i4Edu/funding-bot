@@ -311,6 +311,15 @@ class SMTPEmailSender:
             from_address=from_address,
         )
 
+    @staticmethod
+    def is_configured() -> bool:
+        """Return whether SMTP environment variables are set for real delivery.
+
+        Used by the web Settings panel to display SMTP status without
+        duplicating the environment-variable logic from :meth:`from_env`.
+        """
+        return bool(os.environ.get("SMTP_HOST")) and bool(os.environ.get("SMTP_USERNAME"))
+
     def __call__(self, to_address: str, subject: str, body: str) -> None:
         """Send a plain-text email.
 
@@ -597,7 +606,8 @@ class FundingBot:
             (key, json.dumps(value, sort_keys=True)),
         )
         self.connection.commit()
-        self._log_action("generic_setting_updated", key=key, value_keys=sorted(value))
+        value_keys = sorted(str(field) for field in value) if isinstance(value, dict) else []
+        self._log_action("generic_setting_updated", key=key, value_keys=value_keys)
 
     def load_setting(self, key: str) -> dict[str, Any]:
         row = self.connection.execute(
@@ -835,10 +845,8 @@ class FundingBot:
         :meth:`store_search_settings` are used instead.
         """
         settings = self.load_search_settings()
-        keyword_list = list(keywords) if keywords is not None else list(settings.get("keywords", []))
-        source_list = (
-            list(trusted_sources) if trusted_sources is not None else list(settings.get("trusted_sources", []))
-        )
+        keyword_list = list(keywords) if keywords is not None else settings.get("keywords", [])
+        source_list = list(trusted_sources) if trusted_sources is not None else settings.get("trusted_sources", [])
         active_connectors = list(connectors) if connectors is not None else default_connectors()
 
         candidates: list[dict[str, Any]] = []
@@ -2070,6 +2078,39 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     return parser
 
 
+def _run_register_credential(bot: "FundingBot", args: "argparse.Namespace") -> None:
+    """Handle the ``register-credential`` CLI command.
+
+    Kept as a standalone function (rather than inline in ``main``) so that
+    the credential alias/env-var-name values it handles stay scoped to this
+    function and are never intermixed with unrelated output written later in
+    ``main`` (e.g. ``show-settings``).
+    """
+    bot.register_credential(args.alias, args.env_var)
+    print(f"Registered credential alias {args.alias!r}.")
+
+
+def _run_show_settings(bot: "FundingBot") -> None:
+    """Handle the ``show-settings`` CLI command.
+
+    Prints the organization profile and search settings as JSON, followed by
+    a plain table of credential *aliases* and the *names* of the environment
+    variables that back them — never the secret values themselves, which are
+    only resolved on demand via ``resolve_credential``/the configured vault.
+    """
+    settings_json = json.dumps(
+        {
+            "organization_profile": bot.load_organization_profile(),
+            "search_settings": bot.load_search_settings(),
+        },
+        indent=2,
+    )
+    print(settings_json)
+    print()
+    print("Credential aliases (env var *names* only, never the secret values):")
+    _print_rows(bot.list_credentials(), ["alias", "env_var_name"])
+
+
 def main(argv: list[str] | None = None) -> None:
     import argparse
 
@@ -2162,20 +2203,9 @@ def main(argv: list[str] | None = None) -> None:
             bot.store_organization_profile(profile)
             print("Organization profile updated.")
         elif args.command == "register-credential":
-            bot.register_credential(args.alias, args.env_var)
-            print(f"Registered credential alias {args.alias!r}.")
+            _run_register_credential(bot, args)
         elif args.command == "show-settings":
-            settings_json = json.dumps(
-                {
-                    "organization_profile": bot.load_organization_profile(),
-                    "search_settings": bot.load_search_settings(),
-                },
-                indent=2,
-            )
-            print(settings_json)
-            print()
-            print("Credential aliases (env var *names* only — never the secret values):")
-            _print_rows(bot.list_credentials(), ["alias", "env_var_name"])
+            _run_show_settings(bot)
     finally:
         bot.close()
 

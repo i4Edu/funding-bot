@@ -447,7 +447,7 @@ def audit_log() -> Response:
 @require_role("staff", "admin", "auditor")
 def settings_page() -> str:
     bot = _bot()
-    smtp_configured = bool(os.environ.get("SMTP_HOST")) and bool(os.environ.get("SMTP_USERNAME"))
+    smtp_configured = SMTPEmailSender.is_configured()
     context = {
         "current_role": getattr(g, "current_role", None),
         "organization_profile": bot.load_organization_profile(),
