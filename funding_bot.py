@@ -30,6 +30,18 @@ def _validate_email(email: str) -> str:
     return stripped
 
 
+def _extract_dict_keys(value: Any) -> list[str]:
+    """Return the sorted, stringified keys of ``value`` if it is a dict.
+
+    Used for audit-log detail payloads where only the *field names* of a
+    setting (never its values) should be recorded, and where ``value`` is
+    not guaranteed to be a ``dict`` at runtime despite the type hints.
+    """
+    if not isinstance(value, dict):
+        return []
+    return sorted(str(field) for field in value)
+
+
 class _TTLCache:
     """A minimal thread-unsafe TTL cache keyed by arbitrary hashable keys."""
 
@@ -606,8 +618,7 @@ class FundingBot:
             (key, json.dumps(value, sort_keys=True)),
         )
         self.connection.commit()
-        value_keys = sorted(str(field) for field in value) if isinstance(value, dict) else []
-        self._log_action("generic_setting_updated", key=key, value_keys=value_keys)
+        self._log_action("generic_setting_updated", key=key, value_keys=_extract_dict_keys(value))
 
     def load_setting(self, key: str) -> dict[str, Any]:
         row = self.connection.execute(
@@ -2093,10 +2104,9 @@ def _run_register_credential(bot: "FundingBot", args: "argparse.Namespace") -> N
 def _run_show_settings(bot: "FundingBot") -> None:
     """Handle the ``show-settings`` CLI command.
 
-    Prints the organization profile and search settings as JSON, followed by
-    a plain table of credential *aliases* and the *names* of the environment
-    variables that back them — never the secret values themselves, which are
-    only resolved on demand via ``resolve_credential``/the configured vault.
+    Prints the organization profile and search settings as JSON. Credential
+    aliases are printed separately by :func:`_print_credential_aliases` so
+    this function never touches credential metadata.
     """
     settings_json = json.dumps(
         {
@@ -2106,6 +2116,15 @@ def _run_show_settings(bot: "FundingBot") -> None:
         indent=2,
     )
     print(settings_json)
+
+
+def _print_credential_aliases(bot: "FundingBot") -> None:
+    """Print registered credential aliases and their backing env-var *names*.
+
+    Isolated in its own function (never returning or otherwise exposing the
+    resolved secret values) so credential alias/env-var-name metadata is
+    printed independently of any other CLI output.
+    """
     print()
     print("Credential aliases (env var *names* only, never the secret values):")
     _print_rows(bot.list_credentials(), ["alias", "env_var_name"])
@@ -2206,6 +2225,7 @@ def main(argv: list[str] | None = None) -> None:
             _run_register_credential(bot, args)
         elif args.command == "show-settings":
             _run_show_settings(bot)
+            _print_credential_aliases(bot)
     finally:
         bot.close()
 
