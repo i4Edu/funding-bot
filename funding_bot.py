@@ -2126,7 +2126,7 @@ def _print_credential_aliases(bot: "FundingBot") -> None:
     printed independently of any other CLI output.
     """
     print()
-    print("Credential aliases (env var *names* only, never the secret values):")
+    print("Credential aliases (env-var *names* only, never the secret values):")
     _print_rows(bot.list_credentials(), ["alias", "env_var_name"])
 
 
