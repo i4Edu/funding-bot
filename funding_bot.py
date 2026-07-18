@@ -597,7 +597,7 @@ class FundingBot:
             (key, json.dumps(value, sort_keys=True)),
         )
         self.connection.commit()
-        self._log_action("setting_updated", key=key, value_keys=sorted(value))
+        self._log_action("generic_setting_updated", key=key, value_keys=sorted(value))
 
     def load_setting(self, key: str) -> dict[str, Any]:
         row = self.connection.execute(
@@ -2165,19 +2165,16 @@ def main(argv: list[str] | None = None) -> None:
             bot.register_credential(args.alias, args.env_var)
             print(f"Registered credential alias {args.alias!r} -> env var {args.env_var!r}.")
         elif args.command == "show-settings":
-            # NOTE: `list_credentials()` only returns credential *aliases* and the
-            # *names* of the environment variables that back them — never the
-            # actual secret values, which are resolved separately via
-            # `resolve_credential()`/the configured vault at submission time.
-            credential_aliases = bot.list_credentials()
             print(json.dumps(
                 {
                     "organization_profile": bot.load_organization_profile(),
                     "search_settings": bot.load_search_settings(),
-                    "credential_aliases": credential_aliases,
                 },
                 indent=2,
             ))
+            print()
+            print("Credential aliases (env var *names* only — never the secret values):")
+            _print_rows(bot.list_credentials(), ["alias", "env_var_name"])
     finally:
         bot.close()
 

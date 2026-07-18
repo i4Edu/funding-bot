@@ -1002,11 +1002,12 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
         with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
             main(["--db", str(self.db_path), "show-settings"])
 
-        settings = json.loads(stdout.getvalue())
+        output = stdout.getvalue()
+        json_blob, _, table_output = output.partition("Credential aliases")
+        settings = json.loads(json_blob)
         self.assertEqual({"name": "i4Edu"}, settings["organization_profile"])
-        self.assertEqual(
-            [{"alias": "smtp", "env_var_name": "SMTP_PASSWORD"}], settings["credential_aliases"]
-        )
+        self.assertIn("smtp", table_output)
+        self.assertIn("SMTP_PASSWORD", table_output)
 
 
 if __name__ == "__main__":
