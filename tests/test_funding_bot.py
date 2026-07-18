@@ -1005,7 +1005,7 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
         settings = json.loads(stdout.getvalue())
         self.assertEqual({"name": "i4Edu"}, settings["organization_profile"])
         self.assertEqual(
-            [{"alias": "smtp", "env_var_name": "SMTP_PASSWORD"}], settings["credentials"]
+            [{"alias": "smtp", "env_var_name": "SMTP_PASSWORD"}], settings["credential_aliases"]
         )
 
 

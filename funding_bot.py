@@ -597,7 +597,7 @@ class FundingBot:
             (key, json.dumps(value, sort_keys=True)),
         )
         self.connection.commit()
-        self._log_action("setting_updated", key=key, keys=sorted(value))
+        self._log_action("setting_updated", key=key, value_keys=sorted(value))
 
     def load_setting(self, key: str) -> dict[str, Any]:
         row = self.connection.execute(
@@ -2150,9 +2150,12 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 print(f"\nOutreach email sent to {args.email}.")
         elif args.command == "set-organization-profile":
-            raw_json = (
-                Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
-            )
+            try:
+                raw_json = (
+                    Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
+                )
+            except OSError as exc:
+                raise FundingBotError(f"Failed to read profile from {args.file!r}: {exc}") from exc
             profile = json.loads(raw_json)
             if not isinstance(profile, dict):
                 raise ValueError("Organization profile JSON must be an object.")
@@ -2162,11 +2165,16 @@ def main(argv: list[str] | None = None) -> None:
             bot.register_credential(args.alias, args.env_var)
             print(f"Registered credential alias {args.alias!r} -> env var {args.env_var!r}.")
         elif args.command == "show-settings":
+            # NOTE: `list_credentials()` only returns credential *aliases* and the
+            # *names* of the environment variables that back them — never the
+            # actual secret values, which are resolved separately via
+            # `resolve_credential()`/the configured vault at submission time.
+            credential_aliases = bot.list_credentials()
             print(json.dumps(
                 {
                     "organization_profile": bot.load_organization_profile(),
                     "search_settings": bot.load_search_settings(),
-                    "credentials": bot.list_credentials(),
+                    "credential_aliases": credential_aliases,
                 },
                 indent=2,
             ))

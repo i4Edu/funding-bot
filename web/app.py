@@ -464,7 +464,10 @@ def settings_page() -> str:
 def update_organization_settings() -> Response:
     payload = _get_request_json()
     if not payload:
-        raise ValueError("Request body must contain at least one profile field.")
+        raise ValueError(
+            "Request body must contain at least one profile field, e.g. "
+            "'name', 'mission', or 'registration_number'."
+        )
     _bot().store_organization_profile(payload)
     return jsonify({"organization_profile": _bot().load_organization_profile()})
 
@@ -480,7 +483,10 @@ def update_search_settings() -> Response:
     if isinstance(trusted_sources, str):
         trusted_sources = [item.strip() for item in trusted_sources.split(",") if item.strip()]
     if not isinstance(keywords, list) or not isinstance(trusted_sources, list):
-        raise ValueError("Fields 'keywords' and 'trusted_sources' must be lists or comma-separated strings.")
+        raise ValueError(
+            "Fields 'keywords' and 'trusted_sources' must be lists (e.g. "
+            "[\"education\", \"csr\"]) or comma-separated strings (e.g. \"education,csr\")."
+        )
 
     settings = _bot().store_search_settings(keywords=keywords, trusted_sources=trusted_sources)
     return jsonify({"search_settings": settings})

@@ -85,10 +85,12 @@
               </ul>
               <form id="credential-form" class="row g-2">
                 <div class="col-5">
-                  <input class="form-control" name="alias" placeholder="alias" aria-label="Credential alias">
+                  <label class="visually-hidden" for="credential-alias">Credential alias</label>
+                  <input class="form-control" id="credential-alias" name="alias" placeholder="alias" aria-label="Credential alias">
                 </div>
                 <div class="col-5">
-                  <input class="form-control" name="env_var_name" placeholder="ENV_VAR_NAME" aria-label="Environment variable name">
+                  <label class="visually-hidden" for="credential-env-var">Environment variable name</label>
+                  <input class="form-control" id="credential-env-var" name="env_var_name" placeholder="ENV_VAR_NAME" aria-label="Environment variable name">
                 </div>
                 <div class="col-2">
                   <button type="submit" class="btn btn-success w-100" {{ "disabled" if current_role != "admin" }}>Add</button>
