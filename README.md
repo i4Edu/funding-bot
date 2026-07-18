@@ -68,6 +68,9 @@ The project is designed for nonprofit operations teams that need a lightweight w
 - role-based access for admin, staff, and auditor personas
 - monthly audit report generation
 - collaboration workflows for shared review and follow-up
+- self-service `/settings` panel for the organization profile, search keywords, and
+  credential aliases, plus one-click actions to prove donation search and donor
+  outreach without leaving the browser
 
 #### v0.5.0 — Scaling + resilience
 - Docker Compose deployment for local/shared hosting
@@ -148,6 +151,11 @@ Command reference:
 | `audit-log` | `v0.3.0` | `--limit N`, `--action ACTION` | Review recent audit events for compliance and operational troubleshooting. | Available |
 | `list-donors` | `v0.3.0` | `--segment {corporate,institutional,individual,unknown}` | List donor records and segment membership. | Available |
 | `monthly-audit-report` | `v1.0.0` | `--year YEAR`, `--month MONTH`, `--output FILE` | Generate a monthly GDPR/ISO compliance audit report as JSON. | Available |
+| `discover` | `v0.3.0` | `--keywords KEYWORDS`, `--trusted-sources SOURCES` | Query every configured portal connector and persist new opportunities (proves donation search). | Available |
+| `send-outreach` | `v0.3.0` | `--email EMAIL`, `--name NAME`, `--subject TEMPLATE`, `--body TEMPLATE`, `--dry-run` | Compose and send (or preview) a personalized donor outreach email (proves donor communication). | Available |
+| `set-organization-profile` | `v0.4.0` | `--file FILE` | Store the nonprofit's organization profile from a JSON file (or stdin). | Available |
+| `register-credential` | `v0.4.0` | `--alias ALIAS`, `--env-var ENV_VAR` | Register a credential alias that resolves to an environment variable. | Available |
+| `show-settings` | `v0.4.0` | *(none)* | Print the organization profile, search settings, and credential aliases. | Available |
 
 ## SMTP Configuration
 
@@ -201,6 +209,12 @@ The dashboard uses HTTP Basic Auth. Use one of these usernames as the role name:
 | `/donors/<email>/opt-out` | `POST` | `admin` | Mark a donor as opted out. |
 | `/analytics` | `GET` | `admin`, `auditor` | Return outreach analytics data. |
 | `/audit-log` | `GET` | `admin`, `auditor` | Return the latest audit log entries. |
+| `/settings` | `GET` | `staff`, `admin`, `auditor` | Self-service settings panel: organization profile, search keywords, credential aliases, and proof-of-capability actions. |
+| `/settings/organization` | `POST` | `admin` | Update the organization profile. |
+| `/settings/search` | `POST` | `admin` | Update donation-search keyword filters and trusted sources. |
+| `/settings/credentials` | `POST` | `admin` | Register a credential alias (never exposes secret values). |
+| `/settings/discover` | `POST` | `admin` | Run every portal connector now and persist new opportunities — proves the bot can search for funding. |
+| `/settings/test-outreach` | `POST` | `admin` | Compose (dry-run) or send a donor outreach email — proves the bot can communicate with donors. |
 | `/feedback` | `POST` | `staff`, `admin` | Submit partner feature-request or bug-report feedback. |
 | `/metrics` | `GET` | `admin`, `auditor` | Prometheus-compatible text metrics for Grafana scraping. |
 | `/health` | `GET` | Public | Health-check endpoint. |
@@ -235,6 +249,35 @@ curl -u staff:$STAFF_PASSWORD \
 
 Allowed categories: `feature_request`, `bug_report`, `general`.
 The `message` field must be non-empty and at most 2000 characters.
+
+## Proof: Search and Donor Communication
+
+Two independent ways to demonstrate the bot searching for donation opportunities and
+communicating with a donor — from the CLI or from the `/settings` admin panel, without
+touching code or environment variables.
+
+### From the CLI
+
+```bash
+# Search every configured portal connector and store any new opportunities.
+python funding_bot.py discover --keywords "education,csr"
+
+# Compose (and, unless --dry-run, send via SMTP) a personalized donor email.
+python funding_bot.py send-outreach --email donor@example.org --name "Jane Donor" --dry-run
+```
+
+### From the web Settings panel
+
+1. Sign in to `/settings` as `admin`.
+2. Click **Run discovery now** under "Prove: Donation Search" to query every portal
+   connector and see newly discovered opportunities rendered as JSON.
+3. Fill in a donor email/name under "Prove: Donor Communication" and click
+   **Send test outreach**. With "Dry run" checked, the email is composed and logged
+   without being delivered; uncheck it (with SMTP credentials configured) to deliver
+   a real message.
+
+Both actions are logged to the audit trail (`audit-log` / `/audit-log`) for
+compliance review.
 
 ## Docker Deployment
 

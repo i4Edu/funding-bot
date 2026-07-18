@@ -6,6 +6,7 @@ import os
 import re
 import smtplib
 import sqlite3
+import sys
 import time
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -250,6 +251,16 @@ class NGODirectoryConnector(_BasePortalConnector):
                 "tags": ["community", "literacy", "institutional"],
             }
         ]
+
+
+def default_connectors() -> list[PortalConnector]:
+    """Return the built-in portal connectors used by ``run_discovery``.
+
+    Each connector returns demo data unless an ``http_client`` is supplied,
+    which keeps discovery safe to run out-of-the-box while still exercising
+    the full search pipeline end-to-end.
+    """
+    return [GrantsPortalConnector(), CSRNetworkConnector(), NGODirectoryConnector()]
 
 
 class SMTPEmailSender:
@@ -574,19 +585,62 @@ class FundingBot:
         )
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
-    def store_organization_profile(self, profile: dict[str, Any]) -> None:
+    def store_setting(self, key: str, value: dict[str, Any]) -> None:
+        """Persist an arbitrary named setting (organization profile, search
+        preferences, etc.) as JSON, keyed by ``key``.
+
+        This backs the web admin "Settings" panel so operators can configure
+        the bot without leaving the dashboard or touching the CLI/env vars.
+        """
         self.connection.execute(
-            "INSERT OR REPLACE INTO organization_profile (key, value_json) VALUES ('profile', ?)",
-            (json.dumps(profile, sort_keys=True),),
+            "INSERT OR REPLACE INTO organization_profile (key, value_json) VALUES (?, ?)",
+            (key, json.dumps(value, sort_keys=True)),
         )
         self.connection.commit()
-        self._log_action("organization_profile_updated", keys=sorted(profile))
+        self._log_action("setting_updated", key=key, keys=sorted(value))
 
-    def load_organization_profile(self) -> dict[str, Any]:
+    def load_setting(self, key: str) -> dict[str, Any]:
         row = self.connection.execute(
-            "SELECT value_json FROM organization_profile WHERE key = 'profile'"
+            "SELECT value_json FROM organization_profile WHERE key = ?",
+            (key,),
         ).fetchone()
         return json.loads(row["value_json"]) if row else {}
+
+    def store_organization_profile(self, profile: dict[str, Any]) -> None:
+        self.store_setting("profile", profile)
+
+    def load_organization_profile(self) -> dict[str, Any]:
+        return self.load_setting("profile")
+
+    def store_search_settings(
+        self,
+        *,
+        keywords: Iterable[str] | None = None,
+        trusted_sources: Iterable[str] | None = None,
+    ) -> dict[str, Any]:
+        """Persist default keyword/source filters used by :meth:`run_discovery`."""
+        settings = {
+            "keywords": sorted({keyword.strip() for keyword in (keywords or []) if keyword.strip()}),
+            "trusted_sources": sorted(
+                {source.strip() for source in (trusted_sources or []) if source.strip()}
+            ),
+        }
+        self.store_setting("search_settings", settings)
+        return settings
+
+    def load_search_settings(self) -> dict[str, Any]:
+        settings = self.load_setting("search_settings")
+        return {
+            "keywords": settings.get("keywords", []),
+            "trusted_sources": settings.get("trusted_sources", []),
+        }
+
+    def list_credentials(self) -> list[dict[str, Any]]:
+        """Return registered credential aliases (never the secret values)."""
+        rows = self.connection.execute(
+            "SELECT alias, env_var_name FROM credential_refs ORDER BY alias"
+        ).fetchall()
+        return [dict(row) for row in rows]
 
     def register_credential(self, alias: str, env_var_name: str) -> None:
         self.connection.execute(
@@ -762,6 +816,41 @@ class FundingBot:
         self.connection.commit()
         self._log_action("opportunities_discovered", count=len(found), keywords=keyword_list)
         return found
+
+    def run_discovery(
+        self,
+        connectors: Iterable[PortalConnector] | None = None,
+        *,
+        keywords: Iterable[str] | None = None,
+        trusted_sources: Iterable[str] | None = None,
+        discovered_at: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        """Query donation-source connectors and persist new opportunities.
+
+        This is the end-to-end "search" entry point: it queries each
+        connector (grant portals, CSR networks, NGO directories, ...) using
+        the configured keyword filters, then deduplicates and stores any new
+        opportunities via :meth:`discover_opportunities`. If ``keywords`` or
+        ``trusted_sources`` are omitted, the persisted search settings from
+        :meth:`store_search_settings` are used instead.
+        """
+        settings = self.load_search_settings()
+        keyword_list = list(keywords) if keywords is not None else list(settings.get("keywords", []))
+        source_list = (
+            list(trusted_sources) if trusted_sources is not None else list(settings.get("trusted_sources", []))
+        )
+        active_connectors = list(connectors) if connectors is not None else default_connectors()
+
+        candidates: list[dict[str, Any]] = []
+        for connector in active_connectors:
+            candidates.extend(connector.fetch_opportunities(keyword_list))
+
+        return self.discover_opportunities(
+            candidates,
+            keywords=keyword_list,
+            trusted_sources=source_list,
+            discovered_at=discovered_at,
+        )
 
     def list_opportunities(self, *, status: str | None = None) -> list[dict[str, Any]]:
         if status:
@@ -1913,6 +2002,71 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
         help="Write the report as JSON to FILE instead of printing it.",
     )
 
+    discover_parser = subparsers.add_parser(
+        "discover",
+        help="Search configured donation sources and store new opportunities.",
+    )
+    discover_parser.add_argument(
+        "--keywords",
+        metavar="KEYWORDS",
+        help="Comma-separated keyword filters (default: stored search settings).",
+    )
+    discover_parser.add_argument(
+        "--trusted-sources",
+        metavar="SOURCES",
+        help="Comma-separated allow-list of sources (default: stored search settings).",
+    )
+
+    outreach_parser = subparsers.add_parser(
+        "send-outreach",
+        help="Compose and send (or preview) a personalized donor outreach email.",
+    )
+    outreach_parser.add_argument("--email", required=True, metavar="EMAIL", help="Donor email address.")
+    outreach_parser.add_argument("--name", required=True, metavar="NAME", help="Donor name.")
+    outreach_parser.add_argument(
+        "--subject",
+        default="Thank you for supporting {organization_name}",
+        metavar="TEMPLATE",
+        help="Subject template with {placeholders} (default provided).",
+    )
+    outreach_parser.add_argument(
+        "--body",
+        default=(
+            "Dear {donor_name},\n\nThank you for your continued interest in {organization_name}."
+        ),
+        metavar="TEMPLATE",
+        help="Body template with {placeholders} (default provided).",
+    )
+    outreach_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Compose and log the outreach without sending a real email.",
+    )
+
+    profile_parser = subparsers.add_parser(
+        "set-organization-profile",
+        help="Store the nonprofit's organization profile from a JSON file (or stdin).",
+    )
+    profile_parser.add_argument(
+        "--file",
+        metavar="FILE",
+        help="Path to a JSON file with the profile (default: read from stdin).",
+    )
+
+    credential_parser = subparsers.add_parser(
+        "register-credential",
+        help="Register a credential alias that resolves to an environment variable.",
+    )
+    credential_parser.add_argument("--alias", required=True, metavar="ALIAS", help="Credential alias name.")
+    credential_parser.add_argument(
+        "--env-var",
+        required=True,
+        metavar="ENV_VAR",
+        help="Name of the environment variable holding the secret.",
+    )
+
+    subparsers.add_parser("show-settings", help="Print the organization profile, search settings, and credentials.")
+
     return parser
 
 
@@ -1964,6 +2118,58 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"Monthly audit report written to {args.output}.")
             else:
                 print(report_json)
+        elif args.command == "discover":
+            keywords = (
+                [item.strip() for item in args.keywords.split(",") if item.strip()]
+                if args.keywords
+                else None
+            )
+            trusted_sources = (
+                [item.strip() for item in args.trusted_sources.split(",") if item.strip()]
+                if args.trusted_sources
+                else None
+            )
+            found = bot.run_discovery(keywords=keywords, trusted_sources=trusted_sources)
+            if found:
+                _print_rows(found, ["signature", "source", "donor_name", "title", "category"])
+            else:
+                print("No new opportunities found.")
+        elif args.command == "send-outreach":
+            sender = None if args.dry_run else SMTPEmailSender.from_env()
+            result = bot.send_outreach(
+                donor_email=args.email,
+                donor_name=args.name,
+                subject_template=args.subject,
+                body_template=args.body,
+                sender=sender,
+            )
+            print(f"Subject: {result['subject']}\n")
+            print(result["body"])
+            if args.dry_run:
+                print("\n(dry run: no email was actually sent)")
+            else:
+                print(f"\nOutreach email sent to {args.email}.")
+        elif args.command == "set-organization-profile":
+            raw_json = (
+                Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
+            )
+            profile = json.loads(raw_json)
+            if not isinstance(profile, dict):
+                raise ValueError("Organization profile JSON must be an object.")
+            bot.store_organization_profile(profile)
+            print("Organization profile updated.")
+        elif args.command == "register-credential":
+            bot.register_credential(args.alias, args.env_var)
+            print(f"Registered credential alias {args.alias!r} -> env var {args.env_var!r}.")
+        elif args.command == "show-settings":
+            print(json.dumps(
+                {
+                    "organization_profile": bot.load_organization_profile(),
+                    "search_settings": bot.load_search_settings(),
+                    "credentials": bot.list_credentials(),
+                },
+                indent=2,
+            ))
     finally:
         bot.close()
 
