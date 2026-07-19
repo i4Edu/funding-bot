@@ -7,12 +7,16 @@ import importlib
 import json
 import os
 import secrets
+import socket
+import ssl
 import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
+from urllib.parse import urlparse, urlunparse
 
 from flask import Flask, Response, g, jsonify, redirect, render_template, request, session, url_for
 from flask_limiter import Limiter
@@ -41,6 +45,7 @@ app = Flask(__name__, template_folder=str(Path(__file__).resolve().parent / "tem
 app.config["JSON_SORT_KEYS"] = False
 MAX_FEEDBACK_MESSAGE_LENGTH = 2000
 DEFAULT_CELERY_HEALTH_TIMEOUT_SECONDS = 2.0
+DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS = 1.0
 TASK_SORT_OPTIONS = (
     ("updated_at", "Recently updated"),
     ("-updated_at", "Least recently updated"),
@@ -73,6 +78,14 @@ CSRF_UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 # Track server start time for the uptime metric.
 _APP_START_TIME = time.time()
+_HEALTH_CHECK_METRICS_LOCK = threading.Lock()
+_HEALTH_CHECK_METRICS = {
+    "endpoints": {
+        "health": {"checks_performed": 0, "failures": 0},
+        "ready": {"checks_performed": 0, "failures": 0},
+    },
+    "components": {},
+}
 
 
 def _env_flag(name: str, *, default: bool) -> bool:
@@ -201,6 +214,80 @@ def _build_json_response(
     return response
 
 
+def _prometheus_label_value(value: str) -> str:
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'"{escaped}"'
+
+
+def _render_query_metrics_prometheus(query_metrics: dict[str, Any]) -> list[str]:
+    buckets = list(query_metrics.get("buckets", []))
+    summary = _mapping_or_default(query_metrics.get("summary"), {})
+    statements = _mapping_or_default(query_metrics.get("statements"), {})
+    rendered = [
+        "# HELP funding_bot_db_query_slow_threshold_seconds Configured slow-query threshold in seconds",
+        "# TYPE funding_bot_db_query_slow_threshold_seconds gauge",
+        f"funding_bot_db_query_slow_threshold_seconds {float(query_metrics.get('slow_query_threshold_seconds', 0.25))}",
+        "# HELP funding_bot_db_queries_in_flight Database queries currently executing",
+        "# TYPE funding_bot_db_queries_in_flight gauge",
+        "# HELP funding_bot_db_queries_total Database queries observed by statement type and final status",
+        "# TYPE funding_bot_db_queries_total counter",
+        "# HELP funding_bot_db_query_errors_total Database query failures by statement type",
+        "# TYPE funding_bot_db_query_errors_total counter",
+        "# HELP funding_bot_db_query_timeouts_total Database query timeouts or lock timeouts by statement type",
+        "# TYPE funding_bot_db_query_timeouts_total counter",
+        "# HELP funding_bot_db_slow_queries_total Database queries slower than the configured threshold",
+        "# TYPE funding_bot_db_slow_queries_total counter",
+        "# HELP funding_bot_db_query_duration_seconds Database query execution time histogram by statement type",
+        "# TYPE funding_bot_db_query_duration_seconds histogram",
+        "# HELP funding_bot_db_query_duration_seconds_max Maximum observed database query execution time by statement type",
+        "# TYPE funding_bot_db_query_duration_seconds_max gauge",
+    ]
+
+    def _emit_statement(statement: str, metric: dict[str, Any]) -> None:
+        statement_label = _prometheus_label_value(statement)
+        rendered.append(
+            f"funding_bot_db_queries_in_flight{{statement={statement_label}}} {int(metric.get('in_flight', 0))}"
+        )
+        for status in ("success", "error", "timeout"):
+            rendered.append(
+                f"funding_bot_db_queries_total{{statement={statement_label},status={_prometheus_label_value(status)}}} {int(metric.get(status, 0))}"
+            )
+        rendered.append(
+            f"funding_bot_db_query_errors_total{{statement={statement_label}}} {int(metric.get('error', 0))}"
+        )
+        rendered.append(
+            f"funding_bot_db_query_timeouts_total{{statement={statement_label}}} {int(metric.get('timeout', 0))}"
+        )
+        rendered.append(
+            f"funding_bot_db_slow_queries_total{{statement={statement_label}}} {int(metric.get('slow', 0))}"
+        )
+        cumulative = 0
+        bucket_counts = list(metric.get("bucket_counts", []))
+        for bucket_limit, bucket_count in zip(buckets, bucket_counts):
+            cumulative += int(bucket_count)
+            rendered.append(
+                f"funding_bot_db_query_duration_seconds_bucket{{statement={statement_label},le={_prometheus_label_value(str(bucket_limit))}}} {cumulative}"
+            )
+        rendered.append(
+            f"funding_bot_db_query_duration_seconds_bucket{{statement={statement_label},le=\"+Inf\"}} {int(metric.get('count', 0))}"
+        )
+        rendered.append(
+            f"funding_bot_db_query_duration_seconds_sum{{statement={statement_label}}} {float(metric.get('sum_duration_seconds', 0.0))}"
+        )
+        rendered.append(
+            f"funding_bot_db_query_duration_seconds_count{{statement={statement_label}}} {int(metric.get('count', 0))}"
+        )
+        rendered.append(
+            f"funding_bot_db_query_duration_seconds_max{{statement={statement_label}}} {float(metric.get('max_duration_seconds', 0.0))}"
+        )
+
+    _emit_statement("all", summary)
+    for statement, metric in sorted(statements.items()):
+        if isinstance(metric, dict):
+            _emit_statement(statement, metric)
+    return rendered
+
+
 def _rate_limit_value(config_key: str) -> Callable[[], str]:
     def _resolver() -> str:
         return str(app.config[config_key])
@@ -225,7 +312,7 @@ export_rate_limit = limiter.limit(_rate_limit_value("RATE_LIMIT_EXPORT"), overri
 
 def _bot() -> FundingBot:
     bot = g.get("_bot")
-    if bot is None:
+    if bot is None or getattr(bot, "connection", None) is None:
         bot = FundingBot(db_path=os.environ.get("BOT_DB_PATH", "funding_bot.db"))
         g._bot = bot
     return bot
@@ -587,6 +674,12 @@ def _task_assignee_options() -> list[str]:
     return [str(row["assignee"]) for row in rows]
 
 
+def _task_assignment_options() -> list[str]:
+    options = {"admin", "staff", "auditor"}
+    options.update(_task_assignee_options())
+    return sorted(options)
+
+
 def _resolve_ui_locale() -> dict[str, Any]:
     requested_locale = request.args.get("locale", DEFAULT_LOCALE_CODE)
     try:
@@ -722,8 +815,11 @@ def _task_dashboard_context(filters: dict[str, str | None]) -> dict[str, Any]:
         "task_status_labels": TASK_STATUS_LABELS,
         "task_sort_options": TASK_SORT_OPTIONS,
         "task_assignee_options": _task_assignee_options(),
+        "task_assignment_options": _task_assignment_options(),
         "can_filter_all_assignees": current_role in {"admin", "auditor"},
         "can_reassign_tasks": current_role == "admin",
+        "can_manage_tasks": current_role == "admin",
+        "can_export_tasks": current_role in {"admin", "auditor"},
         "ui_locale": _resolve_ui_locale(),
     }
 
@@ -742,10 +838,304 @@ def _queue_health_timeout_seconds() -> float:
     return max(timeout, 0.1)
 
 
+def _health_check_timeout_seconds() -> float:
+    configured = os.environ.get("HEALTH_CHECK_TIMEOUT_SECONDS", str(DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS))
+    try:
+        timeout = float(configured)
+    except ValueError:
+        return DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS
+    return max(timeout, 0.1)
+
+
 def _count_tasks_by_worker(task_map: Any) -> int:
     if not isinstance(task_map, dict):
         return 0
     return sum(len(tasks) for tasks in task_map.values() if isinstance(tasks, list))
+
+
+def reset_health_check_metrics() -> None:
+    with _HEALTH_CHECK_METRICS_LOCK:
+        _HEALTH_CHECK_METRICS["endpoints"] = {
+            "health": {"checks_performed": 0, "failures": 0},
+            "ready": {"checks_performed": 0, "failures": 0},
+        }
+        _HEALTH_CHECK_METRICS["components"] = {}
+
+
+def _health_check_metrics_snapshot() -> dict[str, Any]:
+    with _HEALTH_CHECK_METRICS_LOCK:
+        return {
+            "endpoints": {
+                name: dict(metrics)
+                for name, metrics in _HEALTH_CHECK_METRICS["endpoints"].items()
+            },
+            "components": {
+                name: dict(metrics)
+                for name, metrics in _HEALTH_CHECK_METRICS["components"].items()
+            },
+        }
+
+
+def _record_health_check_metrics(endpoint: str, checks: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    failing_components = [
+        name for name, result in checks.items() if str(result.get("status", "error")) not in {"ok", "disabled"}
+    ]
+    with _HEALTH_CHECK_METRICS_LOCK:
+        endpoint_metrics = _HEALTH_CHECK_METRICS["endpoints"].setdefault(
+            endpoint,
+            {"checks_performed": 0, "failures": 0},
+        )
+        endpoint_metrics["checks_performed"] += 1
+        if failing_components:
+            endpoint_metrics["failures"] += 1
+        for name, result in checks.items():
+            component_metrics = _HEALTH_CHECK_METRICS["components"].setdefault(
+                name,
+                {"checks_performed": 0, "failures": 0},
+            )
+            component_metrics["checks_performed"] += 1
+            if str(result.get("status", "error")) not in {"ok", "disabled"}:
+                component_metrics["failures"] += 1
+    return _health_check_metrics_snapshot()
+
+
+def _redact_service_url(url: str) -> str:
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        return url
+    netloc = parsed.hostname or ""
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    if parsed.username:
+        netloc = f"{parsed.username}:***@{netloc}"
+    return urlunparse(parsed._replace(netloc=netloc))
+
+
+def _redis_ping(url: str, *, timeout: float) -> dict[str, Any]:
+    parsed = urlparse(url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 6379
+    payload = {
+        "url": _redact_service_url(url),
+        "host": host,
+        "port": port,
+        "scheme": parsed.scheme or "redis",
+        "database": (parsed.path or "/0").lstrip("/") or "0",
+        "timeout_seconds": timeout,
+    }
+    try:
+        connection = socket.create_connection((host, port), timeout=timeout)
+        try:
+            if parsed.scheme == "rediss":
+                connection = ssl.create_default_context().wrap_socket(connection, server_hostname=host)
+            connection.sendall(b"*1\r\n$4\r\nPING\r\n")
+            response = connection.recv(16)
+        finally:
+            connection.close()
+    except Exception as exc:
+        return {**payload, "status": "error", "reachable": False, "error": str(exc)}
+    if response.startswith(b"+PONG"):
+        return {**payload, "status": "ok", "reachable": True}
+    return {
+        **payload,
+        "status": "error",
+        "reachable": False,
+        "error": f"Unexpected Redis response: {response!r}",
+    }
+
+
+def _check_database_health(bot: FundingBot) -> dict[str, Any]:
+    metrics = _mapping_or_default(
+        getattr(bot, "get_database_pool_metrics", lambda: {})(),
+        {},
+    )
+    try:
+        row = bot.connection.execute("SELECT 1").fetchone()
+    except Exception as exc:
+        return {
+            "status": "error",
+            "checked": True,
+            "reachable": False,
+            "error": str(exc),
+            "metrics": metrics,
+        }
+    return {
+        "status": "ok" if row and int(row[0]) == 1 else "error",
+        "checked": True,
+        "reachable": bool(row and int(row[0]) == 1),
+        "metrics": metrics,
+    }
+
+
+def _check_redis_health(bot: FundingBot, queue_config: Any) -> dict[str, Any]:
+    timeout_seconds = _health_check_timeout_seconds()
+    cache_health = _mapping_or_default(bot.get_cache_metrics().get("health"), {})
+    targets: list[dict[str, Any]] = []
+    cache_url = os.environ.get("FUNDING_BOT_CACHE_URL", "")
+    if cache_health.get("enabled") and cache_health.get("backend") == "redis" and cache_url:
+        targets.append({"role": "cache", **_redis_ping(cache_url, timeout=timeout_seconds)})
+    for role, url in (
+        ("broker", getattr(queue_config, "broker_url", "")),
+        ("result_backend", getattr(queue_config, "result_backend", "")),
+    ):
+        if urlparse(str(url)).scheme in {"redis", "rediss"}:
+            targets.append({"role": role, **_redis_ping(str(url), timeout=timeout_seconds)})
+    if not targets:
+        return {
+            "status": "disabled",
+            "checked": False,
+            "targets": [],
+            "cache_backend": cache_health.get("backend", "memory"),
+            "message": "Redis is not configured for the current cache or queue settings.",
+        }
+    return {
+        "status": "error" if any(target["status"] != "ok" for target in targets) else "ok",
+        "checked": True,
+        "targets": targets,
+        "cache_backend": cache_health.get("backend", "memory"),
+    }
+
+
+def _check_celery_health() -> dict[str, Any]:
+    snapshot = _get_queue_health_snapshot()
+    return {
+        **snapshot,
+        "checked": bool(snapshot.get("queue_enabled")),
+    }
+
+
+def _active_connectors(bot: FundingBot) -> list[Any]:
+    if bot.connector_configs:
+        return bot.connector_registry.build_connectors(
+            bot.connector_configs,
+            credential_resolver=bot.resolve_credential,
+            cache_manager=bot.cache_manager,
+        )
+    return default_connectors(cache_manager=bot.cache_manager)
+
+
+def _check_connector_health(bot: FundingBot) -> dict[str, Any]:
+    try:
+        active_connectors = _active_connectors(bot)
+    except Exception as exc:
+        return {
+            "status": "error",
+            "checked": True,
+            "count": 0,
+            "healthy_count": 0,
+            "connectors": [],
+            "error": str(exc),
+        }
+    checks = []
+    for connector in active_connectors:
+        connector_name = str(
+            getattr(connector, "connector_slug", getattr(connector, "source_name", type(connector).__name__))
+        )
+        source_name = str(getattr(connector, "source_name", connector_name))
+        mode = "remote" if (getattr(connector, "http_client", None) is not None or getattr(connector, "transport", "") == "http") else "demo"
+        try:
+            health = connector.check_health()
+            healthy = bool(health.get("healthy", True))
+            checks.append(
+                {
+                    "connector": connector_name,
+                    "source": source_name,
+                    "mode": mode,
+                    "status": "ok" if healthy else "degraded",
+                    "healthy": healthy,
+                    "health": health,
+                }
+            )
+        except Exception as exc:
+            checks.append(
+                {
+                    "connector": connector_name,
+                    "source": source_name,
+                    "mode": mode,
+                    "status": "error",
+                    "healthy": False,
+                    "error": str(exc),
+                }
+            )
+    if not checks:
+        return {
+            "status": "disabled",
+            "checked": True,
+            "count": 0,
+            "healthy_count": 0,
+            "connectors": [],
+        }
+    statuses = {entry["status"] for entry in checks}
+    overall_status = "error" if "error" in statuses else ("degraded" if "degraded" in statuses else "ok")
+    return {
+        "status": overall_status,
+        "checked": True,
+        "count": len(checks),
+        "healthy_count": sum(1 for entry in checks if entry["status"] == "ok"),
+        "connectors": checks,
+    }
+
+
+def _status_code_for_health(payload_status: str) -> int:
+    return 200 if payload_status == "ok" else 503
+
+
+def _build_health_payload(endpoint: str) -> dict[str, Any]:
+    bot = _bot()
+    queue_config = load_queue_config()
+    checked_at = datetime.now(timezone.utc).isoformat()
+    queue_mode = {
+        "mode": queue_config.mode,
+        "queue_enabled": queue_config.enable_task_queue,
+        "legacy_cron_enabled": queue_config.enable_legacy_cron,
+        "queue_name": queue_config.queue_name,
+    }
+    if endpoint == "health":
+        checks = {
+            "application": {
+                "status": "ok",
+                "checked": True,
+                "uptime_seconds": round(time.time() - _APP_START_TIME, 3),
+            },
+            "database": _check_database_health(bot),
+        }
+    else:
+        checks = {
+            "database": _check_database_health(bot),
+            "redis": _check_redis_health(bot, queue_config),
+            "celery": _check_celery_health(),
+            "connectors": _check_connector_health(bot),
+        }
+    overall_status = (
+        "ok"
+        if all(str(result.get("status", "error")) in {"ok", "disabled"} for result in checks.values())
+        else "degraded"
+    )
+    failing_checks = [
+        name for name, result in checks.items() if str(result.get("status", "error")) not in {"ok", "disabled"}
+    ]
+    metrics = _record_health_check_metrics(endpoint, checks)
+    payload = {
+        "status": overall_status,
+        "service": "funding-bot",
+        "endpoint": f"/{endpoint}",
+        "checked_at": checked_at,
+        "uptime_seconds": round(time.time() - _APP_START_TIME, 3),
+        "queue": queue_mode,
+        "checks": checks,
+        "failing_checks": failing_checks,
+        "metrics": metrics,
+    }
+    if endpoint == "health":
+        payload["healthy"] = overall_status == "ok"
+        payload["database"] = checks["database"]
+    else:
+        payload["ready"] = overall_status == "ok"
+        payload["database"] = checks["database"]
+        payload["redis"] = checks["redis"]
+        payload["celery"] = checks["celery"]
+        payload["connectors"] = checks["connectors"]
+    return payload
 
 
 def _create_celery_health_app() -> Any:
@@ -788,9 +1178,9 @@ def _fetch_celery_queue_snapshot() -> dict[str, Any]:
                 "status": "online" if worker_name in ping else "unreachable",
                 "active_tasks": len(worker_active) if isinstance(worker_active, list) else 0,
                 "reserved_tasks": len(worker_reserved) if isinstance(worker_reserved, list) else 0,
-                "scheduled_tasks": len(worker_scheduled)
-                if isinstance(worker_scheduled, list)
-                else 0,
+                "scheduled_tasks": (
+                    len(worker_scheduled) if isinstance(worker_scheduled, list) else 0
+                ),
             }
         )
 
@@ -1347,12 +1737,16 @@ def generate_privacy_policy() -> Response:
 
     generated = _bot().generate_privacy_policies(
         output_dir=output_dir,
-        jurisdictions=_coerce_list(payload.get("jurisdictions"), "jurisdictions")
-        if payload.get("jurisdictions") is not None
-        else None,
-        formats=_coerce_list(payload.get("formats"), "formats")
-        if payload.get("formats") is not None
-        else None,
+        jurisdictions=(
+            _coerce_list(payload.get("jurisdictions"), "jurisdictions")
+            if payload.get("jurisdictions") is not None
+            else None
+        ),
+        formats=(
+            _coerce_list(payload.get("formats"), "formats")
+            if payload.get("formats") is not None
+            else None
+        ),
         effective_date=payload.get("effective_date"),
     )
     return (
@@ -1662,15 +2056,14 @@ def transition_task_status_route(task_id: int) -> Response:
 
 @app.get("/health")
 def health() -> Response:
-    bot = _bot()
-    return jsonify(
-        {
-            "status": "ok",
-            "queue": _get_queue_health_snapshot(),
-            "database": bot.get_database_pool_metrics(),
-            "cache": bot.get_cache_metrics()["health"],
-        }
-    )
+    payload = _build_health_payload("health")
+    return jsonify(payload), _status_code_for_health(payload["status"])
+
+
+@app.get("/ready")
+def ready() -> Response:
+    payload = _build_health_payload("ready")
+    return jsonify(payload), _status_code_for_health(payload["status"])
 
 
 @app.get("/health/queue")
@@ -1682,7 +2075,10 @@ def queue_health() -> Response:
 
 @app.get("/health/database")
 def database_health() -> Response:
-    return jsonify(_bot().get_database_pool_metrics())
+    bot = _bot()
+    payload = bot.get_database_pool_metrics()
+    payload["queries"] = bot.get_database_query_metrics()
+    return jsonify(payload)
 
 
 @app.get("/health/cache")
@@ -1728,6 +2124,15 @@ def metrics() -> Response:
             "invalidations": 0,
         },
     )
+    query_metrics = _mapping_or_default(
+        getattr(bot, "get_database_query_metrics", lambda: {})(),
+        {
+            "slow_query_threshold_seconds": 0.25,
+            "buckets": [],
+            "summary": {},
+            "statements": {},
+        },
+    )
     cache_metrics = _mapping_or_default(
         getattr(bot, "get_cache_metrics", lambda: {})(),
         {"namespaces": {}},
@@ -1746,6 +2151,7 @@ def metrics() -> Response:
             queue_metrics[key] = int(raw_queue_metrics.get(key, 0) or 0)
     queue_health = _get_queue_health_snapshot()
     queue_status_value = 1 if queue_health["status"] == "ok" else 0
+    health_metrics = _health_check_metrics_snapshot()
     task_assignments = conn.execute(
         """
         SELECT COALESCE(assignee, assigned_to) AS assignee, COUNT(*) AS total
@@ -1808,6 +2214,7 @@ def metrics() -> Response:
         "# HELP funding_bot_db_pool_invalidations_total SQLAlchemy pool invalidation events",
         "# TYPE funding_bot_db_pool_invalidations_total counter",
         f"funding_bot_db_pool_invalidations_total {database_metrics['invalidations']}",
+        *_render_query_metrics_prometheus(query_metrics),
         "# HELP funding_bot_queue_health_status Queue health status (1=ok, 0=disabled/degraded)",
         "# TYPE funding_bot_queue_health_status gauge",
         f"funding_bot_queue_health_status {queue_status_value}",
@@ -1826,6 +2233,30 @@ def metrics() -> Response:
         "# HELP funding_bot_queue_workers Online Celery workers detected",
         "# TYPE funding_bot_queue_workers gauge",
         f"funding_bot_queue_workers {queue_health['worker_count']}",
+        "# HELP funding_bot_health_checks_total Total /health and /ready probes performed",
+        "# TYPE funding_bot_health_checks_total counter",
+        *[
+            f'funding_bot_health_checks_total{{endpoint="{endpoint}"}} {metrics["checks_performed"]}'
+            for endpoint, metrics in sorted(health_metrics["endpoints"].items())
+        ],
+        "# HELP funding_bot_health_failures_total Total failing /health and /ready probes",
+        "# TYPE funding_bot_health_failures_total counter",
+        *[
+            f'funding_bot_health_failures_total{{endpoint="{endpoint}"}} {metrics["failures"]}'
+            for endpoint, metrics in sorted(health_metrics["endpoints"].items())
+        ],
+        "# HELP funding_bot_health_component_checks_total Total component checks performed by health endpoints",
+        "# TYPE funding_bot_health_component_checks_total counter",
+        *[
+            f'funding_bot_health_component_checks_total{{component="{component}"}} {metrics["checks_performed"]}'
+            for component, metrics in sorted(health_metrics["components"].items())
+        ],
+        "# HELP funding_bot_health_component_failures_total Total component health check failures",
+        "# TYPE funding_bot_health_component_failures_total counter",
+        *[
+            f'funding_bot_health_component_failures_total{{component="{component}"}} {metrics["failures"]}'
+            for component, metrics in sorted(health_metrics["components"].items())
+        ],
         "# HELP funding_bot_queue_task_runs_running Queue task runs currently marked running in SQLite",
         "# TYPE funding_bot_queue_task_runs_running gauge",
         f"funding_bot_queue_task_runs_running {queue_metrics['running']}",

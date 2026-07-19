@@ -271,7 +271,7 @@ def _seed_test_database(bot: FundingBot) -> dict[str, object]:
         keywords=["education", "digital learning", "csr"],
         discovered_at=SEED_TIMESTAMP,
     )
-    submitted = bot.submit_application(
+    bot.submit_application(
         opportunities[0]["signature"],
         submission_reference="seeded-submission-001",
         status="submitted",
@@ -303,7 +303,6 @@ def _seed_test_database(bot: FundingBot) -> dict[str, object]:
     return {
         "organization_name": "i4Edu",
         "opportunity_signatures": [item["signature"] for item in opportunities],
-        "submitted_application_id": submitted["id"],
         "task_id": task["id"],
         "translation_review_id": review["id"],
         "counts": {

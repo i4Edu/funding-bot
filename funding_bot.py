@@ -755,6 +755,233 @@ class BatchProcessingMetricsRegistry:
 _BATCH_METRICS = BatchProcessingMetricsRegistry()
 
 
+def _stream_supports_color(stream: Any) -> bool:
+    isatty = getattr(stream, "isatty", None)
+    return bool(callable(isatty) and isatty())
+
+
+def _should_use_color(
+    stream: Any,
+    *,
+    no_color: bool = False,
+    json_output: bool = False,
+) -> bool:
+    return not no_color and not json_output and not os.environ.get("NO_COLOR") and _stream_supports_color(stream)
+
+
+def _configure_cli_output(*, no_color: bool = False, json_output: bool = False) -> _CliOutputSettings:
+    _CLI_OUTPUT_SETTINGS.stdout_color = _should_use_color(
+        sys.stdout,
+        no_color=no_color,
+        json_output=json_output,
+    )
+    _CLI_OUTPUT_SETTINGS.stderr_color = _should_use_color(
+        sys.stderr,
+        no_color=no_color,
+        json_output=json_output,
+    )
+    _CLI_OUTPUT_SETTINGS.progress_enabled = bool(
+        not json_output and Console is not None and Progress is not None and _stream_supports_color(sys.stdout)
+    )
+    _CLI_OUTPUT_SETTINGS.no_color = no_color
+    _CLI_OUTPUT_SETTINGS.json_output = json_output
+    colorama_init(strip=not (_CLI_OUTPUT_SETTINGS.stdout_color or _CLI_OUTPUT_SETTINGS.stderr_color))
+    return _CLI_OUTPUT_SETTINGS
+
+
+def _style_cli_text(message: str, *, level: str | None = None, stream: Any = sys.stdout) -> str:
+    color_enabled = _CLI_OUTPUT_SETTINGS.stderr_color if stream is sys.stderr else _CLI_OUTPUT_SETTINGS.stdout_color
+    if not color_enabled:
+        return message
+    color = {
+        "success": Fore.GREEN,
+        "error": Fore.RED,
+        "warning": Fore.YELLOW,
+        "info": Fore.CYAN,
+    }.get(level, "")
+    return f"{color}{message}{Style.RESET_ALL}" if color else message
+
+
+def _cli_print(message: str = "", *, level: str | None = None, file: Any = sys.stdout) -> None:
+    print(_style_cli_text(message, level=level, stream=file), file=file)
+
+
+def _colorize_status_text(status: str) -> str:
+    normalized = str(status).strip().lower()
+    if normalized in {"ok", "healthy", "success", "completed"}:
+        level = "success"
+    elif normalized in {"warning", "degraded", "disabled", "cancelled"}:
+        level = "warning"
+    elif normalized in {"error", "failed"}:
+        level = "error"
+    else:
+        level = None
+    return _style_cli_text(str(status), level=level)
+
+
+class _CliColorFormatter(logging.Formatter):
+    def __init__(self, fmt: str, *, color_enabled: bool) -> None:
+        super().__init__(fmt)
+        self._color_enabled = color_enabled
+
+    def format(self, record: logging.LogRecord) -> str:
+        message = super().format(record)
+        if not self._color_enabled:
+            return message
+        if record.levelno >= logging.ERROR:
+            color = Fore.RED
+        elif record.levelno >= logging.WARNING:
+            color = Fore.YELLOW
+        elif record.levelno >= logging.INFO:
+            color = Fore.GREEN
+        else:
+            color = ""
+        return f"{color}{message}{Style.RESET_ALL}" if color else message
+
+
+def _format_eta(seconds: float | None) -> str:
+    if seconds is None or seconds <= 0:
+        return "0s"
+    rounded = int(round(seconds))
+    minutes, secs = divmod(rounded, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _emit_progress_event(
+    progress_callback: Callable[[dict[str, Any]], None] | None,
+    **event: Any,
+) -> None:
+    if progress_callback is None:
+        return
+    payload = dict(event)
+    total = max(int(payload.get("total", 0) or 0), 0)
+    completed = max(int(payload.get("completed", 0) or 0), 0)
+    if total:
+        completed = min(completed, total)
+    payload["total"] = total
+    payload["completed"] = completed
+    payload["remaining"] = max(total - completed, 0)
+    try:
+        progress_callback(payload)
+    except Exception:  # pragma: no cover - progress reporting must never break work
+        logging.getLogger(__name__).debug("Progress callback failed.", exc_info=True)
+
+
+class _CliProgressReporter:
+    def __init__(self) -> None:
+        self._console = None
+        self._progress = None
+        self._task_ids: dict[str, Any] = {}
+        self._started_at: dict[str, float] = {}
+        self._last_snapshot: dict[str, tuple[str, int, int]] = {}
+
+    def __enter__(self) -> "_CliProgressReporter":
+        if _CLI_OUTPUT_SETTINGS.progress_enabled and Console is not None and Progress is not None:
+            self._console = Console(
+                file=sys.stdout,
+                no_color=_CLI_OUTPUT_SETTINGS.no_color,
+                highlight=False,
+            )
+            self._progress = Progress(
+                SpinnerColumn(),
+                TextColumn("{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TextColumn("• {task.fields[remaining]} remaining"),
+                TimeRemainingColumn(),
+                console=self._console,
+                transient=True,
+            )
+            self._progress.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._progress is not None:
+            self._progress.__exit__(exc_type, exc, tb)
+
+    def update(
+        self,
+        key: str,
+        *,
+        description: str,
+        completed: int,
+        total: int,
+    ) -> None:
+        normalized_total = max(int(total), 1)
+        normalized_completed = min(max(int(completed), 0), normalized_total)
+        remaining = max(normalized_total - normalized_completed, 0)
+        if self._progress is not None:
+            task_id = self._task_ids.get(key)
+            if task_id is None:
+                task_id = self._progress.add_task(
+                    description,
+                    total=normalized_total,
+                    completed=normalized_completed,
+                    remaining=remaining,
+                )
+                self._task_ids[key] = task_id
+            else:
+                self._progress.update(
+                    task_id,
+                    description=description,
+                    total=normalized_total,
+                    completed=normalized_completed,
+                    remaining=remaining,
+                )
+            return
+        now = time.monotonic()
+        started_at = self._started_at.setdefault(key, now)
+        eta = 0.0
+        if 0 < normalized_completed < normalized_total:
+            elapsed = max(now - started_at, 0.001)
+            eta = (elapsed / normalized_completed) * remaining
+        snapshot = (description, normalized_completed, normalized_total)
+        if self._last_snapshot.get(key) == snapshot:
+            return
+        self._last_snapshot[key] = snapshot
+        _cli_print(
+            f"{description}: {normalized_completed}/{normalized_total} complete, "
+            f"{remaining} remaining, ETA {_format_eta(eta)}"
+        )
+
+    def update_from_event(self, event: dict[str, Any]) -> None:
+        detail = event.get("callback_payload") if isinstance(event.get("callback_payload"), dict) else {}
+        if detail and detail.get("total"):
+            key = str(detail.get("stage") or detail.get("key") or event.get("task_name") or "task")
+            description = str(detail.get("description") or event.get("message") or key.replace("-", " "))
+            self.update(
+                key,
+                description=description,
+                completed=int(detail.get("completed", 0)),
+                total=int(detail.get("total", 1)),
+            )
+            return
+        task_name = str(event.get("task_name") or "task").replace("_", " ")
+        self.update(
+            task_name,
+            description=str(event.get("message") or task_name.title()),
+            completed=int(event.get("progress", 0)),
+            total=100,
+        )
+
+
+@contextmanager
+def _bind_cli_progress(reporter: _CliProgressReporter | None) -> Any:
+    if reporter is None:
+        yield
+        return
+    token = _CLI_PROGRESS_CALLBACK.set(reporter.update_from_event)
+    try:
+        yield
+    finally:
+        _CLI_PROGRESS_CALLBACK.reset(token)
+
+
 class FundingBotError(Exception):
     """Base error for funding bot operations."""
 
@@ -967,7 +1194,7 @@ class QueueTaskContext:
         callback_name: str = "progress",
         callback_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self.bot.record_task_run(
+        task_run = self.bot.record_task_run(
             self.idempotency_key,
             self.task_name,
             status="running",
@@ -984,6 +1211,18 @@ class QueueTaskContext:
             backoff_max_seconds=self.backoff_max_seconds,
             dead_lettered=False,
         )
+        progress_callback = _CLI_PROGRESS_CALLBACK.get()
+        if progress_callback is not None:
+            _emit_progress_event(
+                progress_callback,
+                task_id=self.idempotency_key,
+                task_name=self.task_name,
+                progress=progress,
+                message=message,
+                callback_name=callback_name,
+                callback_payload=callback_payload or {},
+            )
+        return task_run
 
 
 class BrowserClient(Protocol):
@@ -1920,10 +2159,27 @@ class _BasePortalConnector:
         keywords: Iterable[str] | None = None,
         *,
         sample_limit: int = 3,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         requested_keywords = _normalize_text_list(keywords)
+        _emit_progress_event(
+            progress_callback,
+            stage="connector-validation",
+            description=f"Testing connector {self.connector_slug}",
+            current=self.connector_slug,
+            completed=0,
+            total=3,
+        )
         try:
             result = self.fetch_result(requested_keywords)
+            _emit_progress_event(
+                progress_callback,
+                stage="connector-validation",
+                description=f"Fetched connector data for {self.connector_slug}",
+                current=self.connector_slug,
+                completed=2,
+                total=3,
+            )
             sample_results = result["opportunities"]
             metadata = dict(result.get("metadata", {}))
             degraded = metadata.get("source_status") == "degraded"
@@ -1938,7 +2194,7 @@ class _BasePortalConnector:
                 }
                 for row in sample_results[: max(sample_limit, 0)]
             ]
-            return {
+            validation = {
                 "connector": self.connector_slug,
                 "source": self.source_name,
                 "base_url": self.base_url,
@@ -1953,7 +2209,24 @@ class _BasePortalConnector:
                 "metadata": metadata,
                 "error": metadata.get("last_error"),
             }
+            _emit_progress_event(
+                progress_callback,
+                stage="connector-validation",
+                description=f"Finished connector test for {self.connector_slug}",
+                current=self.connector_slug,
+                completed=3,
+                total=3,
+            )
+            return validation
         except Exception as exc:
+            _emit_progress_event(
+                progress_callback,
+                stage="connector-validation",
+                description=f"Connector test failed for {self.connector_slug}",
+                current=self.connector_slug,
+                completed=3,
+                total=3,
+            )
             return {
                 "connector": self.connector_slug,
                 "source": self.source_name,
@@ -2437,7 +2710,7 @@ class GrantsPortalConnector(_BasePortalConnector):
         )
 
     def _fetch_remote_result(self, keywords: list[str]) -> dict[str, Any]:
-        if self.http_client is not None:
+        if self.http_client is not None or type(self) is not GrantsPortalConnector:
             return super()._fetch_remote_result(keywords)
 
         try:
@@ -3880,6 +4153,27 @@ class FundingBot:
 
     def close(self) -> None:
         self._database.close()
+        self.connection = None
+
+    @asynccontextmanager
+    async def async_db_session(self) -> Any:
+        async with AsyncDatabaseSession(self.connection, self._db_lock) as session:
+            yield session
+
+    @staticmethod
+    def _resolve_connector_batch_size(batch_size: int | None = None) -> int:
+        candidate = batch_size
+        if candidate is None:
+            candidate = _read_numeric_env(
+                ["FUNDING_BOT_CONNECTOR_BATCH_SIZE", "CONNECTOR_BATCH_SIZE"],
+                5,
+                minimum=1,
+                as_int=True,
+            )
+        try:
+            return max(1, int(candidate))
+        except (TypeError, ValueError):
+            return 5
 
     def _create_schema(self) -> None:
         self.connection.executescript(
@@ -4568,6 +4862,42 @@ class FundingBot:
         )
         self.connection.commit()
 
+    async def _store_connector_result_async(
+        self,
+        *,
+        connector_name: str,
+        cache_key: str,
+        schema_version: int,
+        opportunities: Iterable[dict[str, Any]],
+        metadata: dict[str, Any] | None = None,
+        source_status: str = "remote",
+    ) -> None:
+        payload = [dict(item) for item in opportunities]
+        async with self.async_db_session() as session:
+            await session.execute(
+                """
+                INSERT INTO connector_result_cache (
+                    connector_name, cache_key, schema_version, fetched_at,
+                    source_status, metadata_json, result_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(connector_name, cache_key) DO UPDATE SET
+                    schema_version = excluded.schema_version,
+                    fetched_at = excluded.fetched_at,
+                    source_status = excluded.source_status,
+                    metadata_json = excluded.metadata_json,
+                    result_json = excluded.result_json
+                """,
+                (
+                    connector_name,
+                    cache_key,
+                    int(schema_version),
+                    self._to_iso(),
+                    source_status,
+                    json.dumps(metadata or {}, sort_keys=True),
+                    json.dumps(payload, sort_keys=True),
+                ),
+            )
+
     def _load_cached_connector_result(
         self,
         connector: PortalConnector,
@@ -4601,6 +4931,54 @@ class FundingBot:
                 "migrated_at": self._to_iso(),
             }
             self._store_connector_result(
+                connector_name=connector_name,
+                cache_key=cache_key,
+                schema_version=target_version,
+                opportunities=payload,
+                metadata=metadata,
+                source_status=row["source_status"],
+            )
+        return {
+            "schema_version": target_version,
+            "opportunities": payload,
+            "metadata": metadata,
+            "source_status": row["source_status"],
+        }
+
+    async def _load_cached_connector_result_async(
+        self,
+        connector: PortalConnector,
+        keywords: Iterable[str],
+    ) -> dict[str, Any] | None:
+        connector_name = self._connector_name(connector)
+        cache_key = self._connector_cache_key(connector, keywords)
+        async with self.async_db_session() as session:
+            row = await session.fetchone(
+                """
+                SELECT schema_version, source_status, metadata_json, result_json
+                FROM connector_result_cache
+                WHERE connector_name = ? AND cache_key = ?
+                """,
+                (connector_name, cache_key),
+            )
+        if row is None:
+            return None
+        metadata = json.loads(row["metadata_json"] or "{}")
+        payload = json.loads(row["result_json"] or "[]")
+        migrate = getattr(connector, "migrate_result_payload", None)
+        current_version = int(row["schema_version"])
+        target_version = int(getattr(connector, "result_schema_version", _CONNECTOR_RESULT_SCHEMA_VERSION))
+        if callable(migrate):
+            payload = migrate(payload, current_version)
+        else:
+            payload = [dict(item) for item in payload]
+        if current_version != target_version:
+            metadata = {
+                **metadata,
+                "migrated_from_schema_version": current_version,
+                "migrated_at": self._to_iso(),
+            }
+            await self._store_connector_result_async(
                 connector_name=connector_name,
                 cache_key=cache_key,
                 schema_version=target_version,
@@ -4661,6 +5039,18 @@ class FundingBot:
     @staticmethod
     def reset_connector_metrics() -> None:
         _CONNECTOR_METRICS.reset()
+
+    @staticmethod
+    def batch_metrics_snapshot() -> dict[str, Any]:
+        return _BATCH_METRICS.snapshot()
+
+    @staticmethod
+    def render_batch_metrics_prometheus() -> list[str]:
+        return _BATCH_METRICS.render_prometheus()
+
+    @staticmethod
+    def reset_batch_metrics() -> None:
+        _BATCH_METRICS.reset()
 
     @staticmethod
     def _normalize_filter_timestamp(value: datetime | str | None, *, end: bool = False) -> str | None:
@@ -5700,6 +6090,9 @@ class FundingBot:
     def get_database_pool_metrics(self) -> dict[str, Any]:
         return self._database.get_pool_metrics()
 
+    def get_database_query_metrics(self) -> dict[str, Any]:
+        return self._database.get_query_metrics()
+
     def get_cache_metrics(self) -> dict[str, Any]:
         namespaces: dict[str, dict[str, Any]] = {}
         for entry in self.cache_manager.all_stats():
@@ -6496,6 +6889,8 @@ class FundingBot:
         *,
         now: datetime | None = None,
         dry_run: bool = False,
+        archive_manager: ArchiveManager | None = None,
+        archive: bool = True,
     ) -> dict[str, Any]:
         as_of = self._as_utc(now)
         policy = self.load_data_retention_policy()
@@ -6524,12 +6919,60 @@ class FundingBot:
         ).fetchall()
         expired_document_ids = [row["id"] for row in expired_document_rows]
         expired_document_paths = [Path(row["path"]) for row in expired_document_rows]
+        expired_audit_rows = self.connection.execute(
+            "SELECT * FROM audit_logs WHERE happened_at < ? ORDER BY happened_at, id",
+            (cutoffs["audit_logs_days"],),
+        ).fetchall()
+        expired_submission_rows = self.connection.execute(
+            """
+            SELECT *
+            FROM submission_attempts
+            WHERE happened_at < ?
+            ORDER BY happened_at, id
+            """,
+            (cutoffs["submission_attempts_days"],),
+        ).fetchall()
+        expired_task_rows = self.connection.execute(
+            """
+            SELECT *
+            FROM tasks
+            WHERE status = 'done' AND updated_at < ?
+            ORDER BY updated_at, id
+            """,
+            (cutoffs["completed_tasks_days"],),
+        ).fetchall()
+        expired_opportunity_rows = self.connection.execute(
+            """
+            SELECT *
+            FROM opportunities
+            WHERE discovered_at < ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM applications
+                  WHERE applications.opportunity_signature = opportunities.signature
+              )
+            ORDER BY discovered_at, signature
+            """,
+            (cutoffs["opportunities_days"],),
+        ).fetchall()
+        expired_opportunity_signatures = [row["signature"] for row in expired_opportunity_rows]
+        expired_communication_archive_rows = self.connection.execute(
+            """
+            SELECT
+                c.*,
+                oe.id AS outreach_event_id,
+                oe.event_type,
+                oe.happened_at AS outreach_event_happened_at
+            FROM communications c
+            LEFT JOIN outreach_events oe ON oe.communication_id = c.id
+            WHERE c.sent_at < ?
+            ORDER BY c.id, oe.id
+            """,
+            (cutoffs["communications_days"],),
+        ).fetchall()
 
         deleted_counts = {
-            "audit_logs": self.connection.execute(
-                "SELECT COUNT(*) FROM audit_logs WHERE happened_at < ?",
-                (cutoffs["audit_logs_days"],),
-            ).fetchone()[0],
+            "audit_logs": len(expired_audit_rows),
             "communications": len(expired_communication_ids),
             "outreach_events": (
                 self.connection.execute(
@@ -6545,16 +6988,28 @@ class FundingBot:
                 else 0
             ),
             "documents": len(expired_document_ids),
-            "submission_attempts": self.connection.execute(
-                "SELECT COUNT(*) FROM submission_attempts WHERE happened_at < ?",
-                (cutoffs["submission_attempts_days"],),
-            ).fetchone()[0],
-            "completed_tasks": self.connection.execute(
-                "SELECT COUNT(*) FROM tasks WHERE status = 'done' AND updated_at < ?",
-                (cutoffs["completed_tasks_days"],),
-            ).fetchone()[0],
+            "opportunities": len(expired_opportunity_signatures),
+            "submission_attempts": len(expired_submission_rows),
+            "completed_tasks": len(expired_task_rows),
             "document_files_deleted": 0,
         }
+        archival_report: dict[str, Any] | None = None
+        if archive and not dry_run:
+            archive_manager = archive_manager or ArchiveManager.from_env()
+            archival_report = archive_manager.archive_payload(
+                {
+                    "archived_at": self._to_iso(as_of),
+                    "cutoffs": cutoffs,
+                    "policy": policy,
+                    "audit_logs": [dict(row) for row in expired_audit_rows],
+                    "communications": [dict(row) for row in expired_communication_archive_rows],
+                    "documents": [dict(row) for row in expired_document_rows],
+                    "opportunities": [dict(row) for row in expired_opportunity_rows],
+                    "submission_attempts": [dict(row) for row in expired_submission_rows],
+                    "completed_tasks": [dict(row) for row in expired_task_rows],
+                },
+                archive_name=f"retention_archive_{as_of.strftime('%Y%m%dT%H%M%SZ')}.json",
+            )
 
         result = {
             "dry_run": dry_run,
@@ -6562,6 +7017,7 @@ class FundingBot:
             "policy": policy,
             "cutoffs": cutoffs,
             "deleted": deleted_counts,
+            "archival": archival_report,
         }
         if dry_run:
             return result
@@ -6583,6 +7039,12 @@ class FundingBot:
                 "DELETE FROM documents WHERE created_at < ?",
                 (cutoffs["documents_days"],),
             )
+            if expired_opportunity_signatures:
+                placeholders = ", ".join("?" for _ in expired_opportunity_signatures)
+                self.connection.execute(
+                    "DELETE FROM opportunities WHERE signature IN (" + placeholders + ")",
+                    expired_opportunity_signatures,
+                )
             if expired_communication_ids:
                 placeholders = ", ".join("?" for _ in expired_communication_ids)
                 self.connection.execute(
@@ -6608,8 +7070,26 @@ class FundingBot:
             as_of=result["as_of"],
             deleted=deleted_counts,
             policy=policy,
+            archival=archival_report,
         )
         return result
+
+    def export_data_warehouse(
+        self,
+        *,
+        datasets: Iterable[str] | None = None,
+        export_format: str = "json",
+        output_dir: str | os.PathLike[str] = "generated/exports",
+        archive: bool = False,
+        archive_manager: ArchiveManager | None = None,
+    ) -> dict[str, Any]:
+        return WarehouseExportService(self).export(
+            datasets=datasets,
+            export_format=export_format,
+            output_dir=output_dir,
+            archive=archive,
+            archive_manager=archive_manager,
+        )
 
     def list_locale_definitions(self) -> list[dict[str, Any]]:
         return [dict(definition) for definition in SUPPORTED_UI_LOCALES.values()]
@@ -7030,6 +7510,23 @@ class FundingBot:
         trusted_sources: Iterable[str] | None = None,
         discovered_at: datetime | None = None,
     ) -> list[dict[str, Any]]:
+        return _run_async(
+            self.deduplicate_async(
+                opportunities,
+                keywords=keywords,
+                trusted_sources=trusted_sources,
+                discovered_at=discovered_at,
+            )
+        )
+
+    async def deduplicate_async(
+        self,
+        opportunities: Iterable[dict[str, Any]],
+        *,
+        keywords: Iterable[str] | None = None,
+        trusted_sources: Iterable[str] | None = None,
+        discovered_at: datetime | None = None,
+    ) -> list[dict[str, Any]]:
         """Filter, deduplicate, and persist opportunity records."""
         keyword_list = [keyword.lower() for keyword in (keywords or [])]
         allowed_sources = {
@@ -7037,64 +7534,63 @@ class FundingBot:
         }
         found: list[dict[str, Any]] = []
         timestamp = self._to_iso(discovered_at)
+        async with self.async_db_session() as session:
+            for opportunity in opportunities:
+                source = str(opportunity.get("source", "")).strip()
+                if allowed_sources and source.lower() not in allowed_sources:
+                    continue
 
-        for opportunity in opportunities:
-            source = str(opportunity.get("source", "")).strip()
-            if allowed_sources and source.lower() not in allowed_sources:
-                continue
+                searchable_parts = [
+                    str(opportunity.get("title", "")),
+                    str(opportunity.get("summary", "")),
+                    " ".join(str(tag) for tag in opportunity.get("tags", [])),
+                    str(opportunity.get("category", "")),
+                ]
+                searchable_text = " ".join(searchable_parts).lower()
+                if keyword_list and not any(keyword in searchable_text for keyword in keyword_list):
+                    continue
 
-            searchable_parts = [
-                str(opportunity.get("title", "")),
-                str(opportunity.get("summary", "")),
-                " ".join(str(tag) for tag in opportunity.get("tags", [])),
-                str(opportunity.get("category", "")),
-            ]
-            searchable_text = " ".join(searchable_parts).lower()
-            if keyword_list and not any(keyword in searchable_text for keyword in keyword_list):
-                continue
+                record = {
+                    "source": source,
+                    "donor_name": str(opportunity.get("donor_name", source or "Unknown donor")),
+                    "title": str(opportunity.get("title", "Untitled opportunity")),
+                    "portal_url": str(opportunity.get("portal_url", "")),
+                    "summary": str(opportunity.get("summary", "")),
+                    "category": str(opportunity.get("category", "")),
+                    "discovered_at": timestamp,
+                    "status": "new",
+                    "raw_data_json": json.dumps(opportunity, sort_keys=True),
+                }
+                record["signature"] = self._signature_for(record)
+                existing = await session.fetchone(
+                    "SELECT 1 FROM opportunities WHERE signature = ?",
+                    (record["signature"],),
+                )
+                if existing:
+                    continue
 
-            record = {
-                "source": source,
-                "donor_name": str(opportunity.get("donor_name", source or "Unknown donor")),
-                "title": str(opportunity.get("title", "Untitled opportunity")),
-                "portal_url": str(opportunity.get("portal_url", "")),
-                "summary": str(opportunity.get("summary", "")),
-                "category": str(opportunity.get("category", "")),
-                "discovered_at": timestamp,
-                "status": "new",
-                "raw_data_json": json.dumps(opportunity, sort_keys=True),
-            }
-            record["signature"] = self._signature_for(record)
-            existing = self.connection.execute(
-                "SELECT 1 FROM opportunities WHERE signature = ?",
-                (record["signature"],),
-            ).fetchone()
-            if existing:
-                continue
+                await session.execute(
+                    """
+                    INSERT INTO opportunities (
+                        signature, source, donor_name, title, portal_url, summary,
+                        category, discovered_at, status, raw_data_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record["signature"],
+                        record["source"],
+                        record["donor_name"],
+                        record["title"],
+                        record["portal_url"],
+                        record["summary"],
+                        record["category"],
+                        record["discovered_at"],
+                        record["status"],
+                        record["raw_data_json"],
+                    ),
+                )
+                found.append(record)
 
-            self.connection.execute(
-                """
-                INSERT INTO opportunities (
-                    signature, source, donor_name, title, portal_url, summary,
-                    category, discovered_at, status, raw_data_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    record["signature"],
-                    record["source"],
-                    record["donor_name"],
-                    record["title"],
-                    record["portal_url"],
-                    record["summary"],
-                    record["category"],
-                    record["discovered_at"],
-                    record["status"],
-                    record["raw_data_json"],
-                ),
-            )
-            found.append(record)
-
-        self.connection.commit()
         self._log_action("opportunities_discovered", count=len(found), keywords=keyword_list)
         return found
 

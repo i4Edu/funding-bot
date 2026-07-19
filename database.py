@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -33,6 +35,21 @@ class DatabasePoolConfig:
             pool_timeout_seconds=_read_float_env("FUNDING_BOT_DB_POOL_TIMEOUT_SECONDS", 30.0, minimum=1.0),
             pool_recycle_seconds=_read_float_env("FUNDING_BOT_DB_POOL_RECYCLE_SECONDS", 1800.0, minimum=0.0),
             pre_ping=_read_bool_env("FUNDING_BOT_DB_POOL_PRE_PING", True),
+        )
+
+
+@dataclass(frozen=True)
+class DatabaseQueryMonitorConfig:
+    slow_query_threshold_seconds: float = 0.25
+
+    @classmethod
+    def from_env(cls) -> "DatabaseQueryMonitorConfig":
+        return cls(
+            slow_query_threshold_seconds=_read_float_env(
+                "FUNDING_BOT_DB_SLOW_QUERY_THRESHOLD_SECONDS",
+                0.25,
+                minimum=0.0,
+            )
         )
 
 
@@ -72,6 +89,195 @@ def _read_bool_env(name: str, default: bool) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     return default
+
+
+_QUERY_BUCKETS_SECONDS = (0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0)
+_QUERY_PREFIX_RE = re.compile(r"^(?:--[^\n]*\n|\s+|/\*.*?\*/)+", re.DOTALL)
+
+
+def _statement_label(query: str) -> str:
+    normalized = _QUERY_PREFIX_RE.sub("", query or "").lstrip()
+    if not normalized:
+        return "unknown"
+    token = normalized.split(None, 1)[0].strip().strip("();").lower()
+    return token or "unknown"
+
+
+def _query_status(error: BaseException | None) -> str:
+    if error is None:
+        return "success"
+    message = str(error).lower()
+    if "timeout" in message or "timed out" in message or "database is locked" in message:
+        return "timeout"
+    return "error"
+
+
+def _empty_query_metric() -> dict[str, Any]:
+    return {
+        "count": 0,
+        "success": 0,
+        "error": 0,
+        "timeout": 0,
+        "slow": 0,
+        "sum_duration_seconds": 0.0,
+        "max_duration_seconds": 0.0,
+        "bucket_counts": [0 for _ in _QUERY_BUCKETS_SECONDS],
+        "in_flight": 0,
+    }
+
+
+def _snapshot_metric(metric: dict[str, Any]) -> dict[str, Any]:
+    count = int(metric["count"])
+    average = float(metric["sum_duration_seconds"]) / count if count else 0.0
+    snapshot = {
+        "count": count,
+        "success": int(metric["success"]),
+        "error": int(metric["error"]),
+        "timeout": int(metric["timeout"]),
+        "slow": int(metric["slow"]),
+        "sum_duration_seconds": float(metric["sum_duration_seconds"]),
+        "average_duration_seconds": average,
+        "max_duration_seconds": float(metric["max_duration_seconds"]),
+        "bucket_counts": list(metric["bucket_counts"]),
+        "in_flight": int(metric["in_flight"]),
+    }
+    return snapshot
+
+
+class DatabaseQueryMonitor:
+    def __init__(self, config: DatabaseQueryMonitorConfig | None = None) -> None:
+        self.config = config or DatabaseQueryMonitorConfig.from_env()
+        self._lock = threading.Lock()
+        self._summary = _empty_query_metric()
+        self._statements: dict[str, dict[str, Any]] = {}
+
+    def _metric_bucket(self, statement: str) -> dict[str, Any]:
+        bucket = self._statements.get(statement)
+        if bucket is None:
+            bucket = _empty_query_metric()
+            self._statements[statement] = bucket
+        return bucket
+
+    def begin(self, query: str) -> str:
+        statement = _statement_label(query)
+        with self._lock:
+            self._summary["in_flight"] += 1
+            self._metric_bucket(statement)["in_flight"] += 1
+        return statement
+
+    def finish(self, statement: str, duration_seconds: float, error: BaseException | None = None) -> None:
+        status = _query_status(error)
+        with self._lock:
+            for metric in (self._summary, self._metric_bucket(statement)):
+                metric["in_flight"] = max(int(metric["in_flight"]) - 1, 0)
+                metric["count"] += 1
+                metric[status] += 1
+                metric["sum_duration_seconds"] += duration_seconds
+                metric["max_duration_seconds"] = max(
+                    float(metric["max_duration_seconds"]), duration_seconds
+                )
+                if duration_seconds >= self.config.slow_query_threshold_seconds:
+                    metric["slow"] += 1
+                for index, bucket_limit in enumerate(_QUERY_BUCKETS_SECONDS):
+                    if duration_seconds <= bucket_limit:
+                        metric["bucket_counts"][index] += 1
+                        break
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            statements = {
+                statement: _snapshot_metric(metric)
+                for statement, metric in sorted(self._statements.items())
+            }
+            summary = _snapshot_metric(self._summary)
+        return {
+            "slow_query_threshold_seconds": self.config.slow_query_threshold_seconds,
+            "buckets": list(_QUERY_BUCKETS_SECONDS),
+            "summary": summary,
+            "statements": statements,
+        }
+
+
+class InstrumentedCursor:
+    def __init__(self, cursor: Any, monitor: DatabaseQueryMonitor) -> None:
+        self._cursor = cursor
+        self._monitor = monitor
+
+    def _record(self, query: str, operation: Any) -> Any:
+        statement = self._monitor.begin(query)
+        started_at = time.perf_counter()
+        try:
+            result = operation()
+        except BaseException as exc:
+            self._monitor.finish(statement, time.perf_counter() - started_at, exc)
+            raise
+        self._monitor.finish(statement, time.perf_counter() - started_at, None)
+        return result
+
+    def execute(self, query: str, parameters: Any = ()) -> Any:
+        return self._record(query, lambda: self._cursor.execute(query, parameters))
+
+    def executemany(self, query: str, seq_of_parameters: Any) -> Any:
+        return self._record(query, lambda: self._cursor.executemany(query, seq_of_parameters))
+
+    def executescript(self, query: str) -> Any:
+        return self._record(query, lambda: self._cursor.executescript(query))
+
+    def __iter__(self) -> Any:
+        return iter(self._cursor)
+
+    def __enter__(self) -> "InstrumentedCursor":
+        self._cursor.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+        return self._cursor.__exit__(exc_type, exc, tb)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._cursor, name)
+
+
+class InstrumentedConnection:
+    def __init__(self, connection: Any, monitor: DatabaseQueryMonitor) -> None:
+        self._connection = connection
+        self._monitor = monitor
+
+    @property
+    def raw_connection(self) -> Any:
+        return self._connection
+
+    def _record(self, query: str, operation: Any) -> Any:
+        statement = self._monitor.begin(query)
+        started_at = time.perf_counter()
+        try:
+            result = operation()
+        except BaseException as exc:
+            self._monitor.finish(statement, time.perf_counter() - started_at, exc)
+            raise
+        self._monitor.finish(statement, time.perf_counter() - started_at, None)
+        return result
+
+    def execute(self, query: str, parameters: Any = ()) -> Any:
+        return self._record(query, lambda: self._connection.execute(query, parameters))
+
+    def executemany(self, query: str, seq_of_parameters: Any) -> Any:
+        return self._record(query, lambda: self._connection.executemany(query, seq_of_parameters))
+
+    def executescript(self, query: str) -> Any:
+        return self._record(query, lambda: self._connection.executescript(query))
+
+    def cursor(self, *args: Any, **kwargs: Any) -> InstrumentedCursor:
+        return InstrumentedCursor(self._connection.cursor(*args, **kwargs), self._monitor)
+
+    def __enter__(self) -> "InstrumentedConnection":
+        self._connection.__enter__()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> Any:
+        return self._connection.__exit__(exc_type, exc, tb)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
 
 
 class DatabasePoolMonitor:
@@ -176,10 +382,12 @@ class DatabaseManager:
         db_path: str | os.PathLike[str],
         *,
         config: DatabasePoolConfig | None = None,
+        query_monitor_config: DatabaseQueryMonitorConfig | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.config = config or DatabasePoolConfig.from_env()
         self.monitor = DatabasePoolMonitor()
+        self.query_monitor = DatabaseQueryMonitor(query_monitor_config)
         self.engine = None
         self.connection = None
         self._enabled = create_engine is not None
@@ -195,7 +403,7 @@ class DatabaseManager:
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA busy_timeout = 5000")
             connection.row_factory = sqlite3.Row
-            self.connection = connection
+            self.connection = InstrumentedConnection(connection, self.query_monitor)
 
     def _initialize_sqlalchemy_connection(self) -> None:
         assert create_engine is not None
@@ -237,6 +445,7 @@ class DatabaseManager:
         sqlite_connection.execute("PRAGMA foreign_keys = ON")
         sqlite_connection.execute("PRAGMA busy_timeout = 5000")
         sqlite_connection.row_factory = sqlite3.Row
+        self.connection = InstrumentedConnection(self.connection, self.query_monitor)
         self._backend = "sqlalchemy"
 
     @staticmethod
@@ -255,12 +464,17 @@ class DatabaseManager:
     def driver_connection(self) -> sqlite3.Connection:
         if self.connection is None:
             raise RuntimeError("Database connection is not initialized.")
+        raw_connection = getattr(self.connection, "raw_connection", None)
+        if raw_connection is not None:
+            connection = raw_connection
+        else:
+            connection = self.connection
         for attribute in ("driver_connection", "connection"):
-            candidate = getattr(self.connection, attribute, None)
+            candidate = getattr(connection, attribute, None)
             if isinstance(candidate, sqlite3.Connection):
                 return candidate
-        if isinstance(self.connection, sqlite3.Connection):
-            return self.connection
+        if isinstance(connection, sqlite3.Connection):
+            return connection
         raise RuntimeError("Unable to access the underlying sqlite3 connection.")
 
     def get_pool_metrics(self) -> dict[str, Any]:
@@ -278,6 +492,14 @@ class DatabaseManager:
             }
         )
         return snapshot
+
+    def get_query_metrics(self) -> dict[str, Any]:
+        snapshot = self.query_monitor.snapshot()
+        return {
+            "backend": self._backend,
+            "db_path": self.db_path,
+            **snapshot,
+        }
 
     def close(self) -> None:
         if self.connection is not None:

@@ -23,6 +23,10 @@ DEFAULT_RESULT_BACKEND = "redis://redis:6379/1"
 DEFAULT_RABBITMQ_BROKER_URL = "amqp://" "guest:guest@rabbitmq:5672//"
 DEFAULT_DAILY_SUMMARY_HOUR = 9
 DEFAULT_DAILY_SUMMARY_MINUTE = 0
+DEFAULT_WAREHOUSE_EXPORT_HOUR = 1
+DEFAULT_WAREHOUSE_EXPORT_MINUTE = 0
+DEFAULT_RETENTION_CLEANUP_HOUR = 2
+DEFAULT_RETENTION_CLEANUP_MINUTE = 0
 BROKER_ROOT = Path(os.environ.get("CELERY_FILESYSTEM_BROKER_DIR", ".celery-broker"))
 BROKER_QUEUE_DIR = BROKER_ROOT / "queue"
 BROKER_PROCESSED_DIR = BROKER_ROOT / "processed"
@@ -230,13 +234,15 @@ def create_celery_app(config: QueueConfig | None = None) -> Any:
         enable_utc=True,
     )
     if queue_config.broker_url.startswith("filesystem://"):
-        celery_app.conf.broker_transport_options = {
-            "data_folder_in": str(BROKER_QUEUE_DIR),
-            "data_folder_out": str(BROKER_QUEUE_DIR),
-            "data_folder_processed": str(BROKER_PROCESSED_DIR),
-            "control_folder": str(BROKER_CONTROL_DIR),
-        }
-    celery_app.conf.beat_schedule = {
+        celery_app.conf.update(
+            broker_transport_options={
+                "data_folder_in": str(BROKER_QUEUE_DIR),
+                "data_folder_out": str(BROKER_QUEUE_DIR),
+                "data_folder_processed": str(BROKER_PROCESSED_DIR),
+                "control_folder": str(BROKER_CONTROL_DIR),
+            }
+        )
+    celery_app.conf.update(beat_schedule={
         "daily-summary": {
             "task": "funding_bot.send_daily_summary",
             "schedule": crontab(
@@ -254,7 +260,37 @@ def create_celery_app(config: QueueConfig | None = None) -> Any:
                 "dry_run": _coerce_bool(os.environ.get("DAILY_SUMMARY_DRY_RUN"), default=False),
                 "db_path": os.environ.get("BOT_DB_PATH", "funding_bot.db"),
             },
-        }
+        }),
+        "warehouse-export": {
+            "task": "funding_bot.export_data_warehouse",
+            "schedule": crontab(
+                minute=int(os.environ.get("DATA_EXPORT_SCHEDULE_MINUTE", str(DEFAULT_WAREHOUSE_EXPORT_MINUTE))),
+                hour=int(os.environ.get("DATA_EXPORT_SCHEDULE_HOUR", str(DEFAULT_WAREHOUSE_EXPORT_HOUR))),
+            ),
+            "kwargs": {
+                "datasets": [
+                    dataset.strip()
+                    for dataset in os.environ.get("DATA_EXPORT_DATASETS", "donors,tasks,matches,results").split(",")
+                    if dataset.strip()
+                ],
+                "export_format": os.environ.get("DATA_EXPORT_FORMAT", "json"),
+                "output_dir": os.environ.get("DATA_EXPORT_OUTPUT_DIR", "generated/exports"),
+                "archive": _coerce_bool(os.environ.get("DATA_EXPORT_ARCHIVE"), default=True),
+                "db_path": os.environ.get("BOT_DB_PATH", "funding_bot.db"),
+            },
+        },
+        "data-retention-cleanup": {
+            "task": "funding_bot.enforce_data_retention",
+            "schedule": crontab(
+                minute=int(os.environ.get("DATA_RETENTION_SCHEDULE_MINUTE", str(DEFAULT_RETENTION_CLEANUP_MINUTE))),
+                hour=int(os.environ.get("DATA_RETENTION_SCHEDULE_HOUR", str(DEFAULT_RETENTION_CLEANUP_HOUR))),
+            ),
+            "kwargs": {
+                "dry_run": _coerce_bool(os.environ.get("DATA_RETENTION_DRY_RUN"), default=False),
+                "archive": _coerce_bool(os.environ.get("DATA_RETENTION_ARCHIVE"), default=True),
+                "db_path": os.environ.get("BOT_DB_PATH", "funding_bot.db"),
+            },
+        },
     }
     return celery_app
 
@@ -433,6 +469,7 @@ def send_daily_summary_task(
             context.checkpoint("Shutdown requested before daily summary started.")
             sender = None if task_payload.get("dry_run", False) else SMTPEmailSender.from_env()
             if sender is not None and not callable(sender):
+
                 def _discard_email(*_args: Any, **_kwargs: Any) -> None:
                     return None
 
@@ -457,6 +494,87 @@ def send_daily_summary_task(
     return _with_bot(db_path, _run)
 
 
+@celery_app.task(name="funding_bot.export_data_warehouse", queue=load_queue_config().queue_name)
+def export_data_warehouse_task(
+    *,
+    datasets: list[str] | None = None,
+    export_format: str = "json",
+    output_dir: str | None = None,
+    archive: bool = False,
+    db_path: str | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    def _run(bot: FundingBot) -> dict[str, Any]:
+        payload = {
+            "datasets": datasets or ["donors", "tasks", "matches", "results"],
+            "export_format": export_format,
+            "output_dir": output_dir or "generated/exports",
+            "archive": archive,
+        }
+
+        def _task(context: QueueTaskContext, task_payload: dict[str, Any]) -> dict[str, Any]:
+            context.update_progress(20, "Preparing warehouse export.")
+            context.checkpoint("Shutdown requested before warehouse export started.")
+            result = context.bot.export_data_warehouse(
+                datasets=task_payload.get("datasets"),
+                export_format=str(task_payload.get("export_format") or "json"),
+                output_dir=str(task_payload.get("output_dir") or "generated/exports"),
+                archive=bool(task_payload.get("archive")),
+            )
+            context.update_progress(
+                90,
+                "Warehouse export completed.",
+                callback_payload={"artifact_count": result["count"]},
+            )
+            context.checkpoint("Shutdown requested after warehouse export completed.")
+            return result
+
+        task_run = bot.execute_queue_task(
+            "export_data_warehouse",
+            payload,
+            _task,
+            idempotency_key=idempotency_key,
+            worker_id=_current_worker_hostname(),
+        )
+        return _queue_result_payload(task_run, export_format=export_format, archive=archive)
+
+    return _with_bot(db_path, _run)
+
+
+@celery_app.task(name="funding_bot.enforce_data_retention", queue=load_queue_config().queue_name)
+def enforce_data_retention_task(
+    *,
+    dry_run: bool = False,
+    archive: bool = True,
+    db_path: str | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    def _run(bot: FundingBot) -> dict[str, Any]:
+        payload = {"dry_run": dry_run, "archive": archive}
+
+        def _task(context: QueueTaskContext, task_payload: dict[str, Any]) -> dict[str, Any]:
+            context.update_progress(20, "Preparing retention cleanup.")
+            context.checkpoint("Shutdown requested before retention cleanup started.")
+            result = context.bot.enforce_data_retention(
+                dry_run=bool(task_payload.get("dry_run")),
+                archive=bool(task_payload.get("archive", True)),
+            )
+            context.update_progress(90, "Retention cleanup completed.")
+            context.checkpoint("Shutdown requested after retention cleanup completed.")
+            return result
+
+        task_run = bot.execute_queue_task(
+            "enforce_data_retention",
+            payload,
+            _task,
+            idempotency_key=idempotency_key,
+            worker_id=_current_worker_hostname(),
+        )
+        return _queue_result_payload(task_run, dry_run=dry_run, archive=archive)
+
+    return _with_bot(db_path, _run)
+
+
 TASK_DEFINITIONS = {
     "discover": {
         "task_name": discover_opportunities_task.name,
@@ -476,6 +594,18 @@ TASK_DEFINITIONS = {
         "legacy_command": "python -m funding_bot send-daily-summary",
         "task": send_daily_summary_task,
     },
+    "warehouse-export": {
+        "task_name": export_data_warehouse_task.name,
+        "queue": load_queue_config().queue_name,
+        "legacy_command": "python -m funding_bot export-data-warehouse",
+        "task": export_data_warehouse_task,
+    },
+    "retention-cleanup": {
+        "task_name": enforce_data_retention_task.name,
+        "queue": load_queue_config().queue_name,
+        "legacy_command": "python -m funding_bot enforce-data-retention",
+        "task": enforce_data_retention_task,
+    },
 }
 
 
@@ -486,11 +616,11 @@ def dispatch_discovery(
     db_path: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     config = load_queue_config()
-    payload = {
+    request_payload = {
         "keywords": keywords or [],
         "trusted_sources": trusted_sources or [],
     }
-    idempotency_key = _generate_idempotency_key("discover_opportunities", payload)
+    idempotency_key = _generate_idempotency_key("discover_opportunities", request_payload)
     if config.enable_task_queue:
         result = discover_opportunities_task.delay(
             keywords=keywords,
@@ -530,6 +660,52 @@ def _run_discovery_inline(
         db_path=db_path,
         idempotency_key=idempotency_key,
     )
+
+
+def dispatch_export(
+    *,
+    datasets: list[str] | None = None,
+    export_format: str = "json",
+    output_dir: str | None = None,
+    archive: bool = False,
+    db_path: str | None = None,
+) -> tuple[int, dict[str, Any]]:
+    config = load_queue_config()
+    payload = {
+        "datasets": datasets or ["donors", "tasks", "matches", "results"],
+        "export_format": export_format,
+        "output_dir": output_dir or "generated/exports",
+        "archive": archive,
+    }
+    idempotency_key = _generate_idempotency_key("export_data_warehouse", payload)
+    if config.enable_task_queue:
+        result = export_data_warehouse_task.delay(
+            datasets=datasets,
+            export_format=export_format,
+            output_dir=output_dir,
+            archive=archive,
+            db_path=db_path,
+            idempotency_key=idempotency_key,
+        )
+        return 202, {
+            "mode": config.mode,
+            "task_id": getattr(result, "id", None),
+            "task_name": export_data_warehouse_task.name,
+            "idempotency_key": idempotency_key,
+            "legacy_cron_enabled": config.enable_legacy_cron,
+        }
+
+    export_payload = export_data_warehouse_task(
+        datasets=datasets,
+        export_format=export_format,
+        output_dir=output_dir,
+        archive=archive,
+        db_path=db_path,
+        idempotency_key=idempotency_key,
+    )
+    export_payload["mode"] = config.mode
+    export_payload["legacy_cron_enabled"] = config.enable_legacy_cron
+    return 201, export_payload
 
 
 def _safe_inspect_call(inspector: Any, method_name: str) -> dict[str, Any]:

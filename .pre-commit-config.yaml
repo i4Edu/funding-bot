@@ -1,43 +1,29 @@
 minimum_pre_commit_version: "3.7.0"
 
 repos:
-  - repo: https://github.com/psf/black
-    rev: 24.10.0
-    hooks:
-      - id: black
-        files: ^(celery_app\.py|task_queue\.py|tasks/.*\.py|web/.*\.py)$
-        args: [--line-length=100]
-
-  - repo: https://github.com/pycqa/isort
-    rev: 5.13.2
-    hooks:
-      - id: isort
-        files: ^(celery_app\.py|task_queue\.py|tasks/.*\.py|web/.*\.py)$
-        args: [--profile=black, --line-length=100, --filter-files]
-
-  - repo: https://github.com/pycqa/flake8
-    rev: 7.1.1
-    hooks:
-      - id: flake8
-        files: ^(celery_app\.py|task_queue\.py|tasks/.*\.py|web/.*\.py)$
-        args: [--max-line-length=100, --extend-ignore=E203,W503,E501]
-
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.11.2
-    hooks:
-      - id: mypy
-        files: ^(celery_app\.py|task_queue\.py|tasks/.*\.py|web/.*\.py)$
-        args: [--python-version=3.12, --ignore-missing-imports, --follow-imports=skip]
-
-  - repo: https://github.com/PyCQA/bandit
-    rev: 1.7.9
-    hooks:
-      - id: bandit
-        files: ^(celery_app\.py|task_queue\.py|tasks/.*\.py|web/.*\.py)$
-        args: [-q, -s, B105]
-
   - repo: local
     hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: python -m ruff check --fix
+        language: system
+        files: \.pyi?$
+        types_or: [python, pyi]
+
+      - id: black
+        name: black
+        entry: python -m black
+        language: system
+        files: \.pyi?$
+        types_or: [python, pyi]
+
+      - id: isort
+        name: isort
+        entry: python -m isort
+        language: system
+        files: \.pyi?$
+        types_or: [python, pyi]
+
       - id: safety-root
         name: safety (requirements.txt)
         entry: safety
@@ -73,3 +59,17 @@ repos:
         pass_filenames: false
         files: ^web/requirements\.txt$
         args: [-r, web/requirements.txt]
+
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: v1.11.2
+    hooks:
+      - id: mypy
+        files: ^(celery_app\.py|task_queue\.py|tasks/.*\.py|web/.*\.py)$
+        args: [--python-version=3.12, --ignore-missing-imports, --follow-imports=skip]
+
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.7.9
+    hooks:
+      - id: bandit
+        files: ^(celery_app\.py|task_queue\.py|tasks/.*\.py|web/.*\.py)$
+        args: [-q, -s, B105]

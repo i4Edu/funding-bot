@@ -1,0 +1,40 @@
+[tool.black]
+line-length = 100
+target-version = ["py311", "py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip_gitignore = true
+src_paths = ["."]
+known_first_party = ["scripts", "tasks", "tests", "web"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["."]
+extend-exclude = ["node_modules"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "DJ"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["DJ008"]
+
+[tool.mutmut]
+source_paths = ["web/app.py", "task_queue.py"]
+also_copy = ["web/templates/", "web/static/", "i18n/", "migrations/"]
+only_mutate = ["web/app.py", "task_queue.py"]
+do_not_mutate = ["tests/*.py", "tests/**/*.py"]
+pytest_add_cli_args_test_selection = [
+  "tests/test_web_app.py",
+  "tests/test_celery_tasks.py",
+  "tests/test_collaboration.py",
+]
+pytest_add_cli_args = ["-q"]
+mutate_only_covered_lines = true
+max_stack_depth = 8
+timeout_multiplier = 2.0
+timeout_constant = 5.0
+use_setproctitle = false

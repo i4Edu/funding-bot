@@ -1,6 +1,8 @@
 -r web/requirements.txt
+coverage>=7.6.0,<8
 hypothesis>=6.129.0,<7
 locust>=2.31.8,<3
+mutmut==3.3.1
 pytest>=8.4.2,<9
 pytest-rerunfailures>=15.1,<16
 zope.event>=5.0,<7

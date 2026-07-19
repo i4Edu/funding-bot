@@ -1,6 +1,7 @@
 import base64
 import itertools
 import os
+import sqlite3
 import sys
 import unittest
 from pathlib import Path
@@ -42,6 +43,7 @@ class SettingsPanelTests(unittest.TestCase):
         os.environ["DATA_RESIDENCY"] = "EU"
         os.environ["DATA_STORAGE_REGION"] = "EU"
         FundingBot.reset_connector_metrics()
+        web_app_module.reset_health_check_metrics()
         app.config["TESTING"] = True
         self.client = app.test_client()
         self.admin_headers = _auth_header("admin", "admin-secret")
@@ -68,6 +70,7 @@ class SettingsPanelTests(unittest.TestCase):
         os.environ.pop("CELERY_QUEUE_NAME", None)
         os.environ.pop("CELERY_HEALTH_TIMEOUT_SECONDS", None)
         FundingBot.reset_connector_metrics()
+        web_app_module.reset_health_check_metrics()
 
     def test_settings_page_requires_authentication(self):
         response = self.client.get("/settings")
@@ -102,6 +105,9 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn('id="task-board-region"', html)
         self.assertIn('Alt</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> — Focus the task board', html)
         self.assertIn('aria-keyshortcuts="Enter Space ArrowLeft ArrowRight"', html)
+        self.assertIn('id="task-export-link"', html)
+        self.assertIn('id="task-create-form"', html)
+        self.assertIn('id="task-edit-form"', html)
 
     def test_settings_page_binds_keyboard_activation_for_action_buttons(self):
         html = (PROJECT_ROOT / "web" / "templates" / "settings.html").read_text(encoding="utf-8")
@@ -274,8 +280,58 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         payload = response.get_json()
         self.assertEqual("ok", payload["status"])
+        self.assertTrue(payload["healthy"])
         self.assertEqual("cron", payload["queue"]["mode"])
-        self.assertFalse(payload["queue"]["queue_enabled"])
+        self.assertEqual("ok", payload["checks"]["application"]["status"])
+        self.assertEqual("ok", payload["checks"]["database"]["status"])
+
+    def test_ready_endpoint_reports_dependency_checks(self):
+        with (
+            mock.patch.object(web_app_module, "_check_database_health", return_value={"status": "ok", "checked": True}),
+            mock.patch.object(web_app_module, "_check_redis_health", return_value={"status": "disabled", "checked": False}),
+            mock.patch.object(
+                web_app_module,
+                "_check_celery_health",
+                return_value={"status": "disabled", "checked": False, "queue_enabled": False},
+            ),
+            mock.patch.object(
+                web_app_module,
+                "_check_connector_health",
+                return_value={"status": "ok", "checked": True, "count": 2, "healthy_count": 2, "connectors": []},
+            ),
+        ):
+            response = self.client.get("/ready")
+
+        self.assertEqual(200, response.status_code)
+        payload = response.get_json()
+        self.assertTrue(payload["ready"])
+        self.assertEqual([], payload["failing_checks"])
+        self.assertEqual("ok", payload["checks"]["database"]["status"])
+        self.assertEqual("disabled", payload["checks"]["redis"]["status"])
+        self.assertEqual("disabled", payload["checks"]["celery"]["status"])
+        self.assertEqual("ok", payload["checks"]["connectors"]["status"])
+
+    def test_ready_endpoint_returns_503_when_dependency_fails(self):
+        with (
+            mock.patch.object(web_app_module, "_check_database_health", return_value={"status": "error", "checked": True}),
+            mock.patch.object(web_app_module, "_check_redis_health", return_value={"status": "ok", "checked": True}),
+            mock.patch.object(
+                web_app_module,
+                "_check_celery_health",
+                return_value={"status": "disabled", "checked": False, "queue_enabled": False},
+            ),
+            mock.patch.object(
+                web_app_module,
+                "_check_connector_health",
+                return_value={"status": "ok", "checked": True, "count": 1, "healthy_count": 1, "connectors": []},
+            ),
+        ):
+            response = self.client.get("/ready")
+
+        self.assertEqual(503, response.status_code)
+        payload = response.get_json()
+        self.assertFalse(payload["ready"])
+        self.assertEqual(["database"], payload["failing_checks"])
         self.assertIn("database", payload)
         self.assertIn("cache", payload)
         self.assertIn("backend", payload["database"])
@@ -315,34 +371,84 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn("outreach_sent", actions)
 
     def test_metrics_include_queue_retry_and_dead_letter_counts(self):
-        bot = FundingBot(db_path=self.db_path)
+        self.client.get("/settings", headers=self.admin_headers)
+        conn = sqlite3.connect(self.db_path)
         try:
-            bot.record_task_run(
-                "completed-task",
-                "discover_opportunities",
-                status="completed",
-                progress=100,
-                payload={"keywords": ["education"]},
-                result={"count": 1},
-                retry_limit=2,
-                attempts=2,
-                backoff_seconds=1,
-                backoff_max_seconds=2,
+            conn.execute(
+                """
+                INSERT INTO task_runs (
+                    task_id, idempotency_key, task_name, status, progress, message, payload_json,
+                    result_json, error_message, worker_id, duplicate_requests, shutdown_requested,
+                    callback_name, callback_payload_json, created_at, updated_at, completed_at,
+                    retry_limit, attempts, backoff_seconds, backoff_max_seconds, dead_lettered,
+                    last_attempt_at, next_retry_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "completed-task",
+                    "completed-task",
+                    "discover_opportunities",
+                    "completed",
+                    100,
+                    "Task completed.",
+                    '{"keywords":["education"]}',
+                    '{"count":1}',
+                    None,
+                    None,
+                    0,
+                    0,
+                    "on_success",
+                    '{"attempt_number":2,"state":"completed"}',
+                    "2026-07-19T00:00:00+00:00",
+                    "2026-07-19T00:00:02+00:00",
+                    "2026-07-19T00:00:02+00:00",
+                    2,
+                    2,
+                    1.0,
+                    2.0,
+                    0,
+                    "2026-07-19T00:00:02+00:00",
+                    None,
+                ),
             )
-            bot.record_task_run(
-                "failed-task",
-                "send_outreach",
-                status="failed",
-                progress=0,
-                payload={"email": "donor@example.org"},
-                error_message="permanent queue error",
-                retry_limit=2,
-                attempts=3,
-                backoff_seconds=1,
-                backoff_max_seconds=2,
-                dead_lettered=True,
+            conn.execute(
+                """
+                INSERT INTO task_runs (
+                    task_id, idempotency_key, task_name, status, progress, message, payload_json,
+                    result_json, error_message, worker_id, duplicate_requests, shutdown_requested,
+                    callback_name, callback_payload_json, created_at, updated_at, completed_at,
+                    retry_limit, attempts, backoff_seconds, backoff_max_seconds, dead_lettered,
+                    last_attempt_at, next_retry_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "failed-task",
+                    "failed-task",
+                    "send_outreach",
+                    "failed",
+                    0,
+                    "Task failed.",
+                    '{"email":"donor@example.org"}',
+                    None,
+                    "permanent queue error",
+                    None,
+                    0,
+                    0,
+                    "on_failure",
+                    '{"attempt_number":3,"state":"failed"}',
+                    "2026-07-19T00:00:00+00:00",
+                    "2026-07-19T00:00:03+00:00",
+                    "2026-07-19T00:00:03+00:00",
+                    2,
+                    3,
+                    1.0,
+                    2.0,
+                    1,
+                    "2026-07-19T00:00:03+00:00",
+                    None,
+                ),
             )
-            bot.connection.execute(
+            conn.execute(
                 """
                 INSERT INTO task_history (
                     task_id, task_name, attempt_number, status, happened_at, backoff_seconds,
@@ -362,7 +468,7 @@ class SettingsPanelTests(unittest.TestCase):
                     "{}",
                 ),
             )
-            bot.connection.execute(
+            conn.execute(
                 """
                 INSERT INTO dead_letter_queue (
                     task_id, task_name, payload_json, error_message, attempts, failed_at
@@ -371,15 +477,15 @@ class SettingsPanelTests(unittest.TestCase):
                 (
                     "failed-task",
                     "send_outreach",
-                    '{"email": "donor@example.org"}',
+                    '{"email":"donor@example.org"}',
                     "permanent queue error",
                     3,
                     "2026-07-19T00:00:03+00:00",
                 ),
             )
-            bot.connection.commit()
+            conn.commit()
         finally:
-            bot.close()
+            conn.close()
 
         response = self.client.get("/metrics", headers=self.admin_headers)
         self.assertEqual(200, response.status_code)
@@ -436,6 +542,19 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn(b"Todo", response.data)
         self.assertIn(b"In Progress", response.data)
         self.assertIn(b"Overdue", response.data)
+
+    def test_dashboard_tasks_renders_admin_task_management_controls(self):
+        bot = FundingBot(db_path=str(self.db_path))
+        bot.create_task(title="Prepare proposal", assigned_to="admin", due_date="2026-07-21")
+        bot.close()
+
+        response = self.client.get("/dashboard/tasks", headers=self.admin_headers)
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn(b"Task management", response.data)
+        self.assertIn(b"Create task", response.data)
+        self.assertIn(b"Edit selected task", response.data)
+        self.assertIn(b"Export JSON", response.data)
 
     def _seed_task_filter_data(self):
         payloads = [
@@ -850,6 +969,35 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn("funding_bot_queue_pending_tasks 5", body)
         self.assertIn("funding_bot_queue_depth 5", body)
         self.assertIn("funding_bot_queue_workers 2", body)
+
+    def test_metrics_include_health_check_counters(self):
+        with (
+            mock.patch.object(web_app_module, "_check_database_health", return_value={"status": "ok", "checked": True}),
+            mock.patch.object(web_app_module, "_check_redis_health", return_value={"status": "error", "checked": True}),
+            mock.patch.object(
+                web_app_module,
+                "_check_celery_health",
+                return_value={"status": "disabled", "checked": False, "queue_enabled": False},
+            ),
+            mock.patch.object(
+                web_app_module,
+                "_check_connector_health",
+                return_value={"status": "ok", "checked": True, "count": 1, "healthy_count": 1, "connectors": []},
+            ),
+        ):
+            self.client.get("/health")
+            self.client.get("/ready")
+
+        response = self.client.get("/metrics", headers=self.admin_headers)
+
+        self.assertEqual(200, response.status_code)
+        body = response.data.decode("utf-8")
+        self.assertIn('funding_bot_health_checks_total{endpoint="health"} 1', body)
+        self.assertIn('funding_bot_health_checks_total{endpoint="ready"} 1', body)
+        self.assertIn('funding_bot_health_failures_total{endpoint="health"} 0', body)
+        self.assertIn('funding_bot_health_failures_total{endpoint="ready"} 1', body)
+        self.assertIn('funding_bot_health_component_checks_total{component="database"} 2', body)
+        self.assertIn('funding_bot_health_component_failures_total{component="redis"} 1', body)
 
     def test_create_translation_review_defaults_to_pending_status(self):
         response = self.client.post(

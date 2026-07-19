@@ -44,11 +44,12 @@ class DeduplicationMethodTests(unittest.TestCase):
                 ],
                 keywords=["literacy"],
             )
+            stored = bot.list_opportunities()
         finally:
             bot.close()
 
         self.assertEqual(1, len(found))
-        self.assertEqual(1, len(bot.list_opportunities()))
+        self.assertEqual(1, len(stored))
         self.assertEqual("Literacy Grant", found[0]["title"])
 
 

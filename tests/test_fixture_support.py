@@ -21,6 +21,8 @@ def test_seeded_database_populates_expected_records(bot_factory, seeded_database
     assert len(tasks) == seeded_database["counts"]["tasks"]
     assert len(donors) == seeded_database["counts"]["donors"]
     assert len(reviews) == seeded_database["counts"]["translation_reviews"]
+
+
 def test_seeded_app_client_reads_seed_data(seeded_app_client: dict[str, object]) -> None:
     client = seeded_app_client["client"]
     admin_headers = seeded_app_client["admin_headers"]
