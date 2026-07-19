@@ -167,8 +167,12 @@ class ConnectorRegistryIntegrationTests(unittest.TestCase):
                     ]
                 },
             )
+            connectors = bot.connector_registry.build_connectors(
+                bot.connector_configs,
+                credential_resolver=bot.resolve_credential,
+            )
         try:
-            found = bot.run_discovery(keywords=["education"])
+            found = bot.run_discovery(connectors=connectors, keywords=["education"])
         finally:
             bot.close()
 

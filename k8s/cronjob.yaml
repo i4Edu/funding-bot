@@ -158,3 +158,55 @@ spec:
             - name: bot-data
               persistentVolumeClaim:
                 claimName: funding-bot-data
+
+---
+# Daily cleanup job that enforces the configured data retention policy.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: funding-bot-retention-cleanup
+  namespace: funding-bot
+  labels:
+    app: funding-bot
+spec:
+  schedule: "30 1 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: funding-bot
+            component: retention
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: funding-bot-retention
+              image: funding-bot:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - python
+                - -m
+                - funding_bot
+                - enforce-data-retention
+              envFrom:
+                - configMapRef:
+                    name: funding-bot-config
+                - secretRef:
+                    name: funding-bot-secrets
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+              volumeMounts:
+                - name: bot-data
+                  mountPath: /app/data
+          volumes:
+            - name: bot-data
+              persistentVolumeClaim:
+                claimName: funding-bot-data

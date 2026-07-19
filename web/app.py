@@ -1163,13 +1163,23 @@ def send_test_outreach() -> Response:
     return jsonify(result), 201
 
 
+@app.get("/tasks")
 @app.get("/task-directory")
 @require_role("staff", "admin", "auditor")
 def list_tasks_directory_route() -> Response:
+    current_role = getattr(g, "current_role", None)
+    assigned_to = request.args.get("assigned_to") or request.args.get("assignee")
+    if current_role not in {"admin", "auditor"}:
+        normalized_assignee = str(assigned_to or "").strip().lower()
+        if normalized_assignee and normalized_assignee != current_role:
+            return _json_error("Forbidden", 403)
+        assigned_to = current_role
     tasks = _bot().list_tasks(
-        assigned_to=request.args.get("assigned_to"),
+        assigned_to=assigned_to,
         assignee_email=request.args.get("assignee_email"),
         status=request.args.get("status"),
+        due_date_before=request.args.get("due_date_before"),
+        due_date_after=request.args.get("due_date_after"),
         source=request.args.get("source"),
         sort=request.args.get("sort"),
         viewer_email=request.args.get("viewer_email"),
@@ -1177,8 +1187,9 @@ def list_tasks_directory_route() -> Response:
     return jsonify(tasks)
 
 
+@app.post("/tasks")
 @app.post("/task-directory")
-@require_role("staff", "admin")
+@require_role("admin")
 def create_task_directory_route() -> Response:
     payload = _get_request_json()
     title = str(payload.get("title", "")).strip()
@@ -1203,15 +1214,21 @@ def create_task_directory_route() -> Response:
     return jsonify({"task": task, "notification": task.get("assignment_notification")}), 201
 
 
+@app.get("/tasks/<int:task_id>")
 @app.get("/task-directory/<int:task_id>")
 @require_role("staff", "admin", "auditor")
 def get_task_directory_route(task_id: int) -> Response:
     task = _bot().get_task(task_id, viewer_email=request.args.get("viewer_email"))
-    return jsonify(task)
+    current_role = getattr(g, "current_role", None)
+    if current_role not in {"admin", "auditor"} and task["assigned_to"] != current_role:
+        return _json_error("Forbidden", 403)
+    return jsonify({"task": task})
 
 
+@app.post("/tasks/<int:task_id>/assign")
+@app.post("/tasks/<int:task_id>/assignment")
 @app.post("/task-directory/<int:task_id>/assignment")
-@require_role("staff", "admin")
+@require_role("admin")
 def assign_task_directory_route(task_id: int) -> Response:
     payload = _get_request_json()
     assigned_to = str(payload.get("assigned_to", "")).strip()
@@ -1362,6 +1379,7 @@ def metrics() -> Response:
         "# HELP funding_bot_communications_total Total outreach emails logged",
         "# TYPE funding_bot_communications_total counter",
         f"funding_bot_communications_total {communications_total}",
+        *FundingBot.render_connector_metrics_prometheus(),
         "# HELP funding_bot_tasks_total Total collaboration tasks",
         "# TYPE funding_bot_tasks_total gauge",
         f"funding_bot_tasks_total {tasks_total}",
@@ -1392,9 +1410,18 @@ def metrics() -> Response:
         "# HELP funding_bot_queue_task_runs_completed Queue task runs completed successfully in SQLite",
         "# TYPE funding_bot_queue_task_runs_completed counter",
         f"funding_bot_queue_task_runs_completed {queue_metrics['completed']}",
+        "# HELP funding_bot_queue_task_runs_failed Queue task runs that exhausted retries and failed",
+        "# TYPE funding_bot_queue_task_runs_failed counter",
+        f"funding_bot_queue_task_runs_failed {queue_metrics['failed']}",
         "# HELP funding_bot_queue_task_runs_cancelled Queue task runs cancelled during graceful shutdown",
         "# TYPE funding_bot_queue_task_runs_cancelled counter",
         f"funding_bot_queue_task_runs_cancelled {queue_metrics['cancelled']}",
+        "# HELP funding_bot_queue_task_retries_total Retry attempts scheduled with exponential backoff",
+        "# TYPE funding_bot_queue_task_retries_total counter",
+        f"funding_bot_queue_task_retries_total {queue_metrics['retries_scheduled']}",
+        "# HELP funding_bot_dead_letter_queue_total Queue task runs stored in the dead-letter queue",
+        "# TYPE funding_bot_dead_letter_queue_total gauge",
+        f"funding_bot_dead_letter_queue_total {queue_metrics['dead_lettered']}",
         "# HELP funding_bot_queue_duplicate_preventions_total Duplicate queue executions prevented by idempotency keys",
         "# TYPE funding_bot_queue_duplicate_preventions_total counter",
         f"funding_bot_queue_duplicate_preventions_total {queue_metrics['duplicate_preventions']}",

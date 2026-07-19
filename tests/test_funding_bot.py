@@ -1,6 +1,7 @@
 import io
 import itertools
 import json
+import logging
 import os
 import signal
 import tempfile
@@ -296,6 +297,37 @@ class FundingBotTests(unittest.TestCase):
         self.assertEqual(1, len(staff_tasks))
         self.assertEqual("Prepare budget", staff_tasks[0]["title"])
         self.assertEqual("staff", staff_tasks[0]["assigned_to"])
+
+    def test_create_task_tracks_due_dates_and_overdue_flags(self):
+        self.bot.create_task(
+            title="File grant packet",
+            assigned_to="staff",
+            due_date="2026-06-20",
+            status="todo",
+        )
+        self.bot.create_task(
+            title="Archive approval",
+            assigned_to="staff",
+            due_date="2026-06-19",
+            status="done",
+        )
+
+        overdue = self.bot.list_tasks(
+            assigned_to="staff",
+            due_date_before="2026-06-20",
+            sort="due_date",
+        )
+
+        self.assertEqual("2026-06-20", overdue[0]["due_date"])
+        self.assertTrue(overdue[0]["is_overdue"])
+        self.assertFalse(overdue[1]["is_overdue"])
+
+    def test_reassign_task_updates_assignee(self):
+        task = self.bot.create_task(title="Coordinate reviewers", assigned_to="staff")
+
+        updated = self.bot.reassign_task(task["id"], assigned_to="admin", changed_by="admin")
+
+        self.assertEqual("admin", updated["assigned_to"])
 
     def test_task_status_transitions_follow_state_machine(self):
         task = self.bot.create_task(title="Prepare proposal draft", assigned_to="staff")
@@ -612,6 +644,75 @@ class FundingBotTests(unittest.TestCase):
         self.assertIn("07/19/2026 09:30", document_xml)
 
 
+class DataResidencyAndPrivacyPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.output_dir = Path(".test_privacy_policies")
+        if self.output_dir.exists():
+            rmtree(self.output_dir)
+
+    def tearDown(self):
+        if self.output_dir.exists():
+            rmtree(self.output_dir)
+
+    def test_data_residency_validation_rejects_mismatched_storage_region(self):
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"DATA_RESIDENCY": "EU", "DATA_STORAGE_REGION": "US"},
+            clear=False,
+        ):
+            with self.assertRaises(FundingBotError):
+                FundingBot(db_path=":memory:")
+
+    def test_generate_privacy_policies_creates_html_and_pdf_with_versions(self):
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"DATA_RESIDENCY": "EU", "DATA_STORAGE_REGION": "EU"},
+            clear=False,
+        ):
+            bot = FundingBot(db_path=":memory:")
+        try:
+            bot.store_organization_profile(
+                {
+                    "name": "i4Edu",
+                    "mission": "expanding access to equitable education",
+                    "registration_number": "NP-42",
+                    "website": "https://i4edu.example.org",
+                    "contact_email": "hello@i4edu.example.org",
+                    "privacy_email": "privacy@i4edu.example.org",
+                    "address": "Dhaka, Bangladesh",
+                    "privacy_jurisdictions": ["EU", "US"],
+                }
+            )
+
+            generated = bot.generate_privacy_policies(
+                output_dir=self.output_dir,
+                jurisdictions=["EU", "US"],
+                effective_date="2026-07-19",
+            )
+
+            self.assertEqual(2, len(generated))
+            eu_policy = next(item for item in generated if item["jurisdiction"] == "EU")
+            us_policy = next(item for item in generated if item["jurisdiction"] == "US")
+            self.assertEqual("eu-v1", eu_policy["version"])
+            self.assertEqual("us-v1", us_policy["version"])
+            self.assertTrue(Path(eu_policy["html_path"]).exists())
+            self.assertTrue(Path(eu_policy["pdf_path"]).exists())
+            html_body = Path(eu_policy["html_path"]).read_text(encoding="utf-8")
+            self.assertIn("i4Edu Privacy Policy", html_body)
+            self.assertIn("Configured data residency:</strong> EU", html_body)
+
+            generated_again = bot.generate_privacy_policies(
+                output_dir=self.output_dir,
+                jurisdictions=["EU"],
+                formats=["html"],
+            )
+            self.assertEqual("eu-v2", generated_again[0]["version"])
+            versions = bot.list_privacy_policy_versions(limit=10)
+            self.assertEqual(3, len(versions))
+        finally:
+            bot.close()
+
+
 class SMTPEmailSenderTests(unittest.TestCase):
     def test_from_env_reads_environment_variables(self):
         env = {
@@ -788,6 +889,7 @@ from funding_bot import (
     KickstarterForGoodConnector,
     NGODirectoryConnector,
     TokenBucketRateLimiter,
+    _resolve_cli_log_level,
     create_connector,
     main,
 )
@@ -1084,7 +1186,7 @@ class PortalConnectorTests(unittest.TestCase):
                         {
                             "title": f"Campaign {len(calls)}",
                             "projectLink": f"https://example.org/{len(calls)}",
-                            "summary": "Crowdfunding summary",
+                            "summary": "Crowdfunding equity summary",
                             "themeName": "Education",
                             "organization": {"name": "Community Fund"},
                         }

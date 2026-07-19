@@ -7,6 +7,7 @@ from flask import Flask, jsonify, render_template, request
 app = Flask(
     __name__,
     template_folder=str(Path(__file__).resolve().parents[2] / "web" / "templates"),
+    static_folder=str(Path(__file__).resolve().parents[2] / "web" / "static"),
 )
 
 
@@ -21,6 +22,15 @@ def dashboard_page() -> str:
         donor_communications_count=5,
         my_tasks_count=6,
         my_open_tasks_count=2,
+        overdue_tasks_count=1,
+        overdue_tasks=[
+            {
+                "title": "Submit impact budget",
+                "assigned_to": "admin",
+                "description": "Finalize the overdue budget appendix.",
+                "due_date": "2026-07-15",
+            }
+        ],
         recent_opportunities=[
             {
                 "title": "Education Innovation Grant",
@@ -61,6 +71,24 @@ def tasks_page() -> str:
             ("updated_at_desc", "Recently updated"),
             ("due_date_asc", "Due date"),
         ],
+        task_columns={
+            "todo": [],
+            "in-progress": [
+                {
+                    "id": "task-1",
+                    "title": "Review grant checklist",
+                    "description": "Validate the next submission batch.",
+                    "assigned_to": "admin",
+                    "status": "in-progress",
+                    "due_date": "2026-07-20",
+                    "updated_at": "2026-07-18T11:00:00Z",
+                    "is_overdue": False,
+                    "can_move": True,
+                }
+            ],
+            "done": [],
+            "blocked": [],
+        },
         tasks=[
             {
                 "title": "Review grant checklist",
@@ -81,6 +109,18 @@ def settings_page() -> str:
         current_role="admin",
         ui_locale={"code": "en", "direction": "ltr", "is_rtl": False},
         organization_profile={"name": "i4Edu", "mission": "Expand access"},
+        residency_status={
+            "data_residency": "EU",
+            "cross_border_transfers": ["none"],
+            "retention_days": 365,
+        },
+        privacy_policy_versions=[
+            {
+                "version": "2026.07",
+                "effective_at": "2026-07-01",
+                "locale": "en",
+            }
+        ],
         search_settings={"keywords": ["education", "csr"], "trusted_sources": ["fund.example"]},
         credentials=[{"alias": "smtp", "env_var_name": "SMTP_PASSWORD"}],
         smtp_configured=False,

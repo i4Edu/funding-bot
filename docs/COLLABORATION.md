@@ -1,6 +1,6 @@
 # Collaboration Workflow
 
-The Funding Bot collaboration workflow lets teams assign work, track status, and review progress without leaving the dashboard or API.
+The Funding Bot collaboration workflow lets teams assign work, track status, and review progress without leaving the dashboard or API. For pull request expectations, code review standards, and contributor setup steps, see [../CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## Team setup
 

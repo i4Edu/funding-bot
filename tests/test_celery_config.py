@@ -7,7 +7,6 @@ from celery_app import (
     DEFAULT_CELERY_BROKER_URL,
     DEFAULT_CELERY_RESULT_BACKEND,
     DEFAULT_RABBITMQ_BROKER_URL,
-    celery_app,
     get_celery_config,
 )
 from funding_bot import FundingBot

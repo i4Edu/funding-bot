@@ -1,6 +1,6 @@
 # Deployment and Scaling Guide
 
-This document covers production deployment for the funding bot web app, legacy cron jobs, and the new Celery worker fleet used during the cron-to-queue migration.
+This document covers production deployment for the funding bot web app, legacy cron jobs, and the new Celery worker fleet used during the cron-to-queue migration. Contributor setup and PR expectations for deployment-related changes live in [../CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## Deployment modes
 

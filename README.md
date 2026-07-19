@@ -9,6 +9,8 @@ The Nonprofit Funding Bot helps staff discover funding opportunities, prevent du
 For planned milestones and release scope, see [roadmap.md](roadmap.md).
 For connector implementation and keyword-mapping guidance, see [docs/CONNECTORS.md](docs/CONNECTORS.md).
 For collaboration workflow, permissions, and task API examples, see [docs/COLLABORATION.md](docs/COLLABORATION.md).
+For deployment and scaling guidance, see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+For contributor setup, pull request expectations, and code review standards, see [CONTRIBUTING.md](CONTRIBUTING.md).
 For vulnerability reporting, disclosure timelines, incident response, and the penetration-testing checklist, see [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Overview
@@ -28,13 +30,79 @@ The project is designed for nonprofit operations teams that need a lightweight w
 
 ## Architecture
 
+### System diagram
+
+```text
+                                    External systems
++--------------------+   +---------------------+   +----------------------+
+| Grants.gov / grant |   | CSR APIs / partner  |   | NGO directories /    |
+| portals            |   | funding networks    |   | crowdfunding feeds   |
++----------+---------+   +----------+----------+   +-----------+----------+
+           |                        |                          |
+           +------------------------+--------------------------+
+                                    |
+                                    v
+                         +-------------------------+
+                         | Connector layer         |
+                         | funding_bot.py          |
+                         | - discovery connectors  |
+                         | - dedupe + normalization|
+                         | - outreach/doc helpers  |
+                         +-----------+-------------+
+                                     |
+                    sync CLI/admin   | enqueue async discovery,
+                    actions          | outreach, reports
+                                     v
+                         +-------------------------+
+                         | Task queue              |
+                         | Celery + Redis/RabbitMQ |
+                         +-----------+-------------+
+                                     |
+                                     v
+                         +-------------------------+
+                         | Worker processes        |
+                         | celery_tasks.py         |
+                         +-----------+-------------+
+                                     |
+          +--------------------------+---------------------------+
+          |                          |                           |
+          v                          v                           v
++------------------+       +----------------------+   +----------------------+
+| Web dashboard    |<----->| SQLite database      |<->| SMTP / email provider|
+| Flask + JSON API |       | opportunities, tasks,|   | donor outreach +     |
+| /dashboard,      |       | donors, audit logs,  |   | daily summaries      |
+| /settings, /tasks|       | docs, queue metadata |   +----------------------+
++---------+--------+       +----------+-----------+
+          |                           ^
+          | staff/admin/auditor UI    |
+          +---------------------------+
+```
+
+### Component responsibilities
+
 | Component | Purpose |
 | --- | --- |
 | `funding_bot.py` | Core service and CLI entry point. Manages discovery, donor records, audit logs, document generation, outreach, status polling, and daily summaries. |
+| Connector layer | Pulls and normalizes opportunity data from Grants.gov-style portals, CSR APIs, NGO directories, and crowdfunding sources before deduplication/storage. |
+| `task_queue.py`, `celery_app.py`, `celery_tasks.py` | Dispatch, broker configuration, retries, and background execution for discovery, outreach, and report generation. |
 | `web/app.py` | Flask dashboard and JSON API for staff, admins, and auditors. Uses Basic Auth backed by role-specific environment variables. |
-| SQLite database | Default operational store for opportunities, applications, donors, communications, documents, and audit logs. |
-| `Dockerfile` / `docker-compose.yml` | Container packaging for the CLI and web dashboard, suitable for local and small-team deployments. |
-| `k8s/` (roadmap target) | Planned Kubernetes manifests for horizontal scaling, CronJobs, secrets, and production orchestration in v0.5.0+. |
+| SQLite database | Default operational store for opportunities, applications, donors, communications, documents, collaboration tasks, and audit logs. |
+| `Dockerfile` / `docker-compose.yml` | Container packaging for the CLI, web dashboard, broker, worker, and optional Flower monitor in local/shared deployments. |
+| `k8s/` manifests | Kubernetes deployment option for the web pod, worker pods, services, secrets/config, persistent storage, and scheduled jobs. |
+
+### Data flow
+
+1. Connectors query external grant and partner systems, then normalize results into shared opportunity records.
+2. The CLI or web dashboard either executes work inline or enqueues background jobs onto Celery for slower discovery/reporting flows.
+3. Workers persist results to SQLite so the dashboard, CLI, and audit/reporting paths all read the same operational state.
+4. Outreach and summary jobs call SMTP/email providers after checking consent, throttling, and audit requirements.
+5. Staff use the dashboard and task API to review queue state, assign work, and inspect audit history generated by both synchronous and async paths.
+
+### Deployment topology
+
+- **Docker / Docker Compose**: run `web`, `bot`, `worker`, broker (`redis` by default, optional `rabbitmq`), and optional `flower` with a shared volume for SQLite data.
+- **Kubernetes**: deploy the Flask dashboard as a `Deployment` + `Service`, run Celery workers as a separate `Deployment`, keep scheduled summaries/discovery in a `CronJob` where needed, and mount persistent storage for the SQLite data path.
+- **Migration mode**: support legacy cron, hybrid queue mode, or queue-first mode by toggling `ENABLE_TASK_QUEUE` and `ENABLE_LEGACY_CRON`. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for rollout details.
 
 ## Features by version
 
@@ -221,6 +289,23 @@ command (or before calling `SMTPEmailSender.from_env()` programmatically):
 | `SMTP_USE_TLS`  | `1`           | Set to `0` to disable STARTTLS             |
 | `SMTP_FROM`     | username      | Envelope `From` address                    |
 
+## Queue task retry and audit configuration
+
+Queue task runs now persist into SQLite for auditability. Each run stores its
+final result in `task_runs`, every retry attempt in `task_history`, and terminal
+failures in `dead_letter_queue`.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `FUNDING_BOT_TASK_RETRY_LIMIT` | `3` | Maximum retry attempts after the initial queue-task failure. |
+| `FUNDING_BOT_TASK_RETRY_BACKOFF_SECONDS` | `5` | Base retry delay in seconds before exponential backoff is applied. |
+| `FUNDING_BOT_TASK_RETRY_BACKOFF_MAX_SECONDS` | `300` | Maximum retry delay cap in seconds. |
+
+Queue-facing helpers (`run_discovery_task`, `send_outreach_task`, and
+`send_daily_summary_task`) use exponential backoff, emit audit-log events such
+as `queue_task_retry_scheduled` / `queue_task_completed` / `queue_task_failed`,
+and move exhausted runs into the dead-letter queue for later review.
+
 ## Connector pagination and caching
 
 Portal connectors now fetch remote results page-by-page and cache successful
@@ -284,6 +369,12 @@ When a connector exceeds its quota, discovery degrades gracefully for that
 connector: it returns no rows for that request and exposes `retry_after_seconds`
 metadata instead of raising an exception.
 
+## Connector TLS requirements
+
+Outbound connector requests are HTTPS-only. The bot rejects insecure `http://`
+connector URLs before making a request, uses a `requests` session with a minimum
+TLS version of 1.2, and leaves certificate verification enabled.
+
 ## Web Dashboard
 
 The dashboard is intended for v0.4.0+ operations and is already scaffolded in `web/app.py`.
@@ -330,7 +421,12 @@ with AA-compliant colors, and the same audit command runs in GitHub Actions CI.
 
 ### Role-based authentication
 
-The dashboard uses HTTP Basic Auth. Use one of these usernames as the role name:
+The dashboard uses HTTP Basic Auth to establish a signed Flask session. Session
+cookies are issued with `Secure` and `HttpOnly` enabled, and idle sessions
+expire after `DASHBOARD_SESSION_TIMEOUT_MINUTES` (default: `30`). Set
+`FLASK_SECRET_KEY` in deployed environments before serving the dashboard.
+
+Use one of these usernames as the role name:
 
 | Username | Environment variable | Access |
 | --- | --- | --- |
@@ -540,6 +636,7 @@ Both actions are logged to the audit trail (`audit-log` / `/audit-log`) for
 compliance review.
 
 For contributor guidance on English/Bengali outreach copy and locale conventions, see [docs/TRANSLATIONS.md](docs/TRANSLATIONS.md).
+For pull request workflow, review standards, setup steps, and contributor etiquette, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Docker Deployment
 
@@ -579,7 +676,13 @@ Recommended secret/config inputs:
 - dashboard auth: `ADMIN_PASSWORD`, `STAFF_PASSWORD`, `AUDITOR_PASSWORD`
 - persistence/runtime: `BOT_DB_PATH`, `ENABLE_TASK_QUEUE`, `ENABLE_LEGACY_CRON`, `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND`
 
-Use a `CronJob` for scheduled summary delivery and a `Deployment`/`Service` pair for the dashboard. If the `k8s/` manifests are not yet present in your branch, treat this as the target structure for the scaling release.
+Use a `CronJob` for scheduled summary delivery, a second `CronJob` for retention cleanup (`python -m funding_bot enforce-data-retention`), and a `Deployment`/`Service` pair for the dashboard. If the `k8s/` manifests are not yet present in your branch, treat this as the target structure for the scaling release.
+
+## Compliance Documentation
+
+- [Accessibility conformance status](docs/ACCESSIBILITY.md)
+- [Compliance procedures and checklists](docs/COMPLIANCE.md)
+- [Translation contributor guidance](docs/TRANSLATIONS.md)
 
 ## GDPR / Compliance
 

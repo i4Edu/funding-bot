@@ -4,7 +4,6 @@ import base64
 import csv
 import hashlib
 import io
-import inspect
 import json
 import logging
 import os
@@ -29,6 +28,12 @@ from xml.sax.saxutils import escape
 
 import requests
 from jsonschema import ValidationError, validate
+try:
+    import requests
+    from requests import exceptions as requests_exceptions
+except ImportError:  # pragma: no cover - live connectors are optional in some envs
+    requests = None
+    requests_exceptions = None
 from requests.adapters import HTTPAdapter
 
 try:
@@ -47,6 +52,11 @@ except ImportError:  # pragma: no cover - exercised in environments without Babe
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 _UNSET = object()
 _TRANSIENT_CONNECTOR_ERRORS = (TimeoutError, ConnectionError, OSError)
+if requests_exceptions is not None:  # pragma: no branch - import-time constant setup
+    _TRANSIENT_CONNECTOR_ERRORS = _TRANSIENT_CONNECTOR_ERRORS + (
+        requests_exceptions.ConnectionError,
+        requests_exceptions.Timeout,
+    )
 _DOCUMENT_LOCALE_CONFIG = {
     "en": {
         "babel_locale": "en_US",
@@ -560,10 +570,6 @@ class TaskTransitionError(FundingBotError):
     """Raised when a task status change violates the workflow state machine."""
 
 
-class TaskAssignmentError(FundingBotError):
-    """Raised when a task assignment update cannot be applied."""
-
-
 class TaskNotFoundError(FundingBotError):
     """Raised when a task cannot be found."""
 
@@ -619,16 +625,55 @@ class QueueTaskContext:
         bot: "FundingBot",
         idempotency_key: str,
         controller: GracefulShutdownController,
+        task_name: str,
+        payload: dict[str, Any] | None = None,
+        worker_id: str | None = None,
+        retry_limit: int = 0,
+        backoff_seconds: float = 0.0,
+        backoff_max_seconds: float = 0.0,
     ) -> None:
         self.bot = bot
         self.idempotency_key = idempotency_key
         self._controller = controller
+        self.task_name = task_name
+        self.payload = dict(payload or {})
+        self.worker_id = worker_id
+        self.retry_limit = retry_limit
+        self.backoff_seconds = backoff_seconds
+        self.backoff_max_seconds = backoff_max_seconds
 
     def shutdown_requested(self) -> bool:
         return self._controller.shutdown_requested()
 
     def checkpoint(self, reason: str | None = None) -> None:
         self._controller.raise_if_shutdown_requested(reason=reason)
+
+    def update_progress(
+        self,
+        progress: int,
+        message: str,
+        *,
+        attempt_number: int = 0,
+        callback_name: str = "progress",
+        callback_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self.bot.record_task_run(
+            self.idempotency_key,
+            self.task_name,
+            status="running",
+            progress=progress,
+            message=message,
+            payload=self.payload,
+            callback_name=callback_name,
+            callback_payload=callback_payload,
+            idempotency_key=self.idempotency_key,
+            worker_id=self.worker_id,
+            retry_limit=self.retry_limit,
+            attempts=attempt_number,
+            backoff_seconds=self.backoff_seconds,
+            backoff_max_seconds=self.backoff_max_seconds,
+            dead_lettered=False,
+        )
 
 
 class BrowserClient(Protocol):
@@ -887,6 +932,43 @@ class OAuth2ClientCredentialsVault:
         if not isinstance(parsed, dict):
             raise CredentialRefreshError("OAuth2 token endpoint returned a non-object JSON payload.")
         return parsed
+
+
+def _perform_json_request(
+    method: str,
+    url: str,
+    *,
+    session: Any | None = None,
+    headers: dict[str, str] | None = None,
+    params: dict[str, Any] | None = None,
+    json_payload: dict[str, Any] | None = None,
+    timeout: float = 30.0,
+) -> Any:
+    if session is None:
+        if requests is None:
+            raise FundingBotError(
+                "The requests package is required for live connector HTTP transport."
+            )
+        session = requests.Session()
+    request_method = getattr(session, method.lower(), None)
+    if not callable(request_method):
+        raise FundingBotError(f"HTTP session does not support {method.upper()} requests.")
+    response = request_method(
+        url,
+        headers=headers or {},
+        params=params,
+        json=json_payload,
+        timeout=timeout,
+    )
+    if hasattr(response, "raise_for_status"):
+        response.raise_for_status()
+    if hasattr(response, "json"):
+        return response.json()
+    if isinstance(response, (dict, list)):
+        return response
+    raise FundingBotError(
+        f"HTTP client for {url!r} returned {type(response).__name__}, expected JSON-compatible data."
+    )
 
 
 class TokenBucketRateLimiter:
@@ -1682,11 +1764,11 @@ class CSRNetworkConnector(_BasePortalConnector):
 
 
 class NGODirectoryConnector(_BasePortalConnector):
-    """Stub connector for NGO funding directories."""
+    """NGO directory connector with optional ProPublica live integration."""
 
     connector_slug = "ngo-directory"
     source_name = "NGO Directory"
-    base_url = "https://directory.example.org/opportunities"
+    base_url = "https://projects.propublica.org/nonprofits/api/v2/search.json"
     keyword_category_mappings = {
         "literacy": {
             "keywords": ("reading", "community engagement", "library support"),
@@ -1697,6 +1779,92 @@ class NGODirectoryConnector(_BasePortalConnector):
             "categories": ("Literacy",),
         },
     }
+    default_page_size = 25
+
+    def _fetch_remote_result(self, keywords: list[str]) -> dict[str, Any]:
+        search_terms = keywords or ["nonprofit"]
+        opportunities: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        pages_fetched = 0
+        response_keys: set[str] = set()
+
+        for term in search_terms[:3]:
+            page_number = 0
+            while True:
+                response = self._fetch_remote_json(
+                    self.base_url,
+                    {
+                        "q": term,
+                        "page": page_number,
+                    },
+                )
+                if not isinstance(response, dict):
+                    break
+                response_keys.update(str(key) for key in response)
+                organizations = response.get("organizations", [])
+                for organization in organizations:
+                    if not isinstance(organization, dict):
+                        continue
+                    normalized = self._normalize_live_ngo_record(organization, term)
+                    if normalized["portal_url"] in seen_urls:
+                        continue
+                    seen_urls.add(normalized["portal_url"])
+                    opportunities.append(normalized)
+                pages_fetched += 1
+                total_results = int(response.get("total_results", 0) or 0)
+                per_page = int(response.get("per_page", self.page_size) or self.page_size)
+                if not organizations or (page_number + 1) * max(per_page, 1) >= total_results:
+                    break
+                page_number += 1
+
+        return {
+            "schema_version": self.result_schema_version,
+            "opportunities": opportunities,
+            "metadata": {
+                "connector_name": self.source_name,
+                "source_status": "remote",
+                "upstream": "propublica-nonprofit-explorer",
+                "response_keys": sorted(response_keys),
+                "pages_fetched": pages_fetched,
+                "page_size": self.page_size,
+            },
+        }
+
+    def _normalize_live_ngo_record(self, organization: dict[str, Any], query: str) -> dict[str, Any]:
+        donor_name = (
+            str(organization.get("name") or organization.get("organization_name") or "").strip()
+            or "Unknown nonprofit"
+        )
+        ein = str(organization.get("ein") or organization.get("strein") or "").replace("-", "").strip()
+        city = str(organization.get("city") or "").strip()
+        state = str(organization.get("state") or "").strip()
+        location = ", ".join(part for part in [city, state] if part) or "Unknown location"
+        category = (
+            str(organization.get("ntee_code") or organization.get("raw_ntee_code") or "").strip()
+            or "NGO Directory"
+        )
+        subsection = str(organization.get("sub_name") or "").strip()
+        if not subsection:
+            subsection_code = organization.get("subseccd")
+            subsection = (
+                f"501(c)({subsection_code}) organization"
+                if subsection_code not in (None, "")
+                else "Registered nonprofit"
+            )
+        portal_url = (
+            f"https://projects.propublica.org/nonprofits/organizations/{ein}"
+            if ein
+            else "https://projects.propublica.org/nonprofits/"
+        )
+        return {
+            "source": self.source_name,
+            "donor_name": donor_name,
+            "title": f"{donor_name} nonprofit directory profile",
+            "portal_url": portal_url,
+            "summary": f"Live NGO directory match for '{query}' in {location}. {subsection}.",
+            "category": category,
+            "tags": [query, category, state or "directory"],
+        }
 
     def _demo_data(self) -> list[dict[str, Any]]:
         return [
@@ -1708,6 +1876,174 @@ class NGODirectoryConnector(_BasePortalConnector):
                 "summary": "Institutional support for literacy and community engagement projects.",
                 "category": "Literacy",
                 "tags": ["community", "literacy", "institutional"],
+            }
+        ]
+
+
+class FoundationDirectoryConnector(_BasePortalConnector):
+    """Private foundation grant listings connector backed by Candid Grants API."""
+
+    connector_slug = "foundation-directory"
+    source_name = "Foundation Directory"
+    base_url = "https://api.candid.org/grants/v1/transactions"
+    default_page_size = 25
+    keyword_category_mappings = {
+        "foundation": {
+            "keywords": ("grantmaker", "private foundation", "philanthropy"),
+            "categories": ("Private Foundation",),
+        },
+        "education": {
+            "keywords": ("learning", "student success", "school"),
+            "categories": ("Education",),
+        },
+    }
+
+    def _fetch_remote_result(self, keywords: list[str]) -> dict[str, Any]:
+        api_key = str(self.credentials.get("api_key") or self.credentials.get("secret") or "").strip()
+        if not api_key:
+            raise ConnectorConfigError(
+                "Foundation Directory live mode requires credentials containing 'api_key' "
+                "or a raw secret value."
+            )
+
+        query = " ".join(keyword.strip() for keyword in keywords if keyword.strip()) or "nonprofit"
+        opportunities: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        response_keys: set[str] = set()
+        pages_fetched = 0
+        page_number = 1
+
+        while True:
+            response = self._fetch_remote_json(
+                self.base_url,
+                {
+                    "query": query,
+                    "page": page_number,
+                    "sort_by": "amount",
+                    "sort_order": "desc",
+                    "transaction": "TA",
+                },
+                headers={"x-api-key": api_key},
+            )
+            page_payload, _, page_response_keys, next_page = self._parse_remote_page(
+                response,
+                current_page=page_number,
+            )
+            response_keys.update(page_response_keys)
+            for row in page_payload:
+                normalized = self._normalize_foundation_record(row, query)
+                if normalized["portal_url"] in seen_urls:
+                    continue
+                seen_urls.add(normalized["portal_url"])
+                opportunities.append(normalized)
+            pages_fetched += 1
+            if next_page is None:
+                break
+            page_number = next_page
+
+        return {
+            "schema_version": self.result_schema_version,
+            "opportunities": opportunities,
+            "metadata": {
+                "connector_name": self.source_name,
+                "source_status": "remote",
+                "upstream": "candid-grants-api",
+                "response_keys": sorted(response_keys),
+                "pages_fetched": pages_fetched,
+                "page_size": self.page_size,
+            },
+        }
+
+    def _normalize_foundation_record(self, row: dict[str, Any], query: str) -> dict[str, Any]:
+        donor_name = (
+            self._first_non_empty(
+                row.get("funder_name"),
+                row.get("foundation_name"),
+                row.get("grantmaker_name"),
+                row.get("funder"),
+                self._nested_value(row, "funder", "name"),
+                self._nested_value(row, "grantor", "name"),
+            )
+            or "Private foundation listing"
+        )
+        recipient_name = (
+            self._first_non_empty(
+                row.get("recipient_name"),
+                row.get("organization_name"),
+                row.get("recipient"),
+                self._nested_value(row, "recipient", "name"),
+            )
+            or "eligible nonprofits"
+        )
+        title = (
+            self._first_non_empty(
+                row.get("title"),
+                row.get("grant_title"),
+                row.get("program_name"),
+            )
+            or f"{donor_name} grant listing"
+        )
+        summary = (
+            self._first_non_empty(
+                row.get("purpose"),
+                row.get("description"),
+                row.get("summary"),
+            )
+            or f"Private foundation grant listing matching '{query}' for {recipient_name}."
+        )
+        portal_url = (
+            self._first_non_empty(
+                row.get("url"),
+                row.get("detail_url"),
+                row.get("source_url"),
+                self._nested_value(row, "links", "self"),
+            )
+            or self.base_url
+        )
+        category = (
+            self._first_non_empty(
+                row.get("subject"),
+                row.get("support_strategy"),
+                row.get("category"),
+            )
+            or "Private Foundation"
+        )
+        return {
+            "source": self.source_name,
+            "donor_name": str(donor_name),
+            "title": str(title),
+            "portal_url": str(portal_url),
+            "summary": str(summary),
+            "category": str(category),
+            "tags": [str(item) for item in [query, category, recipient_name] if item],
+        }
+
+    @staticmethod
+    def _first_non_empty(*values: Any) -> str:
+        for value in values:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    @staticmethod
+    def _nested_value(row: dict[str, Any], key: str, nested_key: str) -> str:
+        value = row.get(key)
+        if isinstance(value, dict):
+            nested = value.get(nested_key)
+            if isinstance(nested, str):
+                return nested.strip()
+        return ""
+
+    def _demo_data(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "source": self.source_name,
+                "donor_name": "Heritage Arts Foundation",
+                "title": "Regional Arts Access Grant",
+                "portal_url": "https://foundation.example.org/opportunities/arts-access",
+                "summary": "Private foundation support for arts access and community culture.",
+                "category": "Arts",
+                "tags": ["arts", "foundation", "community"],
             }
         ]
 
@@ -1768,7 +2104,13 @@ class CrowdfundingConnector(_BasePortalConnector):
             "platform": self.platform,
             "health_check": self._circuit_state == "half-open",
         }
-        response = self._call_with_retry(lambda: client(self.base_url, payload, self.credentials))
+        def operation() -> Any:
+            try:
+                return client(self.base_url, payload, self.credentials)
+            except TypeError:
+                return client(self.base_url, payload)
+
+        response = self._call_with_retry(operation)
         raw_rows, response_keys = self._extract_platform_rows(response)
         normalized_rows = [row for row in (self._normalize_platform_row(item) for item in raw_rows) if row]
         return {
@@ -1927,6 +2269,7 @@ def default_connectors() -> list[PortalConnector]:
             GrantsPortalConnector(),
             CSRNetworkConnector(),
             NGODirectoryConnector(),
+            FoundationDirectoryConnector(),
             GlobalGivingConnector(),
             KickstarterForGoodConnector(),
         ]
@@ -2119,6 +2462,18 @@ DEFAULT_CONNECTOR_REGISTRY = ConnectorRegistry()
 DEFAULT_CONNECTOR_REGISTRY.register(GrantsPortalConnector.connector_slug, GrantsPortalConnector)
 DEFAULT_CONNECTOR_REGISTRY.register(CSRNetworkConnector.connector_slug, CSRNetworkConnector)
 DEFAULT_CONNECTOR_REGISTRY.register(NGODirectoryConnector.connector_slug, NGODirectoryConnector)
+DEFAULT_CONNECTOR_REGISTRY.register(
+    FoundationDirectoryConnector.connector_slug,
+    FoundationDirectoryConnector,
+    credential_schema={
+        "type": "object",
+        "properties": {
+            "api_key": {"type": "string", "minLength": 1},
+            "secret": {"type": "string", "minLength": 1},
+        },
+        "anyOf": [{"required": ["api_key"]}, {"required": ["secret"]}],
+    },
+)
 DEFAULT_CONNECTOR_REGISTRY.register(GlobalGivingConnector.connector_slug, GlobalGivingConnector)
 DEFAULT_CONNECTOR_REGISTRY.register(
     KickstarterForGoodConnector.connector_slug,
@@ -2132,6 +2487,7 @@ def connector_registry() -> dict[str, type[_BasePortalConnector]]:
         GrantsPortalConnector.connector_slug: GrantsPortalConnector,
         CSRNetworkConnector.connector_slug: CSRNetworkConnector,
         NGODirectoryConnector.connector_slug: NGODirectoryConnector,
+        FoundationDirectoryConnector.connector_slug: FoundationDirectoryConnector,
         GlobalGivingConnector.connector_slug: GlobalGivingConnector,
         KickstarterForGoodConnector.connector_slug: KickstarterForGoodConnector,
     }
@@ -2336,7 +2692,8 @@ class FundingBot:
         "opportunities": "public",
         "applications": "internal",
         "submission_attempts": "internal",
-        "donors": "confidential",
+        "donors": "secret",
+        "consent_records": "confidential",
         "communications": "confidential",
         "documents": "internal",
         "audit_logs": "confidential",
@@ -2347,7 +2704,7 @@ class FundingBot:
         "translation_reviews": "internal",
     }
     SETTING_DEFAULT_CLASSIFICATIONS = {
-        "profile": "confidential",
+        "profile": "secret",
         "search_settings": "internal",
     }
     DONOR_FIELD_CLASSIFICATIONS = {
@@ -2879,64 +3236,6 @@ class FundingBot:
             )
             self.connection.commit()
 
-    def _ensure_tasks_schema(self) -> None:
-        columns = [
-            row["name"]
-            for row in self.connection.execute("PRAGMA table_info(tasks)").fetchall()
-        ]
-        if not columns or "assignee" in columns:
-            return
-        if "assigned_to" not in columns:
-            return
-        self.connection.executescript(
-            """
-            ALTER TABLE tasks RENAME TO tasks_legacy;
-            CREATE TABLE tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                external_id TEXT UNIQUE,
-                title TEXT NOT NULL,
-                description TEXT NOT NULL DEFAULT '',
-                assignee TEXT NOT NULL,
-                status TEXT NOT NULL,
-                due_date TEXT NOT NULL,
-                source TEXT NOT NULL DEFAULT 'manual',
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                assignee_email TEXT,
-                assignee_name TEXT
-            );
-            INSERT INTO tasks (
-                id, external_id, title, description, assignee, status, due_date,
-                source, created_at, updated_at, assignee_email, assignee_name
-            )
-            SELECT
-                id,
-                external_id,
-                title,
-                COALESCE(description, ''),
-                LOWER(assigned_to),
-                CASE LOWER(status)
-                    WHEN 'todo' THEN 'pending'
-                    WHEN 'in-progress' THEN 'in_progress'
-                    WHEN 'done' THEN 'completed'
-                    ELSE REPLACE(LOWER(status), '-', '_')
-                END,
-                COALESCE(date(due_date), date(updated_at), date(created_at), date('now')),
-                COALESCE(source, 'manual'),
-                created_at,
-                updated_at,
-                assignee_email,
-                assignee_name
-            FROM tasks_legacy;
-            DROP TABLE tasks_legacy;
-            CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee);
-            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-            CREATE INDEX IF NOT EXISTS idx_tasks_external_id ON tasks(external_id);
-            CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date);
-            """
-        )
-        self.connection.commit()
-
     def _apply_migrations(self) -> None:
         """Apply lightweight schema migrations for existing databases."""
         self.connection.execute(
@@ -2950,9 +3249,65 @@ class FundingBot:
 
     def _ensure_tasks_schema(self) -> None:
         """Ensure task collaboration columns exist for upgraded databases."""
+        columns = [
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(tasks)").fetchall()
+        ]
+        if columns and "assignee" not in columns and "assigned_to" in columns:
+            self.connection.executescript(
+                """
+                ALTER TABLE tasks RENAME TO tasks_legacy;
+                CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    external_id TEXT UNIQUE,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    assignee TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    due_date TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    assignee_email TEXT,
+                    assignee_name TEXT
+                );
+                INSERT INTO tasks (
+                    id, external_id, title, description, assignee, status, due_date,
+                    source, created_at, updated_at, assignee_email, assignee_name
+                )
+                SELECT
+                    id,
+                    external_id,
+                    title,
+                    COALESCE(description, ''),
+                    LOWER(assigned_to),
+                    CASE LOWER(status)
+                        WHEN 'todo' THEN 'pending'
+                        WHEN 'in-progress' THEN 'in_progress'
+                        WHEN 'done' THEN 'completed'
+                        ELSE REPLACE(LOWER(status), '-', '_')
+                    END,
+                    COALESCE(date(due_date), date(updated_at), date(created_at), date('now')),
+                    COALESCE(source, 'manual'),
+                    created_at,
+                    updated_at,
+                    assignee_email,
+                    assignee_name
+                FROM tasks_legacy;
+                DROP TABLE tasks_legacy;
+                """
+            )
         self._ensure_column("tasks", "external_id", "TEXT")
         self._ensure_column("tasks", "due_date", "TEXT")
         self._ensure_column("tasks", "source", "TEXT NOT NULL DEFAULT 'manual'")
+        self._ensure_column("tasks", "assignee_email", "TEXT")
+        self._ensure_column("tasks", "assignee_name", "TEXT")
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)"
+        )
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_tasks_external_id ON tasks(external_id)"
         )
@@ -4142,6 +4497,12 @@ class FundingBot:
             bot=self,
             idempotency_key=normalized_idempotency_key,
             controller=controller,
+            task_name=normalized_task_name,
+            payload=normalized_payload,
+            worker_id=worker_id,
+            retry_limit=int(config["retry_limit"]),
+            backoff_seconds=float(config["backoff_seconds"]),
+            backoff_max_seconds=float(config["backoff_max_seconds"]),
         )
         sleeper = sleep_func or time.sleep
 
@@ -4195,6 +4556,8 @@ class FundingBot:
                     message=str(exc),
                     payload=normalized_payload,
                     error_message=str(exc),
+                    callback_name="on_cancel",
+                    callback_payload={"attempt_number": attempt_number, "state": "cancelled"},
                     idempotency_key=normalized_idempotency_key,
                     worker_id=worker_id,
                     retry_limit=int(config["retry_limit"]),
@@ -4251,6 +4614,12 @@ class FundingBot:
                     message=message,
                     payload=normalized_payload,
                     error_message=error_message,
+                    callback_name="on_retry" if should_retry else "on_failure",
+                    callback_payload={
+                        "attempt_number": attempt_number,
+                        "state": "retry_scheduled" if should_retry else "failed",
+                        "next_retry_at": self._to_iso(next_retry_at) if next_retry_at is not None else None,
+                    },
                     idempotency_key=normalized_idempotency_key,
                     worker_id=worker_id,
                     retry_limit=int(config["retry_limit"]),
@@ -4326,6 +4695,8 @@ class FundingBot:
                 message="Task completed.",
                 payload=normalized_payload,
                 result=result if isinstance(result, dict) else {"value": result},
+                callback_name="on_success",
+                callback_payload={"attempt_number": attempt_number, "state": "completed"},
                 idempotency_key=normalized_idempotency_key,
                 worker_id=worker_id,
                 retry_limit=int(config["retry_limit"]),
@@ -5651,11 +6022,12 @@ class FundingBot:
         self,
         *,
         title: str,
-        assigned_to: str,
+        assigned_to: str | None = None,
+        assignee: str | None = None,
         assignee_email: str | None = None,
         assignee_name: str | None = None,
         description: str = "",
-        status: str = "todo",
+        status: str = "pending",
         created_at: datetime | None = None,
         due_date: datetime | str | None = None,
         external_id: str | None = None,
@@ -5664,7 +6036,7 @@ class FundingBot:
         commit: bool = True,
     ) -> dict[str, Any]:
         normalized_title = str(title).strip()
-        normalized_assignee = str(assigned_to).strip().lower()
+        normalized_assignee = str(assignee if assignee is not None else assigned_to or "").strip().lower()
         if not normalized_title:
             raise ValueError("Task title is required.")
         if not normalized_assignee:
@@ -5688,7 +6060,7 @@ class FundingBot:
         cursor = self.connection.execute(
             """
             INSERT INTO tasks (
-                external_id, title, description, assigned_to, assignee_email, assignee_name,
+                external_id, title, description, assignee, assignee_email, assignee_name,
                 status, due_date, source, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -5714,7 +6086,7 @@ class FundingBot:
             commit=commit,
             task_id=task["id"],
             title=task["title"],
-            assigned_to=task["assigned_to"],
+            assignee=task["assignee"],
             status=task["status"],
             due_date=task["due_date"],
             external_id=task["external_id"],
@@ -5727,7 +6099,7 @@ class FundingBot:
             task_id=task["id"],
             title=task["title"],
             previous_assignee=None,
-            assigned_to=task["assigned_to"],
+            assignee=task["assignee"],
             external_id=task["external_id"],
             assignee_email=task.get("assignee_email"),
         )
@@ -5740,7 +6112,11 @@ class FundingBot:
         return task
 
     def get_task(self, task_id: int, *, viewer_email: str | None = None) -> dict[str, Any]:
-        task = self._serialize_task(self._get_task_row(task_id))
+        task_row = self._get_task_row(task_id)
+        task_model = Task.from_row(task_row)
+        if task_model is None:
+            raise TaskNotFoundError(f"Task {task_id!r} does not exist.")
+        task = self._serialize_task(task_model)
         if viewer_email:
             task["unread_comment_count"] = self.get_unread_task_comment_count(task_id, viewer_email)
         return task
@@ -5754,27 +6130,36 @@ class FundingBot:
             (normalized,),
         ).fetchone()
         if row is None:
-            raise FundingBotError(f"Task with external_id {external_id!r} does not exist.")
-        return self._serialize_task(row)
+            raise TaskNotFoundError(f"Task with external_id {external_id!r} does not exist.")
+        task = Task.from_row(row)
+        if task is None:
+            raise TaskNotFoundError(f"Task with external_id {external_id!r} does not exist.")
+        return self._serialize_task(task)
 
     def list_tasks(
         self,
         *,
         assigned_to: str | None = None,
+        assignee: str | None = None,
         assignee_email: str | None = None,
         status: str | None = None,
         due_date_before: datetime | str | None = None,
         due_date_after: datetime | str | None = None,
+        due_before: datetime | str | None = None,
+        due_after: datetime | str | None = None,
         sort: str | None = None,
+        sort_by: str | None = None,
+        sort_order: str | None = None,
         source: str | None = None,
         viewer_email: str | None = None,
     ) -> list[dict[str, Any]]:
         query = "SELECT * FROM tasks"
         params: list[Any] = []
         clauses: list[str] = []
-        if assigned_to:
-            clauses.append("assigned_to = ?")
-            params.append(str(assigned_to).strip().lower())
+        effective_assignee = assignee if assignee is not None else assigned_to
+        if effective_assignee:
+            clauses.append("assignee = ?")
+            params.append(str(effective_assignee).strip().lower())
         if assignee_email:
             clauses.append("assignee_email = ?")
             params.append(_validate_email(assignee_email))
@@ -5782,26 +6167,34 @@ class FundingBot:
             clauses.append("status = ?")
             params.append(self._normalize_task_status(status))
         normalized_due_date_before = (
-            self._normalize_task_due_date(str(due_date_before)) if due_date_before else None
+            self._normalize_task_due_date(
+                str(due_before if due_before is not None else due_date_before)
+            )
+            if (due_before is not None or due_date_before is not None)
+            else None
         )
         if normalized_due_date_before:
-            clauses.append("due_date IS NOT NULL AND due_date <= ?")
+            clauses.append("due_date <= ?")
             params.append(normalized_due_date_before)
         normalized_due_date_after = (
-            self._normalize_task_due_date(str(due_date_after)) if due_date_after else None
+            self._normalize_task_due_date(
+                str(due_after if due_after is not None else due_date_after)
+            )
+            if (due_after is not None or due_date_after is not None)
+            else None
         )
         if normalized_due_date_after:
-            clauses.append("due_date IS NOT NULL AND due_date >= ?")
+            clauses.append("due_date >= ?")
             params.append(normalized_due_date_after)
         if source:
             clauses.append("source = ?")
             params.append(str(source).strip())
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY " + self._task_sort_clause(sort)
+        query += " ORDER BY " + self._task_sort_clause(sort, sort_by=sort_by, sort_order=sort_order)
         rows = self.connection.execute(query, params).fetchall()
         normalized_viewer_email = _validate_email(viewer_email) if viewer_email else None
-        tasks = [self._serialize_task(row) for row in rows]
+        tasks = [self._serialize_task(Task.from_row(row) or row) for row in rows]
         if normalized_viewer_email:
             for task in tasks:
                 task["unread_comment_count"] = self.get_unread_task_comment_count(
@@ -5811,32 +6204,58 @@ class FundingBot:
         return tasks
 
     @staticmethod
-    def _task_sort_clause(sort: str | None) -> str:
-        sort_key = (sort or "").strip().lower()
+    def _task_sort_clause(
+        sort: str | None,
+        *,
+        sort_by: str | None = None,
+        sort_order: str | None = None,
+    ) -> str:
+        if sort_by is not None:
+            normalized_field = str(sort_by).strip().lower()
+            normalized_order = str(sort_order or "asc").strip().lower()
+            if normalized_order not in {"asc", "desc"}:
+                raise ValueError("Invalid task sort_order. Expected 'asc' or 'desc'.")
+            prefix = "-" if normalized_order == "desc" else ""
+            sort_key = f"{prefix}{normalized_field}" if normalized_field != "updated_at" else (
+                "updated_at" if normalized_order == "desc" else "-updated_at"
+            )
+        else:
+            sort_key = (sort or "").strip().lower()
         sort_map = {
             "": "updated_at DESC, id DESC",
             "updated_at": "updated_at DESC, id DESC",
             "-updated_at": "updated_at ASC, id ASC",
-            "assignee": "assigned_to COLLATE NOCASE ASC, due_date IS NULL ASC, due_date ASC, id ASC",
-            "-assignee": "assigned_to COLLATE NOCASE DESC, due_date IS NULL ASC, due_date DESC, id DESC",
+            "assignee": "assignee COLLATE NOCASE ASC, due_date ASC, id ASC",
+            "-assignee": "assignee COLLATE NOCASE DESC, due_date DESC, id DESC",
+            "title": "title COLLATE NOCASE ASC, due_date ASC, id ASC",
+            "-title": "title COLLATE NOCASE DESC, due_date DESC, id DESC",
             "status": "status COLLATE NOCASE ASC, due_date IS NULL ASC, due_date ASC, id ASC",
             "-status": "status COLLATE NOCASE DESC, due_date IS NULL ASC, due_date DESC, id DESC",
             "due_date": "due_date IS NULL ASC, due_date ASC, id ASC",
             "-due_date": "due_date IS NULL ASC, due_date DESC, id DESC",
+            "created_at": "created_at ASC, id ASC",
+            "-created_at": "created_at DESC, id DESC",
         }
         if sort_key not in sort_map:
             raise ValueError(
                 "Invalid task sort. Expected one of "
-                "['assignee', '-assignee', 'due_date', '-due_date', 'status', '-status']."
+                "['assignee', '-assignee', 'title', '-title', 'due_date', '-due_date', "
+                "'status', '-status', 'created_at', '-created_at', 'updated_at', '-updated_at']."
             )
         return sort_map[sort_key]
 
-    def get_task_status_counts(self, *, assigned_to: str | None = None) -> dict[str, int]:
+    def get_task_status_counts(
+        self,
+        *,
+        assigned_to: str | None = None,
+        assignee: str | None = None,
+    ) -> dict[str, int]:
         query = "SELECT status, COUNT(*) AS total FROM tasks"
         params: list[Any] = []
-        if assigned_to:
-            query += " WHERE assigned_to = ?"
-            params.append(str(assigned_to).strip().lower())
+        effective_assignee = assignee if assignee is not None else assigned_to
+        if effective_assignee:
+            query += " WHERE assignee = ?"
+            params.append(str(effective_assignee).strip().lower())
         query += " GROUP BY status"
         counts = {status: 0 for status in self.TASK_STATUSES}
         for row in self.connection.execute(query, params).fetchall():
@@ -5863,7 +6282,7 @@ class FundingBot:
                 (normalized_status, updated_at, task_id),
             )
             if updated.rowcount == 0:
-                raise FundingBotError(f"Task {task_id!r} does not exist.")
+                raise TaskNotFoundError(f"Task {task_id!r} does not exist.")
         notification = (
             f"Task '{task['title']}' moved from {task['status']} to {normalized_status}."
         )
@@ -5871,7 +6290,7 @@ class FundingBot:
             "task_status_changed",
             task_id=task_id,
             title=task["title"],
-            assigned_to=task["assigned_to"],
+            assignee=task["assignee"],
             previous_status=task["status"],
             status=normalized_status,
             changed_by=str(changed_by).strip().lower(),
@@ -5881,6 +6300,31 @@ class FundingBot:
         updated_task = self.get_task(task_id)
         updated_task["notification"] = notification
         return updated_task
+
+    def update_task(
+        self,
+        task_id: int,
+        *,
+        title: str | None = None,
+        description: str | None = None,
+        assignee: str | None = None,
+        status: str | None = None,
+        due_date: datetime | str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {"id": task_id}
+        if title is not None:
+            payload["title"] = title
+        if description is not None:
+            payload["description"] = description
+        if assignee is not None:
+            payload["assigned_to"] = assignee
+        if status is not None:
+            payload["status"] = status
+        if due_date is not None:
+            payload["due_date"] = due_date
+        if len(payload) == 1:
+            raise ValueError("At least one task field must be provided for update.")
+        return self.upsert_task(payload)
 
     def update_task_assignment(
         self,
@@ -5908,7 +6352,7 @@ class FundingBot:
             self.connection.execute(
                 """
                 UPDATE tasks
-                SET assigned_to = ?, assignee_email = ?, assignee_name = ?, updated_at = ?
+                SET assignee = ?, assignee_email = ?, assignee_name = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
@@ -5924,8 +6368,8 @@ class FundingBot:
                 commit=False,
                 task_id=task_id,
                 title=task["title"],
-                previous_assignee=task["assigned_to"],
-                assigned_to=normalized_assigned_to,
+                previous_assignee=task["assignee"],
+                assignee=normalized_assigned_to,
                 previous_assignee_email=task.get("assignee_email"),
                 assignee_email=normalized_assignee_email,
                 changed_by=str(changed_by or "").strip().lower() or None,
@@ -6813,7 +7257,7 @@ class FundingBot:
                 ).fetchall()
             ]
         export = {
-            "donor": dict(donor) if donor else None,
+            "donor": self._deserialize_donor_row(donor),
             "consent_records": self.list_consent_records(donor_email),
             "communications": [dict(row) for row in communications],
             "outreach_events": events,

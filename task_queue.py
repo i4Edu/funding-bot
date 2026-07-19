@@ -97,6 +97,13 @@ class _FallbackAsyncResult:
     def __init__(self, task_name: str, payload: Any) -> None:
         self.id = f"local-{task_name}"
         self.payload = payload
+        self.status = "SUCCESS"
+
+    def ready(self) -> bool:
+        return True
+
+    def get(self, propagate: bool = True) -> Any:
+        return self.payload
 
 
 class _FallbackInspect:
@@ -132,11 +139,16 @@ class _FallbackTask:
         self.name = name
         self.queue = queue
         self.bind = bind
+        self.request = type("FallbackRequest", (), {"id": f"local-{name}", "hostname": "local"})()
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         if self.bind:
             return self.run(self, *args, **kwargs)
         return self.run(*args, **kwargs)
+
+    def update_state(self, *, state: str, meta: dict[str, Any] | None = None) -> None:
+        self.request.state = state
+        self.request.meta = meta or {}
 
     def delay(self, *args: Any, **kwargs: Any) -> _FallbackAsyncResult:
         return _FallbackAsyncResult(self.name, self(*args, **kwargs))
@@ -177,6 +189,7 @@ def create_celery_app(config: QueueConfig | None = None) -> Any:
     queue_config = config or load_queue_config()
     try:
         from celery import Celery
+        from celery.schedules import crontab
     except ImportError:
         celery_app = _FallbackCelery("funding_bot")
         celery_app.conf.update(
@@ -184,6 +197,7 @@ def create_celery_app(config: QueueConfig | None = None) -> Any:
             result_backend=queue_config.result_backend,
             task_always_eager=queue_config.task_always_eager,
             task_default_queue=queue_config.queue_name,
+            imports=("tasks.celery_tasks",),
         )
         return celery_app
 
@@ -193,12 +207,40 @@ def create_celery_app(config: QueueConfig | None = None) -> Any:
         backend=queue_config.result_backend,
     )
     celery_app.conf.update(
+        accept_content=["json"],
         broker_connection_retry_on_startup=True,
+        imports=("tasks.celery_tasks",),
+        result_extended=True,
+        result_serializer="json",
         task_always_eager=queue_config.task_always_eager,
         task_default_queue=queue_config.queue_name,
         task_ignore_result=False,
+        task_serializer="json",
         task_track_started=True,
+        timezone="UTC",
+        enable_utc=True,
     )
+    if queue_config.broker_url.startswith("filesystem://"):
+        celery_app.conf.broker_transport_options = {
+            "data_folder_in": str(BROKER_QUEUE_DIR),
+            "data_folder_out": str(BROKER_QUEUE_DIR),
+            "data_folder_processed": str(BROKER_PROCESSED_DIR),
+            "control_folder": str(BROKER_CONTROL_DIR),
+        }
+    celery_app.conf.beat_schedule = {
+        "daily-summary": {
+            "task": "funding_bot.send_daily_summary",
+            "schedule": crontab(
+                minute=int(os.environ.get("DAILY_SUMMARY_SCHEDULE_MINUTE", str(DEFAULT_DAILY_SUMMARY_MINUTE))),
+                hour=int(os.environ.get("DAILY_SUMMARY_SCHEDULE_HOUR", str(DEFAULT_DAILY_SUMMARY_HOUR))),
+            ),
+            "kwargs": {
+                "recipient": os.environ.get("DAILY_SUMMARY_RECIPIENT", "lupael@i4e.com.bd"),
+                "dry_run": _coerce_bool(os.environ.get("DAILY_SUMMARY_DRY_RUN"), default=False),
+                "db_path": os.environ.get("BOT_DB_PATH", "funding_bot.db"),
+            },
+        }
+    }
     return celery_app
 
 
@@ -225,7 +267,7 @@ def _queue_result_payload(task_run: dict[str, Any], *, mode: str = "queue", **ex
 
 @celery_app.task(
     bind=True,
-    name="funding_bot.discover_opportunities",
+    name="funding_bot.discover",
     queue=load_queue_config().queue_name,
 )
 def discover_opportunities_task(
@@ -243,11 +285,13 @@ def discover_opportunities_task(
         }
 
         def _task(context: QueueTaskContext, task_payload: dict[str, Any]) -> dict[str, Any]:
+            context.update_progress(20, "Loading discovery configuration.")
             context.checkpoint("Shutdown requested before discovery started.")
             found = context.bot.run_discovery(
                 keywords=task_payload.get("keywords") or None,
                 trusted_sources=task_payload.get("trusted_sources") or None,
             )
+            context.update_progress(90, "Persisted discovery results.", callback_payload={"count": len(found)})
             context.checkpoint("Shutdown requested after discovery completed.")
             return {
                 "count": len(found),
@@ -276,8 +320,9 @@ def send_outreach_task(
     *,
     donor_email: str,
     donor_name: str,
-    subject_template: str,
-    body_template: str,
+    subject_template: str | None = None,
+    body_template: str | None = None,
+    locale: str | None = None,
     dry_run: bool = True,
     db_path: str | None = None,
     idempotency_key: str | None = None,
@@ -288,19 +333,46 @@ def send_outreach_task(
             "donor_name": donor_name,
             "subject_template": subject_template,
             "body_template": body_template,
+            "locale": locale,
             "dry_run": dry_run,
         }
 
         def _task(context: QueueTaskContext, task_payload: dict[str, Any]) -> dict[str, Any]:
+            context.update_progress(20, "Preparing outreach message.")
             context.checkpoint("Shutdown requested before donor outreach started.")
             sender = None if task_payload.get("dry_run", True) else SMTPEmailSender.from_env()
-            result = context.bot.send_outreach(
-                donor_email=str(task_payload["donor_email"]),
-                donor_name=str(task_payload["donor_name"]),
-                subject_template=str(task_payload["subject_template"]),
-                body_template=str(task_payload["body_template"]),
-                sender=sender,
-            )
+            resolved_locale = task_payload.get("locale")
+            if task_payload.get("subject_template") is None and task_payload.get("body_template") is None:
+                if resolved_locale is not None:
+                    context.bot.upsert_donor(
+                        email=str(task_payload["donor_email"]),
+                        name=str(task_payload["donor_name"]),
+                        locale=str(resolved_locale),
+                    )
+                result = context.bot.send_outreach_from_template(
+                    context.bot.DEFAULT_OUTREACH_TEMPLATE,
+                    str(task_payload["donor_email"]),
+                    str(task_payload["donor_name"]),
+                    sender=sender,
+                )
+            else:
+                fallback = context.bot._resolve_catalog_template(
+                    context.bot.DEFAULT_OUTREACH_TEMPLATE,
+                    segment="unknown",
+                    locale=str(resolved_locale or context.bot.DEFAULT_TEMPLATE_LOCALE),
+                ) or (
+                    "Thank you for supporting {organization_name}",
+                    "Dear {donor_name},\n\nThank you for your continued interest in {organization_name}.",
+                )
+                result = context.bot.send_outreach(
+                    donor_email=str(task_payload["donor_email"]),
+                    donor_name=str(task_payload["donor_name"]),
+                    subject_template=str(task_payload.get("subject_template") or fallback[0]),
+                    body_template=str(task_payload.get("body_template") or fallback[1]),
+                    sender=sender,
+                    locale=str(resolved_locale) if resolved_locale is not None else None,
+                )
+            context.update_progress(90, "Outreach workflow completed.")
             context.checkpoint("Shutdown requested after donor outreach completed.")
             return result
 
@@ -333,12 +405,14 @@ def send_daily_summary_task(
         payload = {"recipient": recipient, "dry_run": dry_run}
 
         def _task(context: QueueTaskContext, task_payload: dict[str, Any]) -> dict[str, Any]:
+            context.update_progress(25, "Building daily summary.")
             context.checkpoint("Shutdown requested before daily summary started.")
             sender = None if task_payload.get("dry_run", False) else SMTPEmailSender.from_env()
             result = context.bot.send_daily_summary(
                 recipient=str(task_payload["recipient"]),
                 sender=sender,
             )
+            context.update_progress(90, "Daily summary workflow completed.")
             context.checkpoint("Shutdown requested after daily summary completed.")
             return result
 

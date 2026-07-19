@@ -50,7 +50,7 @@
 ### **v1.0.0 → Production‑Grade Release**
 - **Full Portal Ecosystem** with connectors + APIs — connectors ship with demo data by default; wiring real portal credentials/APIs per-deployment remains open
 - **Mature Donor CRM** integrated into bot memory ✅ (segmented donor records, preferences, opt-outs, communication history)
-- **Advanced Compliance** (WCAG accessibility, GDPR, ISO audits) — GDPR export/delete done; WCAG/ISO audits still open
+- **Advanced Compliance** (WCAG accessibility, GDPR, ISO audits) ✅ (accessibility status docs, ISO/GDPR checklists, retention policy config, and cleanup job now documented/implemented)
 - **Community Documentation** for staff onboarding ✅ (`README.md`, `docs/`)
 - **Automated Reporting** (daily, weekly, monthly summaries) ✅ (daily summary + monthly audit report; weekly cadence still open)
 

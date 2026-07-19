@@ -29,9 +29,19 @@ def _auth_header(role: str, password: str) -> dict[str, str]:
 class SettingsPanelTests(unittest.TestCase):
     def setUp(self):
         self.db_path = Path(f".test_web_settings_{self._testMethodName}.db")
+        self.output_dir = Path(f".test_policy_output_{self._testMethodName}")
         if self.db_path.exists():
             self.db_path.unlink()
+        if self.output_dir.exists():
+            for path in sorted(self.output_dir.rglob("*"), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            self.output_dir.rmdir()
         os.environ["BOT_DB_PATH"] = str(self.db_path)
+        os.environ["DATA_RESIDENCY"] = "EU"
+        os.environ["DATA_STORAGE_REGION"] = "EU"
         app.config["TESTING"] = True
         self.client = app.test_client()
         self.admin_headers = _auth_header("admin", "admin-secret")
@@ -41,7 +51,16 @@ class SettingsPanelTests(unittest.TestCase):
     def tearDown(self):
         if self.db_path.exists():
             self.db_path.unlink()
+        if self.output_dir.exists():
+            for path in sorted(self.output_dir.rglob("*"), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            self.output_dir.rmdir()
         os.environ.pop("BOT_DB_PATH", None)
+        os.environ.pop("DATA_RESIDENCY", None)
+        os.environ.pop("DATA_STORAGE_REGION", None)
         os.environ.pop("ENABLE_TASK_QUEUE", None)
         os.environ.pop("ENABLE_LEGACY_CRON", None)
         os.environ.pop("ENABLE_TASK_QUEUE", None)
@@ -59,14 +78,46 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn(b"Settings", response.data)
         self.assertIn(b"Translations", response.data)
 
+    def test_dashboard_auth_sets_secure_httponly_session_cookie(self):
+        response = self.client.get("/dashboard", headers=self.auditor_headers)
+
+        self.assertEqual(200, response.status_code)
+        session_cookie = response.headers.get("Set-Cookie", "")
+        self.assertIn("Secure", session_cookie)
+        self.assertIn("HttpOnly", session_cookie)
+
+    def test_dashboard_session_allows_follow_up_request_without_auth_header(self):
+        first_response = self.client.get("/dashboard", headers=self.auditor_headers)
+        second_response = self.client.get("/dashboard")
+
+        self.assertEqual(200, first_response.status_code)
+        self.assertEqual(200, second_response.status_code)
+
+    def test_dashboard_session_times_out_after_configured_lifetime(self):
+        original_lifetime = app.config["PERMANENT_SESSION_LIFETIME"]
+        app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(minutes=30)
+        try:
+            first_response = self.client.get("/dashboard", headers=self.auditor_headers)
+            self.assertEqual(200, first_response.status_code)
+
+            expired_at = (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat()
+            with self.client.session_transaction() as flask_session:
+                flask_session["authenticated_role"] = "auditor"
+                flask_session["authenticated_at"] = expired_at
+                flask_session["last_seen_at"] = expired_at
+
+            expired_response = self.client.get("/dashboard")
+            self.assertEqual(401, expired_response.status_code)
+        finally:
+            app.config["PERMANENT_SESSION_LIFETIME"] = original_lifetime
+
     def test_dashboard_page_exposes_keyboard_shortcuts_and_focus_regions(self):
-        base_html = (PROJECT_ROOT / "web" / "templates" / "base.html").read_text(encoding="utf-8")
-        dashboard_html = (PROJECT_ROOT / "web" / "templates" / "dashboard.html").read_text(encoding="utf-8")
-        self.assertIn('aria-label="Open settings page"', dashboard_html)
-        self.assertIn('id="main-content" class="{% block main_class %}container py-4{% endblock %}" tabindex="-1"', base_html)
-        self.assertIn('id="recent-opps-region"', dashboard_html)
-        self.assertIn('Alt</kbd> + <kbd>Shift</kbd> + <kbd>O</kbd> — Focus recent opportunities', dashboard_html)
-        self.assertIn('KeyO: () => focusAndScroll(document.getElementById("recent-opps-region"))', dashboard_html)
+        html = (PROJECT_ROOT / "web" / "templates" / "dashboard.html").read_text(encoding="utf-8")
+        self.assertIn('aria-label="Open settings page"', html)
+        self.assertIn('id="main-content" class="container py-4" tabindex="-1"', html)
+        self.assertIn('id="recent-opps-region"', html)
+        self.assertIn('Alt</kbd> + <kbd>Shift</kbd> + <kbd>O</kbd> — Focus recent opportunities', html)
+        self.assertIn('KeyO: () => focusAndScroll(document.getElementById("recent-opps-region"))', html)
 
     def test_settings_page_includes_aria_labels_live_regions_and_shortcuts(self):
         html = (PROJECT_ROOT / "web" / "templates" / "settings.html").read_text(encoding="utf-8")
@@ -80,8 +131,9 @@ class SettingsPanelTests(unittest.TestCase):
     def test_task_dashboard_page_includes_shortcut_help(self):
         html = (PROJECT_ROOT / "web" / "templates" / "tasks.html").read_text(encoding="utf-8")
         self.assertIn('aria-label="Open dashboard page"', html)
-        self.assertIn('id="assigned-task-list-region"', html)
-        self.assertIn('Alt</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> — Focus the assigned task list', html)
+        self.assertIn('id="task-board-region"', html)
+        self.assertIn('Alt</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> — Focus the task board', html)
+        self.assertIn('aria-keyshortcuts="Enter Space ArrowLeft ArrowRight"', html)
 
     def test_settings_page_binds_keyboard_activation_for_action_buttons(self):
         html = (PROJECT_ROOT / "web" / "templates" / "settings.html").read_text(encoding="utf-8")
@@ -100,14 +152,54 @@ class SettingsPanelTests(unittest.TestCase):
     def test_update_organization_settings_as_admin(self):
         response = self.client.post(
             "/settings/organization",
-            json={"name": "i4Edu", "mission": "Educate"},
+            json={"name": "i4Edu", "mission": "Educate", "privacy_jurisdictions": ["EU", "US"]},
             headers=self.admin_headers,
         )
         self.assertEqual(200, response.status_code)
         self.assertEqual(
-            {"name": "i4Edu", "mission": "Educate"},
+            {"name": "i4Edu", "mission": "Educate", "privacy_jurisdictions": ["EU", "US"]},
             response.get_json()["organization_profile"],
         )
+
+    def test_generate_privacy_policy_returns_versions_and_artifacts(self):
+        self.client.post(
+            "/settings/organization",
+            json={
+                "name": "i4Edu",
+                "mission": "Educate",
+                "privacy_email": "privacy@i4edu.example.org",
+                "contact_email": "hello@i4edu.example.org",
+                "privacy_jurisdictions": ["EU", "US"],
+            },
+            headers=self.admin_headers,
+        )
+
+        response = self.client.post(
+            "/settings/privacy-policy",
+            json={
+                "jurisdictions": ["EU", "US"],
+                "output_dir": str(self.output_dir),
+                "effective_date": "2026-07-19",
+            },
+            headers=self.admin_headers,
+        )
+
+        self.assertEqual(201, response.status_code)
+        payload = response.get_json()
+        self.assertEqual("EU", payload["residency_status"]["data_residency"])
+        self.assertEqual(2, len(payload["policies"]))
+        self.assertEqual(2, len(payload["versions"]))
+        first_policy = payload["policies"][0]
+        self.assertTrue(Path(first_policy["html_path"]).exists())
+        self.assertTrue(Path(first_policy["pdf_path"]).exists())
+
+    def test_generate_privacy_policy_requires_admin(self):
+        response = self.client.post(
+            "/settings/privacy-policy",
+            json={"jurisdictions": ["EU"], "output_dir": str(self.output_dir)},
+            headers=self.auditor_headers,
+        )
+        self.assertEqual(403, response.status_code)
 
     def test_update_search_settings_accepts_comma_separated_strings(self):
         response = self.client.post(
@@ -234,9 +326,14 @@ class SettingsPanelTests(unittest.TestCase):
         actions = [entry["action"] for entry in audit_response.get_json()]
         self.assertIn("outreach_sent", actions)
 
-    def test_dashboard_tasks_lists_only_current_users_tasks(self):
+    def test_dashboard_tasks_renders_kanban_board_and_overdue_highlight(self):
         bot = FundingBot(db_path=str(self.db_path))
-        bot.create_task(title="Prepare proposal", assigned_to="staff", description="Draft narrative")
+        bot.create_task(
+            title="Prepare proposal",
+            assigned_to="staff",
+            description="Draft narrative",
+            due_date="2026-07-01",
+        )
         bot.create_task(title="Check audit trail", assigned_to="auditor")
         bot.close()
 
@@ -245,7 +342,10 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertIn(b"Prepare proposal", response.data)
         self.assertNotIn(b"Check audit trail", response.data)
-        self.assertIn(b"Task Dashboard", response.data)
+        self.assertIn(b"Task Board", response.data)
+        self.assertIn(b"Todo", response.data)
+        self.assertIn(b"In Progress", response.data)
+        self.assertIn(b"Overdue", response.data)
 
     def _seed_task_filter_data(self):
         bot = FundingBot(db_path=str(self.db_path))

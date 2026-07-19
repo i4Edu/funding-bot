@@ -3,9 +3,9 @@
 {% block title %}Task Board{% endblock %}
 
 {% block nav_links %}
-        <a class="nav-link app-nav-link" href="{{ url_for('dashboard') }}">Dashboard</a>
-        <a class="nav-link app-nav-link" href="{{ url_for('settings_page') }}">Settings</a>
-        <a class="nav-link app-nav-link" href="{{ url_for('translation_review_dashboard') }}">Translations</a>
+        <a class="nav-link text-white" href="{{ url_for('dashboard') }}" aria-label="Open dashboard page">Dashboard</a>
+        <a class="nav-link text-white" href="{{ url_for('settings_page') }}" aria-label="Open settings page">Settings</a>
+        <a class="nav-link text-white" href="{{ url_for('translation_review_dashboard') }}" aria-label="Open translation review dashboard">Translations</a>
 {% endblock %}
 
 {% block head %}
@@ -22,13 +22,21 @@
         padding: 0.75rem;
       }
 
-      .kanban-dropzone.drag-over {
+      .kanban-dropzone.drag-over,
+      .kanban-dropzone:focus-visible {
         border-color: #198754;
         background: rgba(25, 135, 84, 0.08);
+        outline: 3px solid rgba(25, 135, 84, 0.25);
+        outline-offset: 2px;
       }
 
       .task-card {
         cursor: grab;
+      }
+
+      .task-card:focus-visible {
+        outline: 3px solid #0d6efd;
+        outline-offset: 2px;
       }
 
       .task-card[draggable="false"] {
@@ -48,15 +56,15 @@
           <h1 class="h3 mb-1">Task Board</h1>
           <p class="text-muted mb-0">{{ total_tasks }} task(s) match the active filters. Overdue tasks are highlighted.</p>
         </div>
-        <a class="btn btn-outline-success" href="{{ url_for('list_tasks_route', **task_filters) }}">View JSON API</a>
+        <a class="btn btn-outline-success" href="{{ url_for('list_tasks_route', **task_filters) }}" aria-label="View filtered tasks as JSON" data-keyboard-click>View JSON API</a>
       </div>
 
-      <div id="board-message" class="alert d-none" role="status" aria-live="polite"></div>
+      <div id="board-message" class="alert d-none" role="status" aria-live="polite" aria-atomic="true" tabindex="-1"></div>
 
       <div class="row g-4 mb-4" role="region" aria-label="Task metrics">
         {% for status, total in task_counts.items() %}
         <div class="col-md-6 col-xl-3">
-          <div class="card border-0 shadow-sm h-100">
+          <div class="card border-0 shadow-sm h-100" role="group" aria-label="{{ status.replace('-', ' ').title() }} task count" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted">{{ status.replace('-', ' ').title() }}</h2>
               <p class="display-6 mb-0">{{ total }}</p>
@@ -66,12 +74,13 @@
         {% endfor %}
       </div>
 
-      <div class="card border-0 shadow-sm mb-4">
+      <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="task-filters-heading">
         <div class="card-header bg-white">
-          <h2 class="h5 mb-0">Filters</h2>
+          <h2 class="h5 mb-0" id="task-filters-heading">Filters</h2>
         </div>
         <div class="card-body">
-          <form class="row g-3" method="get" action="{{ url_for('dashboard_tasks') }}">
+          <form class="row g-3" method="get" action="{{ url_for('dashboard_tasks') }}" aria-labelledby="task-filters-heading" aria-describedby="task-filters-help">
+            <p id="task-filters-help" class="text-muted small mb-0">Use Alt+Shift+F to focus filters and Alt+Shift+T to jump to the task board.</p>
             <div class="col-md-3">
               <label class="form-label" for="assignee">Assignee</label>
               {% if can_filter_all_assignees %}
@@ -111,29 +120,35 @@
               </select>
             </div>
             <div class="col-12 d-flex gap-2">
-              <button class="btn btn-success" type="submit">Apply filters</button>
-              <a class="btn btn-outline-secondary" href="{{ url_for('dashboard_tasks') }}">Reset</a>
+              <button class="btn btn-success" type="submit" aria-label="Apply task filters" data-keyboard-click>Apply filters</button>
+              <a class="btn btn-outline-secondary" href="{{ url_for('dashboard_tasks') }}" aria-label="Reset task filters" data-keyboard-click>Reset</a>
             </div>
           </form>
         </div>
-      </div>
+      </section>
 
-      <div class="row g-4" aria-label="Kanban task board">
+      <section id="task-board-region" class="row g-4" aria-label="Kanban task board" tabindex="-1">
         {% for status_name in ['todo', 'in-progress', 'done', 'blocked'] %}
         <div class="col-xl-3 col-md-6">
-          <div class="card border-0 shadow-sm h-100 kanban-column">
+          <section class="card border-0 shadow-sm h-100 kanban-column" role="region" aria-labelledby="column-{{ status_name }}-heading">
             <div class="card-header bg-white d-flex justify-content-between align-items-center">
-              <h2 class="h5 mb-0">{{ status_name.replace('-', ' ').title() }}</h2>
-              <span class="badge text-bg-secondary">{{ task_columns[status_name] | length }}</span>
+              <h2 class="h5 mb-0" id="column-{{ status_name }}-heading">{{ status_name.replace('-', ' ').title() }}</h2>
+              <span class="badge text-bg-secondary" aria-label="{{ task_columns[status_name] | length }} task(s)">{{ task_columns[status_name] | length }}</span>
             </div>
             <div class="card-body">
-              <div class="kanban-dropzone" data-task-status="{{ status_name }}">
+              <div class="kanban-dropzone" id="kanban-{{ status_name }}" data-task-status="{{ status_name }}" role="list" aria-labelledby="column-{{ status_name }}-heading" tabindex="0">
                 {% for task in task_columns[status_name] %}
                 <article
                   class="card shadow-sm mb-3 task-card {% if task.is_overdue %}task-card-overdue{% endif %}"
                   data-task-id="{{ task.id }}"
                   data-task-title="{{ task.title }}"
+                  data-task-status="{{ status_name }}"
+                  data-can-move="{{ 'true' if task.can_move else 'false' }}"
                   draggable="{{ 'true' if task.can_move else 'false' }}"
+                  tabindex="0"
+                  role="button"
+                  aria-label="{{ task.title }}. Status {{ task.status.replace('-', ' ') }}. Assigned to {{ task.assigned_to }}. Due {{ task.due_date or 'none' }}."
+                  aria-keyshortcuts="Enter Space ArrowLeft ArrowRight"
                 >
                   <div class="card-body">
                     <div class="d-flex justify-content-between gap-2 align-items-start mb-2">
@@ -155,29 +170,144 @@
                 {% endfor %}
               </div>
             </div>
-          </div>
+          </section>
         </div>
         {% endfor %}
-      </div>
+      </section>
+
+      <section id="keyboard-shortcuts" class="card border-0 shadow-sm mt-4" role="region" aria-labelledby="keyboard-shortcuts-heading" tabindex="-1">
+        <div class="card-header bg-white">
+          <h2 class="h5 mb-0" id="keyboard-shortcuts-heading">Keyboard shortcuts</h2>
+        </div>
+        <div class="card-body">
+          <p id="keyboard-shortcuts-note" class="text-muted small mb-3">
+            Keyboard navigation follows the filter form and then each task column. On a focused task card, use Left or Right Arrow to move the task between columns.
+          </p>
+          <ul class="list-group list-group-flush small" aria-describedby="keyboard-shortcuts-note">
+            <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>D</kbd> — Open the dashboard</li>
+            <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>S</kbd> — Open settings</li>
+            <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>F</kbd> — Focus filters</li>
+            <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> — Focus the task board</li>
+            <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>K</kbd> — Focus this shortcut help</li>
+            <li class="list-group-item px-0"><kbd>Left</kbd>/<kbd>Right</kbd> Arrow — Move a focused task to the previous or next column</li>
+          </ul>
+        </div>
+      </section>
 {% endblock %}
 
 {% block scripts %}
     <script>
       const boardMessage = document.getElementById("board-message");
-      const taskCards = Array.from(document.querySelectorAll(".task-card[draggable='true']"));
+      const taskCards = Array.from(document.querySelectorAll(".task-card"));
       const dropzones = Array.from(document.querySelectorAll(".kanban-dropzone"));
+      const statusOrder = ["todo", "in-progress", "done", "blocked"];
       let draggedTaskId = null;
+
+      function focusAndScroll(element) {
+        if (!element) {
+          return;
+        }
+        element.focus();
+        element.scrollIntoView({ block: "start", behavior: "smooth" });
+      }
+
+      function bindKeyboardActivation(element) {
+        element.addEventListener("keydown", (event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            element.click();
+          }
+        });
+      }
 
       function showBoardMessage(kind, text) {
         boardMessage.className = `alert alert-${kind}`;
         boardMessage.textContent = text;
+        boardMessage.focus();
       }
 
+      async function moveTask(taskId, nextStatus) {
+        const response = await fetch(`/tasks/${taskId}/status`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ status: nextStatus }),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || "Could not move task.");
+        }
+        showBoardMessage("success", payload.notification || `Task moved to ${nextStatus}.`);
+        window.location.reload();
+      }
+
+      document.querySelectorAll("[data-keyboard-click]").forEach(bindKeyboardActivation);
+
+      document.addEventListener("keydown", (event) => {
+        if (!(event.altKey && event.shiftKey) || event.ctrlKey || event.metaKey) {
+          return;
+        }
+
+        const activeElement = document.activeElement;
+        const isTyping = activeElement && (
+          activeElement.tagName === "INPUT"
+          || activeElement.tagName === "TEXTAREA"
+          || activeElement.tagName === "SELECT"
+          || activeElement.isContentEditable
+        );
+        if (isTyping && !["KeyK", "KeyT"].includes(event.code)) {
+          return;
+        }
+
+        const shortcutActions = {
+          KeyD: () => window.location.assign("{{ url_for('dashboard') }}"),
+          KeyS: () => window.location.assign("{{ url_for('settings_page') }}"),
+          KeyF: () => focusAndScroll(document.getElementById("assignee")),
+          KeyT: () => focusAndScroll(document.getElementById("task-board-region")),
+          KeyK: () => focusAndScroll(document.getElementById("keyboard-shortcuts")),
+        };
+
+        const action = shortcutActions[event.code];
+        if (!action) {
+          return;
+        }
+
+        event.preventDefault();
+        action();
+      });
+
       taskCards.forEach((card) => {
+        if (card.dataset.canMove !== "true") {
+          return;
+        }
+
         card.addEventListener("dragstart", (event) => {
           draggedTaskId = card.dataset.taskId;
           event.dataTransfer.effectAllowed = "move";
           event.dataTransfer.setData("text/plain", draggedTaskId);
+        });
+
+        card.addEventListener("keydown", async (event) => {
+          if (!["ArrowLeft", "ArrowRight", "Enter", " "].includes(event.key)) {
+            return;
+          }
+
+          const currentIndex = statusOrder.indexOf(card.dataset.taskStatus);
+          let nextIndex = currentIndex;
+          if (event.key === "ArrowLeft") {
+            nextIndex = Math.max(0, currentIndex - 1);
+          } else {
+            nextIndex = Math.min(statusOrder.length - 1, currentIndex + 1);
+          }
+          if (nextIndex === currentIndex) {
+            return;
+          }
+
+          event.preventDefault();
+          try {
+            await moveTask(card.dataset.taskId, statusOrder[nextIndex]);
+          } catch (error) {
+            showBoardMessage("danger", error.message || "Could not move task right now.");
+          }
         });
       });
 
@@ -198,20 +328,9 @@
             return;
           }
           try {
-            const response = await fetch(`/tasks/${taskId}/status`, {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({ status: nextStatus }),
-            });
-            const payload = await response.json();
-            if (!response.ok) {
-              showBoardMessage("danger", payload.error || "Could not move task.");
-              return;
-            }
-            showBoardMessage("success", payload.notification || "Task updated.");
-            window.location.reload();
+            await moveTask(taskId, nextStatus);
           } catch (error) {
-            showBoardMessage("danger", "Could not move task right now.");
+            showBoardMessage("danger", error.message || "Could not move task right now.");
           } finally {
             draggedTaskId = null;
           }
