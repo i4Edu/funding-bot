@@ -110,7 +110,9 @@ class CeleryTaskExecutionTests(unittest.TestCase):
             self.assertEqual("completed", task_run["callback_payload"]["state"])
             self.assertEqual(1, len(bot.list_opportunities()))
             self.assertGreaterEqual(
-                {row["name"]: row for row in bot.get_slo_summary()}["task_queue_throughput"]["samples"],
+                {row["name"]: row for row in bot.get_slo_summary()}["task_queue_throughput"][
+                    "samples"
+                ],
                 1,
             )
         finally:

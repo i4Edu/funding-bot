@@ -204,15 +204,11 @@ class WarehouseExportService:
         if output_dir:
             # Sanitize each path component: reject any traversal segments
             sanitized_parts = [
-                os.path.basename(part)
-                for part in Path(output_dir).parts
-                if part not in ("/", "\\")
+                os.path.basename(part) for part in Path(output_dir).parts if part not in ("/", "\\")
             ]
             sanitized_parts = [p for p in sanitized_parts if p and p != ".."]
             if not sanitized_parts:
-                raise ValueError(
-                    "output_dir contains only invalid path components."
-                )
+                raise ValueError("output_dir contains only invalid path components.")
             requested_output = Path(*sanitized_parts)
         else:
             requested_output = Path(".")
@@ -220,9 +216,7 @@ class WarehouseExportService:
         try:
             export_root.relative_to(safe_base)
         except ValueError:
-            raise ValueError(
-                "output_dir resolves outside the allowed export directory."
-            )
+            raise ValueError("output_dir resolves outside the allowed export directory.")
         exported_at = self.bot._to_iso()
         archive_manager = archive_manager or ArchiveManager.from_env()
         artifacts: list[dict[str, Any]] = []

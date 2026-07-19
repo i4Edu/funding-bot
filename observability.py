@@ -126,9 +126,7 @@ def inject_context(carrier: dict[str, str], *, context: Any | None = None) -> di
 def capture_current_context() -> dict[str, str]:
     carrier = inject_context({})
     if "traceparent" not in carrier:
-        carrier["traceparent"] = (
-            f"00-{secrets.token_hex(16)}-{secrets.token_hex(8)}-01"
-        )
+        carrier["traceparent"] = f"00-{secrets.token_hex(16)}-{secrets.token_hex(8)}-01"
     return carrier
 
 

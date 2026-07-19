@@ -1312,7 +1312,9 @@ class PortalConnectorTests(unittest.TestCase):
         def fake_http_client(url, payload, credentials=None, headers=None):
             calls.append((url, dict(payload), dict(headers or {})))
             self.assertEqual("https://projects.propublica.org/nonprofits/api/v2/search.json", url)
-            self.assertTrue(set((headers or {}).keys()).issubset({"traceparent", "tracestate", "baggage"}))
+            self.assertTrue(
+                set((headers or {}).keys()).issubset({"traceparent", "tracestate", "baggage"})
+            )
             if payload["page"] == 0:
                 return {
                     "organizations": [
@@ -3549,7 +3551,9 @@ class WarehouseExportTests(unittest.TestCase):
             )
             self.assertEqual(4, export_report["count"])
             self.assertEqual(export_format, export_report["format"])
-            self.assertTrue(all(Path(artifact["path"]).exists() for artifact in export_report["artifacts"]))
+            self.assertTrue(
+                all(Path(artifact["path"]).exists() for artifact in export_report["artifacts"])
+            )
 
     def test_export_data_warehouse_archives_artifacts_and_logs_audit_event(self):
         export_report = self.bot.export_data_warehouse(

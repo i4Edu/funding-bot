@@ -180,8 +180,7 @@ def _build_observability_compat_module(module: Any) -> Any:
         return normalized.astimezone(timezone.utc).isoformat()
 
     def _ensure_slo_schema(connection: sqlite3.Connection) -> None:
-        connection.execute(
-            """
+        connection.execute("""
             CREATE TABLE IF NOT EXISTS slo_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 slo_name TEXT NOT NULL,
@@ -192,14 +191,11 @@ def _build_observability_compat_module(module: Any) -> Any:
                 metadata_json TEXT NOT NULL DEFAULT '{}',
                 recorded_at TEXT NOT NULL
             )
-            """
-        )
-        connection.execute(
-            """
+            """)
+        connection.execute("""
             CREATE INDEX IF NOT EXISTS idx_slo_events_name_recorded_at
             ON slo_events(slo_name, recorded_at DESC)
-            """
-        )
+            """)
 
     def _record_slo_event(
         slo_name: str,
@@ -271,13 +267,16 @@ def _build_observability_compat_module(module: Any) -> Any:
         latencies = [float(row["latency_seconds"]) for row in rows]
         total = len(rows)
         failures = sum(1 for row in rows if not bool(row["success"]))
-        successful_units = sum(float(row["throughput_units"]) for row in rows if bool(row["success"]))
+        successful_units = sum(
+            float(row["throughput_units"]) for row in rows if bool(row["success"])
+        )
         error_rate = failures / total if total else 0.0
         throughput_per_hour = successful_units / float(definition["window_hours"] or 1)
         latency_p95 = _percentile(latencies, 0.95)
         latency_p50 = _percentile(latencies, 0.50)
         latency_compliance = (
-            sum(1 for latency in latencies if latency <= definition["latency_target_seconds"]) / total
+            sum(1 for latency in latencies if latency <= definition["latency_target_seconds"])
+            / total
             if total
             else 0.0
         )
@@ -324,7 +323,9 @@ def _build_observability_compat_module(module: Any) -> Any:
             _ensure_slo_schema(connection)
             summaries = []
             for definition in slo_definitions:
-                cutoff = _to_iso(datetime.now(timezone.utc) - timedelta(hours=definition["window_hours"]))
+                cutoff = _to_iso(
+                    datetime.now(timezone.utc) - timedelta(hours=definition["window_hours"])
+                )
                 rows = connection.execute(
                     """
                     SELECT component, latency_seconds, success, throughput_units
@@ -429,9 +430,8 @@ from observability import (
 )
 from warehouse_exports import ArchiveManager, WarehouseExportService
 
-if (
-    getattr(ArchiveManager, "__init__", object.__init__) is object.__init__
-    or not hasattr(WarehouseExportService, "export")
+if getattr(ArchiveManager, "__init__", object.__init__) is object.__init__ or not hasattr(
+    WarehouseExportService, "export"
 ):
     _load_local_module(
         "warehouse_exports",

@@ -89,7 +89,7 @@ def test_discovery_submission_and_reporting_flow(smoke_client: dict[str, object]
     assert submit.status_code == 201
     assert detail.status_code == 200
     assert detail.get_json()["application"]["status"] == "submitted"
-    assert any(entry["action"] == "application_submitted" for entry in audit_log.get_json())
+    assert any(entry["action"] == "application_recorded" for entry in audit_log.get_json())
 
 
 def test_task_board_and_assignment_flow(smoke_client: dict[str, object]) -> None:
@@ -126,7 +126,7 @@ def test_task_board_and_assignment_flow(smoke_client: dict[str, object]) -> None
     assert b"Task Board" in board.data
     assert transition.status_code == 200
     assert updated.status_code == 200
-    assert updated.get_json()["status"] == "in_progress"
+    assert updated.get_json()["status"] == "in-progress"
 
 
 def test_donor_outreach_and_analytics_flow(smoke_client: dict[str, object]) -> None:

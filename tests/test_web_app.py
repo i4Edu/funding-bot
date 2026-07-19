@@ -646,7 +646,9 @@ class SettingsPanelTests(unittest.TestCase):
         metrics_response = self.client.get("/metrics", headers=self.admin_headers)
         body = metrics_response.data.decode("utf-8")
         self.assertIn('funding_bot_slo_compliance{operation="dashboard_response_time"}', body)
-        self.assertIn('funding_bot_slo_latency_p95_seconds{operation="task_queue_throughput"}', body)
+        self.assertIn(
+            'funding_bot_slo_latency_p95_seconds{operation="task_queue_throughput"}', body
+        )
 
     def test_analytics_endpoints_expose_funnel_costs_and_alerts(self):
         bot = FundingBot(db_path=str(self.db_path), trusted_sources={"Grants Portal"})

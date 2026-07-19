@@ -788,7 +788,8 @@ def _build_cors_preflight_response() -> Response:
     origin = _origin_from_request()
     if not _is_allowed_cors_origin(origin):
         return _json_error("Origin not allowed for this API.", 403)
-    assert origin is not None, "Origin must be non-None when CORS validation passes"
+    if origin is None:  # pragma: no cover – defensive guard
+        return _json_error("Origin not allowed for this API.", 403)
     response = app.response_class(status=204)
     return _apply_cors_headers(response, origin=origin, preflight=True)
 
@@ -839,8 +840,7 @@ def attach_security_headers(response: Response) -> Response:
         )
     if _is_api_route(request.path):
         origin = _origin_from_request()
-        if _is_allowed_cors_origin(origin):
-            assert origin is not None, "Origin must be non-None when CORS validation passes"
+        if _is_allowed_cors_origin(origin) and origin is not None:
             response = _apply_cors_headers(
                 response,
                 origin=origin,
@@ -2893,9 +2893,7 @@ def metrics() -> Response:
     queue_health = _get_queue_health_snapshot()
     queue_status_value = 1 if queue_health["status"] == "ok" else 0
     health_metrics = _health_check_metrics_snapshot()
-    connector_metrics = _string_iterable_or_empty(
-        FundingBot.render_connector_metrics_prometheus()
-    )
+    connector_metrics = _string_iterable_or_empty(FundingBot.render_connector_metrics_prometheus())
     batch_metrics = _string_iterable_or_empty(FundingBot.render_batch_metrics_prometheus())
     task_assignments = conn.execute("""
         SELECT assigned_to AS assignee, COUNT(*) AS total

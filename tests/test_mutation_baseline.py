@@ -108,7 +108,9 @@ class MutationBaselineTests(unittest.TestCase):
         class _Result:
             id = "job-123"
 
-        with mock.patch.object(task_queue.discover_opportunities_task, "delay", return_value=_Result()):
+        with mock.patch.object(
+            task_queue.discover_opportunities_task, "delay", return_value=_Result()
+        ):
             status_code, payload = task_queue.dispatch_discovery(
                 keywords=["education"],
                 trusted_sources=["CSR Network"],
