@@ -249,7 +249,7 @@ _A prioritized backlog of 200 actionable tasks expanding on the open items in `r
 57. [ ] Add tests covering task assignment and status transition logic
 58. [ ] Add documentation describing the collaboration workflow
 59. [ ] Add filtering/sorting of tasks by assignee, status, and due date
-60. [ ] Add bulk task import from CSV for onboarding existing work
+60. [x] Add bulk task import from CSV for onboarding existing work
 
 ### Compliance & Accessibility
 
