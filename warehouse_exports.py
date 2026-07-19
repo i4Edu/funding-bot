@@ -200,12 +200,17 @@ class WarehouseExportService:
     ) -> dict[str, Any]:
         normalized_datasets = normalize_datasets(datasets)
         normalized_format = normalize_export_format(export_format)
-        export_root = Path(output_dir or DEFAULT_EXPORT_OUTPUT_DIR)
-        # Prevent path traversal: reject paths containing '..' components
-        if ".." in export_root.parts:
+        safe_base = Path(DEFAULT_EXPORT_OUTPUT_DIR).resolve()
+        requested_output = Path(output_dir) if output_dir else Path(".")
+        if requested_output.is_absolute():
+            requested_output = Path(*requested_output.parts[1:])
+        export_root = (safe_base / requested_output).resolve()
+        try:
+            export_root.relative_to(safe_base)
+        except ValueError as exc:
             raise ValueError(
-                f"output_dir {str(output_dir)!r} must not contain '..' path components."
-            )
+                f"output_dir {str(output_dir)!r} resolves outside the allowed export directory."
+            ) from exc
         exported_at = self.bot._to_iso()
         archive_manager = archive_manager or ArchiveManager.from_env()
         artifacts: list[dict[str, Any]] = []
