@@ -217,7 +217,9 @@ class WarehouseExportService:
         else:
             requested_output = Path(".")
         export_root = (safe_base / requested_output).resolve()
-        if not str(export_root).startswith(str(safe_base)):
+        try:
+            export_root.relative_to(safe_base)
+        except ValueError:
             raise ValueError(
                 "output_dir resolves outside the allowed export directory."
             )
