@@ -494,8 +494,10 @@ class SettingsPanelTests(unittest.TestCase):
                 self.assertEqual(200, response.status_code)
                 expected_titles = [
                     task["title"]
-                    for task in tasks
-                    if matches(task, active_filters)
+                    for task in sorted(
+                        (task for task in tasks if matches(task, active_filters)),
+                        key=lambda task: (task["due_date"] is None, task["due_date"], task["id"]),
+                    )
                 ]
                 self.assertEqual(
                     expected_titles,

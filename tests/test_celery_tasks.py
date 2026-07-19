@@ -110,8 +110,7 @@ class CeleryTaskExecutionTests(unittest.TestCase):
         finally:
             bot.close()
 
-        result = task_queue.send_outreach_task.run(
-            None,
+        result = task_queue.send_outreach_task(
             donor_email="bangla@example.org",
             donor_name="দাতা",
             template_name="intro",

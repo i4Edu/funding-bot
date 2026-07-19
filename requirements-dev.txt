@@ -1,3 +1,5 @@
 -r web/requirements.txt
 hypothesis>=6.129.0,<7
 locust>=2.31.8,<3
+zope.event>=5.0,<7
+zope.interface>=7.2,<8

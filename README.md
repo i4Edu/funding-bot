@@ -10,6 +10,7 @@ For planned milestones and release scope, see [roadmap.md](roadmap.md).
 For connector implementation and keyword-mapping guidance, see [docs/CONNECTORS.md](docs/CONNECTORS.md).
 For the full Flask endpoint reference, example requests, authentication rules, and error formats, see [docs/API.md](docs/API.md).
 For collaboration workflow, permissions, and task API examples, see [docs/COLLABORATION.md](docs/COLLABORATION.md).
+For the complete JSON/text API contract, schemas, diagrams, and curl examples, see [docs/API_REFERENCE.md](docs/API_REFERENCE.md).
 For deployment and scaling guidance, see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 For a fast local setup guide, see [docs/QUICKSTART.md](docs/QUICKSTART.md).
 For the complete environment variable reference, see [docs/ENV_VARS.md](docs/ENV_VARS.md).
@@ -497,14 +498,19 @@ Environment variables:
 | `PORTAL_CACHE_TTL` | `300` | Global connector cache TTL in seconds. |
 | `GRANTS_GOV_API_CREDENTIALS` | *(unset)* | Optional Grants.gov auth JSON (`api_key`, `access_token`, or OAuth2 client-credentials config). |
 | `CSR_NETWORK_API_CREDENTIALS` | *(unset)* | Candid Open RFP subscription key JSON for the CSR connector. |
+| `FOUNDATION_DIRECTORY_API_CREDENTIALS` | *(unset)* | Candid Grants API credentials JSON (`api_key`) for the Foundation Directory connector. |
 | `GRANTS_GOV_API_BASE_URL` | `https://api.grants.gov/v1/api/search2` | Grants.gov search endpoint override. |
 | `CSR_NETWORK_API_BASE_URL` | `https://api.candid.org/rfp/v1/opportunity` | CSR connector endpoint override. |
+| `NGO_DIRECTORY_API_BASE_URL` | `https://projects.propublica.org/nonprofits/api/v2/search.json` | ProPublica Nonprofit Explorer search endpoint override. |
+| `FOUNDATION_DIRECTORY_API_BASE_URL` | `https://api.candid.org/grants/v1/transactions` | Candid Grants API endpoint override for private-foundation listings. |
 | `GRANTS_PORTAL_PAGE_SIZE` | inherits `PORTAL_PAGE_SIZE` | Page size override for the Grants Portal connector. |
 | `GRANTS_PORTAL_CACHE_TTL` | inherits `PORTAL_CACHE_TTL` | Cache TTL override for the Grants Portal connector. |
 | `CSR_NETWORK_PAGE_SIZE` | inherits `PORTAL_PAGE_SIZE` | Page size override for the CSR Network connector. |
 | `CSR_NETWORK_CACHE_TTL` | inherits `PORTAL_CACHE_TTL` | Cache TTL override for the CSR Network connector. |
 | `NGO_DIRECTORY_PAGE_SIZE` | inherits `PORTAL_PAGE_SIZE` | Page size override for the NGO Directory connector. |
 | `NGO_DIRECTORY_CACHE_TTL` | inherits `PORTAL_CACHE_TTL` | Cache TTL override for the NGO Directory connector. |
+| `FOUNDATION_DIRECTORY_PAGE_SIZE` | inherits `PORTAL_PAGE_SIZE` | Page size override for the Foundation Directory connector. |
+| `FOUNDATION_DIRECTORY_CACHE_TTL` | inherits `PORTAL_CACHE_TTL` | Cache TTL override for the Foundation Directory connector. |
 | `GLOBALGIVING_PAGE_SIZE` | inherits `PORTAL_PAGE_SIZE` | Page size override for the GlobalGiving connector. |
 | `GLOBALGIVING_CACHE_TTL` | inherits `PORTAL_CACHE_TTL` | Cache TTL override for the GlobalGiving connector. |
 | `KICKSTARTER_FOR_GOOD_PAGE_SIZE` | inherits `PORTAL_PAGE_SIZE` | Page size override for the Kickstarter for Good connector. |
@@ -542,6 +548,10 @@ without exhausting their quotas.
 | --- | --- | --- |
 | `PORTAL_RATE_LIMIT_DEFAULT_CAPACITY` | `5` | Global burst size per connector. |
 | `PORTAL_RATE_LIMIT_DEFAULT_REFILL_RATE` | `1` | Global refill rate in tokens per second. |
+| `NGO_DIRECTORY_RATE_LIMIT_CAPACITY` | inherits global default | NGO Directory-specific burst size. |
+| `NGO_DIRECTORY_RATE_LIMIT_REFILL_RATE` | inherits global default | NGO Directory-specific refill rate. |
+| `FOUNDATION_DIRECTORY_RATE_LIMIT_CAPACITY` | inherits global default | Foundation Directory-specific burst size. |
+| `FOUNDATION_DIRECTORY_RATE_LIMIT_REFILL_RATE` | inherits global default | Foundation Directory-specific refill rate. |
 | `GLOBALGIVING_RATE_LIMIT_CAPACITY` | inherits global default | GlobalGiving-specific burst size. |
 | `GLOBALGIVING_RATE_LIMIT_REFILL_RATE` | inherits global default | GlobalGiving-specific refill rate. |
 | `KICKSTARTER_FOR_GOOD_RATE_LIMIT_CAPACITY` | inherits global default | Kickstarter-specific burst size. |

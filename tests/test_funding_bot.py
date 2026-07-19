@@ -813,7 +813,13 @@ class TaskFilteringFundingBotTests(unittest.TestCase):
 
         for size in range(1, len(filter_values) + 1):
             for active_filters in itertools.combinations(filter_values, size):
-                expected_titles = [task["title"] for task in tasks if matches(task, active_filters)]
+                expected_titles = [
+                    task["title"]
+                    for task in sorted(
+                        (task for task in tasks if matches(task, active_filters)),
+                        key=lambda task: (task["due_date"] is None, task["due_date"], task["id"]),
+                    )
+                ]
                 rows = self.bot.list_tasks(
                     assigned_to=filter_values["assigned_to"] if "assigned_to" in active_filters else None,
                     status=filter_values["status"] if "status" in active_filters else None,

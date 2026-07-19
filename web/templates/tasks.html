@@ -64,9 +64,9 @@
       <div class="row g-4 mb-4" aria-label="Task metrics">
         {% for status, total in task_counts.items() %}
         <div class="col-md-6 col-xl-3">
-          <div class="card border-0 shadow-sm h-100" role="group" aria-label="{{ status.replace('_', ' ').replace('-', ' ').title() }} task count" tabindex="0">
+          <div class="card border-0 shadow-sm h-100" role="group" aria-label="{{ status.replace('-', ' ').title() }} task count" tabindex="0">
             <div class="card-body">
-              <h2 class="h6 text-muted">{{ status.replace('_', ' ').replace('-', ' ').title() }}</h2>
+              <h2 class="h6 text-muted">{{ status.replace('-', ' ').title() }}</h2>
               <p class="display-6 mb-0">{{ total }}</p>
             </div>
           </div>
@@ -98,8 +98,8 @@
               <label class="form-label" for="status">Status</label>
               <select class="form-select" id="status" name="status">
                 <option value="">All statuses</option>
-                {% for status_name in ['pending', 'in_progress', 'completed', 'blocked'] %}
-                <option value="{{ status_name }}" {% if task_filters.status == status_name %}selected{% endif %}>{{ status_name.replace('_', ' ').replace('-', ' ').title() }}</option>
+                {% for status_name in ['todo', 'in-progress', 'done', 'blocked'] %}
+                <option value="{{ status_name }}" {% if task_filters.status == status_name %}selected{% endif %}>{{ status_name.replace('-', ' ').title() }}</option>
                 {% endfor %}
               </select>
             </div>
@@ -128,11 +128,11 @@
       </section>
 
       <section id="task-board-region" class="row g-4" aria-label="Kanban task board" tabindex="-1">
-        {% for status_name in ['pending', 'in_progress', 'completed', 'blocked'] %}
+        {% for status_name in ['todo', 'in-progress', 'done', 'blocked'] %}
         <div class="col-xl-3 col-md-6">
           <section class="card border-0 shadow-sm h-100 kanban-column" role="region" aria-labelledby="column-{{ status_name }}-heading">
             <div class="card-header bg-white d-flex justify-content-between align-items-center">
-              <h2 class="h5 mb-0" id="column-{{ status_name }}-heading">{{ status_name.replace('_', ' ').replace('-', ' ').title() }}</h2>
+              <h2 class="h5 mb-0" id="column-{{ status_name }}-heading">{{ status_name.replace('-', ' ').title() }}</h2>
               <span class="badge text-bg-secondary" aria-label="{{ task_columns[status_name] | length }} task(s)">{{ task_columns[status_name] | length }}</span>
             </div>
             <div class="card-body">
@@ -147,7 +147,7 @@
                   draggable="{{ 'true' if task.can_move else 'false' }}"
                   tabindex="0"
                   role="listitem"
-                  aria-label="{{ task.title }}. Status {{ task.status.replace('_', ' ').replace('-', ' ') }}. Assigned to {{ task.assigned_to }}. Due {{ task.due_date or 'none' }}."
+                  aria-label="{{ task.title }}. Status {{ task.status.replace('-', ' ') }}. Assigned to {{ task.assigned_to }}. Due {{ task.due_date or 'none' }}."
                   aria-keyshortcuts="Enter Space ArrowLeft ArrowRight"
                 >
                   <div class="card-body">
@@ -161,12 +161,12 @@
                     <div class="small mb-3">{{ task.description or 'No description provided.' }}</div>
                     <div class="d-flex flex-wrap gap-2 small">
                       <span class="badge text-bg-light border">Due: {{ task.due_date or 'None' }}</span>
-                      <span class="badge text-bg-secondary">{{ task.status.replace('_', ' ').replace('-', ' ').title() }}</span>
+                      <span class="badge text-bg-secondary">{{ task.status.replace('-', ' ').title() }}</span>
                     </div>
                   </div>
                 </article>
                 {% else %}
-                <p role="listitem" class="text-muted small mb-0">No {{ status_name.replace('_', ' ').replace('-', ' ') }} tasks.</p>
+                <p role="listitem" class="text-muted small mb-0">No {{ status_name.replace('-', ' ') }} tasks.</p>
                 {% endfor %}
               </div>
             </div>
@@ -200,7 +200,7 @@
       const boardMessage = document.getElementById("board-message");
       const taskCards = Array.from(document.querySelectorAll(".task-card"));
       const dropzones = Array.from(document.querySelectorAll(".kanban-dropzone"));
-      const statusOrder = ["pending", "in_progress", "completed", "blocked"];
+      const statusOrder = ["todo", "in-progress", "done", "blocked"];
       let draggedTaskId = null;
 
       function focusAndScroll(element) {

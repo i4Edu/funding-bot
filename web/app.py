@@ -1440,8 +1440,8 @@ def metrics() -> Response:
         "completed": 0,
         "failed": 0,
         "cancelled": 0,
-        "retry_attempts": 0,
-        "dead_letter": 0,
+        "retries_scheduled": 0,
+        "dead_lettered": 0,
         "duplicate_preventions": 0,
     }
     if isinstance(raw_queue_metrics, dict):

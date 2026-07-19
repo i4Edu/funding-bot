@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import signal
+import socket
 import ssl
 import smtplib
 import sqlite3
@@ -28,6 +29,8 @@ from xml.sax.saxutils import escape
 
 import requests
 from jsonschema import ValidationError, validate
+from cache_manager import CacheManager
+from database import DatabaseManager
 try:
     import requests
     from requests import exceptions as requests_exceptions
@@ -296,6 +299,43 @@ class _TTLCache:
             "size": len(self._store),
             "ttl_seconds": self._ttl,
         }
+
+
+_DEFAULT_CACHE_MANAGER: CacheManager | None = None
+
+
+def default_cache_manager() -> CacheManager:
+    global _DEFAULT_CACHE_MANAGER
+    if _DEFAULT_CACHE_MANAGER is None:
+        _DEFAULT_CACHE_MANAGER = CacheManager()
+    return _DEFAULT_CACHE_MANAGER
+
+
+class _ManagedTTLCache:
+    """Cache adapter backed by the shared cache manager."""
+
+    def __init__(self, *, namespace: str, scope: str, ttl_seconds: float) -> None:
+        self._region = default_cache_manager().make_region(
+            namespace,
+            scope=scope,
+            ttl_seconds=ttl_seconds,
+        )
+
+    def get(self, key: Any) -> tuple[bool, Any]:
+        return self._region.get(key)
+
+    def set(self, key: Any, value: Any) -> None:
+        tags = [str(key[0])] if isinstance(key, tuple) and key else None
+        self._region.set(key, value, tags=tags)
+
+    def invalidate(self, key: Any) -> None:
+        self._region.invalidate(key)
+
+    def clear(self) -> None:
+        self._region.clear()
+
+    def stats(self) -> dict[str, float | int | str]:
+        return self._region.stats()
 
 
 def _parse_secret_payload(raw_value: str) -> dict[str, Any]:
@@ -1052,6 +1092,7 @@ class _BasePortalConnector:
         time_func: Callable[[], float] | None = None,
         rate_limit_config: dict[str, float] | None = None,
         rate_limiter: TokenBucketRateLimiter | None = None,
+        cache_manager: CacheManager | None = None,
     ) -> None:
         self.http_client = http_client
         self.base_url = _require_https_url(
@@ -1067,7 +1108,12 @@ class _BasePortalConnector:
         self.transport = transport
         self.page_size = self._resolve_page_size(page_size)
         cache_ttl = self._resolve_cache_ttl(cache_ttl)
-        self._cache = _TTLCache(ttl_seconds=cache_ttl)
+        self._cache_manager = cache_manager or default_cache_manager()
+        self._cache = _ManagedTTLCache(
+            namespace="connector-data",
+            scope=self.connector_slug,
+            ttl_seconds=cache_ttl,
+        )
         self.max_retries = max(0, max_retries)
         self.retry_backoff_base = max(0.0, retry_backoff_base)
         self.retry_backoff_factor = max(1.0, retry_backoff_factor)
@@ -1571,6 +1617,20 @@ class _BasePortalConnector:
                     continue
             return self.http_client(url, params)
 
+        if self._request_session is not None:
+            return _perform_json_request(
+                "GET",
+                url,
+                session=self._get_request_session(),
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "funding-bot/1.0",
+                    **(headers or {}),
+                },
+                params=params,
+                timeout=self.request_timeout,
+            )
+
         query_items: list[tuple[str, str]] = []
         for key, value in params.items():
             if value is None:
@@ -1972,7 +2032,12 @@ class CSRNetworkConnector(_BasePortalConnector):
         if self.http_client is not None:
             return super()._fetch_remote_result(keywords)
 
-        credentials = self._get_resolved_credentials()
+        try:
+            credentials = self._get_resolved_credentials()
+        except CredentialNotFoundError as exc:
+            raise CredentialNotFoundError(
+                "CSR Network connector requires a Candid subscription_key/api_key credential."
+            ) from exc
         subscription_key = str(
             credentials.get("subscription_key")
             or credentials.get("api_key")
@@ -2096,6 +2161,23 @@ class NGODirectoryConnector(_BasePortalConnector):
     }
     default_page_size = 25
 
+    def __init__(
+        self,
+        http_client: Callable[..., Any] | None = None,
+        *,
+        base_url: str | None = None,
+        request_session: Any | None = None,
+        transport: str = "demo",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            http_client,
+            base_url=base_url or os.environ.get("NGO_DIRECTORY_API_BASE_URL") or self.base_url,
+            request_session=request_session,
+            transport=transport,
+            **kwargs,
+        )
+
     def _fetch_remote_result(self, keywords: list[str]) -> dict[str, Any]:
         search_terms = keywords or ["nonprofit"]
         opportunities: list[dict[str, Any]] = []
@@ -2213,6 +2295,29 @@ class FoundationDirectoryConnector(_BasePortalConnector):
         },
     }
 
+    def __init__(
+        self,
+        http_client: Callable[..., Any] | None = None,
+        *,
+        base_url: str | None = None,
+        credentials: dict[str, Any] | None = None,
+        credential_name: str | None = None,
+        credential_vault: CredentialVault | OAuth2ClientCredentialsVault | None = None,
+        request_session: Any | None = None,
+        transport: str = "demo",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            http_client,
+            base_url=base_url or os.environ.get("FOUNDATION_DIRECTORY_API_BASE_URL") or self.base_url,
+            credentials=credentials,
+            credential_name=credential_name or "FOUNDATION_DIRECTORY_API_CREDENTIALS",
+            credential_vault=credential_vault,
+            request_session=request_session,
+            transport=transport,
+            **kwargs,
+        )
+
     def _fetch_remote_result(self, keywords: list[str]) -> dict[str, Any]:
         credentials = self._get_resolved_credentials()
         api_key = str(credentials.get("api_key") or credentials.get("secret") or "").strip()
@@ -2239,7 +2344,7 @@ class FoundationDirectoryConnector(_BasePortalConnector):
                     "sort_order": "desc",
                     "transaction": "TA",
                 },
-                headers={"X-API-Key": api_key},
+                headers={"x-api-key": api_key},
             )
             page_payload, _, page_response_keys, next_page = self._parse_remote_page(
                 response,
@@ -3345,7 +3450,8 @@ class FundingBot:
                 external_id TEXT UNIQUE,
                 title TEXT NOT NULL,
                 description TEXT NOT NULL DEFAULT '',
-                assignee TEXT NOT NULL,
+                assignee TEXT,
+                assigned_to TEXT,
                 status TEXT NOT NULL,
                 due_date TEXT,
                 source TEXT NOT NULL DEFAULT 'manual',
@@ -3631,7 +3737,8 @@ class FundingBot:
                     external_id TEXT UNIQUE,
                     title TEXT NOT NULL,
                     description TEXT NOT NULL DEFAULT '',
-                    assignee TEXT NOT NULL,
+                    assignee TEXT,
+                    assigned_to TEXT,
                     status TEXT NOT NULL,
                     due_date TEXT,
                     source TEXT NOT NULL DEFAULT 'manual',
@@ -3649,6 +3756,7 @@ class FundingBot:
                     external_id,
                     title,
                     COALESCE(description, ''),
+                    LOWER(assigned_to),
                     LOWER(assigned_to),
                     CASE LOWER(status)
                         WHEN 'pending' THEN 'todo'
@@ -3720,6 +3828,7 @@ class FundingBot:
             "segment",
             "locale",
             "external_id",
+            "assigned_to",
             "due_date",
             "source",
             "assignee_email",
@@ -4032,9 +4141,10 @@ class FundingBot:
                     external_id TEXT UNIQUE,
                     title TEXT NOT NULL,
                     description TEXT NOT NULL DEFAULT '',
-                    assignee TEXT NOT NULL,
+                    assignee TEXT,
+                    assigned_to TEXT,
                     status TEXT NOT NULL,
-                    due_date TEXT NOT NULL,
+                    due_date TEXT,
                     source TEXT NOT NULL DEFAULT 'manual',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -4042,7 +4152,7 @@ class FundingBot:
                     assignee_name TEXT
                 );
                 INSERT INTO tasks (
-                    id, external_id, title, description, assignee, status, due_date,
+                    id, external_id, title, description, assignee, assigned_to, status, due_date,
                     source, created_at, updated_at, assignee_email, assignee_name
                 )
                 SELECT
@@ -4051,13 +4161,14 @@ class FundingBot:
                     title,
                     COALESCE(description, ''),
                     LOWER(assigned_to),
+                    LOWER(assigned_to),
                     CASE LOWER(status)
-                        WHEN 'todo' THEN 'pending'
-                        WHEN 'in-progress' THEN 'in_progress'
-                        WHEN 'done' THEN 'completed'
-                        ELSE REPLACE(LOWER(status), '-', '_')
+                        WHEN 'pending' THEN 'todo'
+                        WHEN 'in_progress' THEN 'in-progress'
+                        WHEN 'completed' THEN 'done'
+                        ELSE LOWER(status)
                     END,
-                    COALESCE(date(due_date), date(updated_at), date(created_at), date('now')),
+                    date(due_date),
                     COALESCE(source, 'manual'),
                     created_at,
                     updated_at,
@@ -4070,6 +4181,7 @@ class FundingBot:
         self._ensure_column("tasks", "external_id", "TEXT")
         self._ensure_column("tasks", "due_date", "TEXT")
         self._ensure_column("tasks", "source", "TEXT NOT NULL DEFAULT 'manual'")
+        self._ensure_column("tasks", "assigned_to", "TEXT")
         self._ensure_column("tasks", "assignee_email", "TEXT")
         self._ensure_column("tasks", "assignee_name", "TEXT")
         self.connection.execute("CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee)")
@@ -9266,7 +9378,7 @@ def main(argv: list[str] | None = None) -> None:
     bot = FundingBot(db_path=args.db)
     try:
         if args.command == "send-daily-summary":
-            from celery_tasks import send_daily_summary_task
+            from tasks.celery_tasks import send_daily_summary_task
 
             _queue_async_task(
                 "send-daily-summary",
@@ -9333,7 +9445,7 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 print(report_json)
         elif args.command == "discover":
-            from celery_tasks import discover_task
+            from tasks.celery_tasks import discover_task
 
             _queue_async_task(
                 "discover",
@@ -9353,7 +9465,7 @@ def main(argv: list[str] | None = None) -> None:
             )
             print(json.dumps(validation, indent=2))
         elif args.command == "send-outreach":
-            from celery_tasks import send_outreach_task
+            from tasks.celery_tasks import send_outreach_task
 
             _queue_async_task(
                 "send-outreach",
