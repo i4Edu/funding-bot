@@ -9,11 +9,11 @@ test("admin can run settings, connector, task, and export workflows", async ({ b
   await page.goto(`${baseURL}/settings`);
   await page.getByLabel("Organization name").fill("i4Edu Labs");
   await page.getByLabel("Mission").fill("Expand access to equitable education and digital learning.");
-  await page.getByRole("button", { name: "Save profile" }).click();
+  await page.getByRole("button", { name: "Save organization profile" }).click();
   await expect(page.locator("#organization-result")).toHaveText("Profile saved.");
 
   await page.getByLabel("Keyword filters (comma-separated)").fill("education, community, innovation");
-  await page.getByRole("button", { name: "Save search settings" }).click();
+  await page.getByRole("button", { name: "Save donation search settings" }).click();
   await expect(page.locator("#search-result")).toHaveText("Search settings saved.");
 
   await page.getByLabel("Credential alias").fill("grants-api");
@@ -22,21 +22,21 @@ test("admin can run settings, connector, task, and export workflows", async ({ b
   await page.waitForLoadState("networkidle");
   await expect(page.getByText("grants-api")).toBeVisible();
 
-  await page.getByRole("button", { name: "Run discovery now" }).click();
+  await page.getByRole("button", { name: "Run donation discovery now" }).click();
   await expect(page.locator("#discovery-result")).toContainText("\"count\":");
   await expect(page.locator("#discovery-result")).toContainText("Education");
 
   await page.getByLabel("Effective date").fill("2026-07-19");
-  await page.getByRole("button", { name: "Generate HTML/PDF" }).click();
+  await page.getByRole("button", { name: "Generate privacy policy" }).click();
   await page.waitForLoadState("networkidle");
   await expect(page.getByText(/EU/)).toBeVisible();
 
   await page.getByLabel("Donor email address").fill("donor@example.org");
   await page.getByLabel("Donor name").fill("Donor Name");
-  await page.getByRole("button", { name: "Send test outreach" }).click();
+  await page.getByRole("button", { name: "Send donor outreach test" }).click();
   await expect(page.locator("#outreach-result")).toContainText("donor@example.org");
 
-  await page.getByRole("link", { name: "My Tasks" }).click();
+  await page.getByRole("link", { name: "Open my tasks dashboard" }).click();
   await expect(page.getByRole("heading", { name: "Task Board" })).toBeVisible();
 
   await page.getByLabel("Task title").fill("Playwright created task");
@@ -67,7 +67,7 @@ test("admin can run settings, connector, task, and export workflows", async ({ b
   await exportPage.waitForLoadState("domcontentloaded");
   await expect(exportPage.locator("body")).toContainText("Playwright edited task");
 
-  await page.getByRole("link", { name: "Dashboard" }).click();
+  await page.getByRole("link", { name: "Open dashboard page" }).click();
   await expect(page.getByText("Education Innovation Grant")).toBeVisible();
 
   await context.close();

@@ -4,20 +4,23 @@ import asyncio
 import base64
 import csv
 import hashlib
+import html
 import inspect
 import io
 import json
 import logging
 import os
 import re
+import secrets
 import signal
-import socket
-import ssl
 import smtplib
+import socket
 import sqlite3
+import ssl
 import sys
 import threading
 import time
+import unicodedata
 import urllib.parse
 import zipfile
 from contextlib import asynccontextmanager, contextmanager
@@ -28,16 +31,34 @@ from decimal import Decimal
 from email.mime.text import MIMEText
 from numbers import Number
 from pathlib import Path
+from statistics import mean, pstdev
 from typing import Any, Callable, Iterable, Protocol
 from xml.sax.saxutils import escape
 
 import requests
+import pyotp
 from jsonschema import ValidationError, validate
-from cache_manager import CacheManager
+
+from cli_config import load_cli_config
 from database import DatabaseManager
+from observability import (
+    capture_current_context,
+    configure_tracing,
+    current_trace_id,
+    ensure_slo_schema,
+    inject_context,
+    record_slo_event,
+    render_slo_prometheus,
+    set_span_error,
+    start_span,
+    summarize_slos,
+)
+from opentelemetry.trace import SpanKind
 from warehouse_exports import ArchiveManager, WarehouseExportService
+
 try:
-    from colorama import Fore, Style, init as colorama_init
+    from colorama import Fore, Style
+    from colorama import init as colorama_init
 except ImportError:  # pragma: no cover - exercised when optional CLI extras are absent
     class _ColorFallback:
         BLACK = ""
@@ -104,6 +125,10 @@ except ImportError:  # pragma: no cover - exercised when rich is unavailable
 # ---------------------------------------------------------------------------
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_SAFE_CREDENTIAL_ALIAS_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_SAFE_ENV_VAR_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]{0,127}$")
+_SAFE_AUTH_ROLE_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_UNSAFE_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]")
 _UNSET = object()
 _TRANSIENT_CONNECTOR_ERRORS = (TimeoutError, ConnectionError, OSError)
 if requests_exceptions is not None:  # pragma: no branch - import-time constant setup
@@ -188,6 +213,119 @@ def _validate_email(email: str) -> str:
     if not _EMAIL_RE.match(stripped):
         raise ValueError(f"Invalid email address: {stripped!r}")
     return stripped
+
+
+def escape_html_text(value: Any) -> str:
+    """Return HTML-escaped text for untrusted user-supplied values."""
+    normalized = html.unescape(unicodedata.normalize("NFKC", str(value)))
+    return html.escape(normalized, quote=True)
+
+
+def sanitize_user_string(
+    value: Any,
+    *,
+    field_name: str = "value",
+    allow_empty: bool = True,
+    multiline: bool = False,
+    max_length: int = 4096,
+    html_escape: bool = False,
+) -> str:
+    """Normalize user-supplied text and optionally HTML-escape it."""
+    text = unicodedata.normalize("NFKC", "" if value is None else str(value))
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if multiline:
+        text = "".join(
+            character
+            for character in text
+            if character in {"\n", "\t"} or (ord(character) >= 32 and ord(character) != 127)
+        )
+        text = "\n".join(line.rstrip() for line in text.split("\n"))
+    else:
+        text = _UNSAFE_CONTROL_CHARS_RE.sub(" ", text)
+        text = re.sub(r"\s+", " ", text)
+    text = text.strip()
+    if not allow_empty and not text:
+        raise ValueError(f"Field '{field_name}' is required.")
+    if len(text) > max_length:
+        raise ValueError(f"Field '{field_name}' must not exceed {max_length} characters.")
+    return escape_html_text(text) if html_escape else text
+
+
+def sanitize_user_mapping(
+    value: dict[str, Any] | None,
+    *,
+    field_name: str = "value",
+    max_depth: int = 4,
+) -> dict[str, Any]:
+    """Recursively sanitize user-controlled JSON-compatible mappings."""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError(f"Field '{field_name}' must be an object.")
+
+    def _sanitize(item: Any, *, current_field: str, depth: int) -> Any:
+        if depth < 0:
+            raise ValueError(f"Field '{current_field}' is nested too deeply.")
+        if item is None or isinstance(item, (bool, int, float)):
+            return item
+        if isinstance(item, str):
+            return sanitize_user_string(
+                item,
+                field_name=current_field,
+                multiline=True,
+                html_escape=True,
+            )
+        if isinstance(item, list):
+            return [
+                _sanitize(list_item, current_field=current_field, depth=depth - 1)
+                for list_item in item
+            ]
+        if isinstance(item, dict):
+            sanitized: dict[str, Any] = {}
+            for raw_key, raw_value in item.items():
+                sanitized_key = sanitize_user_string(
+                    raw_key,
+                    field_name=f"{current_field}.key",
+                    allow_empty=False,
+                    max_length=128,
+                )
+                sanitized[sanitized_key] = _sanitize(
+                    raw_value,
+                    current_field=f"{current_field}.{sanitized_key}",
+                    depth=depth - 1,
+                )
+            return sanitized
+        raise ValueError(f"Field '{current_field}' contains an unsupported value type.")
+
+    return _sanitize(value, current_field=field_name, depth=max_depth)
+
+
+def validate_credential_alias(alias: str) -> str:
+    normalized = sanitize_user_string(
+        alias,
+        field_name="alias",
+        allow_empty=False,
+        max_length=128,
+    )
+    if not _SAFE_CREDENTIAL_ALIAS_RE.fullmatch(normalized):
+        raise ValueError(
+            "Field 'alias' may only contain letters, numbers, dots, underscores, and hyphens."
+        )
+    return normalized
+
+
+def validate_env_var_name(name: str) -> str:
+    normalized = sanitize_user_string(
+        name,
+        field_name="env_var_name",
+        allow_empty=False,
+        max_length=128,
+    )
+    if not _SAFE_ENV_VAR_NAME_RE.fullmatch(normalized):
+        raise ValueError(
+            "Field 'env_var_name' must be an uppercase environment variable name containing only A-Z, 0-9, and underscores."
+        )
+    return normalized
 
 
 def _extract_dict_keys(value: Any) -> list[str]:
@@ -400,7 +538,7 @@ class AsyncDatabaseSession:
         "PRAGMA",
     )
 
-    def __init__(self, connection: sqlite3.Connection, lock: threading.RLock) -> None:
+    def __init__(self, connection: sqlite3.Connection, lock: threading.Lock) -> None:
         self._connection = connection
         self._lock = lock
         self._dirty = False
@@ -417,7 +555,7 @@ class AsyncDatabaseSession:
                 else:
                     await asyncio.to_thread(self._connection.rollback)
         finally:
-            self._lock.release()
+            await asyncio.to_thread(self._lock.release)
 
     async def execute(
         self,
@@ -1022,6 +1160,14 @@ class OptOutError(FundingBotError):
     """Raised when a donor has opted out of outreach."""
 
 
+class AccountLockedError(FundingBotError):
+    """Raised when a dashboard account is temporarily locked."""
+
+
+class MFARequiredError(FundingBotError):
+    """Raised when a dashboard account requires a second authentication factor."""
+
+
 @dataclass(frozen=True)
 class ConsentRecord:
     """Immutable donor communication consent event."""
@@ -1086,6 +1232,8 @@ class Task:
     source: str = "manual"
     assignee_email: str | None = None
     assignee_name: str | None = None
+    attributed_connector: str | None = None
+    opportunity_signature: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row | None) -> "Task | None":
@@ -1502,22 +1650,40 @@ def _perform_json_request(
     request_method = getattr(session, method.lower(), None)
     if not callable(request_method):
         raise FundingBotError(f"HTTP session does not support {method.upper()} requests.")
-    response = request_method(
-        url,
-        headers=headers or {},
-        params=params,
-        json=json_payload,
-        timeout=timeout,
-    )
-    if hasattr(response, "raise_for_status"):
-        response.raise_for_status()
-    if hasattr(response, "json"):
-        return response.json()
-    if isinstance(response, (dict, list)):
-        return response
-    raise FundingBotError(
-        f"HTTP client for {url!r} returned {type(response).__name__}, expected JSON-compatible data."
-    )
+    request_headers = dict(headers or {})
+    inject_context(request_headers)
+    with start_span(
+        f"connector.http.{method.lower()}",
+        kind=SpanKind.CLIENT,
+        attributes={
+            "http.request.method": method.upper(),
+            "url.full": url,
+            "network.protocol.name": "http",
+        },
+    ) as span:
+        try:
+            response = request_method(
+                url,
+                headers=request_headers,
+                params=params,
+                json=json_payload,
+                timeout=timeout,
+            )
+            status_code = getattr(response, "status_code", None)
+            if status_code is not None:
+                span.set_attribute("http.response.status_code", int(status_code))
+            if hasattr(response, "raise_for_status"):
+                response.raise_for_status()
+            if hasattr(response, "json"):
+                return response.json()
+            if isinstance(response, (dict, list)):
+                return response
+            raise FundingBotError(
+                f"HTTP client for {url!r} returned {type(response).__name__}, expected JSON-compatible data."
+            )
+        except Exception as exc:
+            set_span_error(span, exc)
+            raise
 
 
 class TokenBucketRateLimiter:
@@ -1637,7 +1803,10 @@ class ConnectorBatchScheduler:
                     else:
                         future.set_result(result)
 
-        return [await asyncio.shield(future) for future in futures]
+        return await asyncio.gather(
+            *[asyncio.shield(future) for future in futures],
+            return_exceptions=True,
+        )
 
     async def _execute_request(
         self,
@@ -1676,6 +1845,7 @@ class _BasePortalConnector:
         transport: str = "demo",
         cache_ttl: float | None = None,
         page_size: int | None = None,
+        request_cost_usd: float | None = None,
         max_retries: int = 2,
         retry_backoff_base: float = 0.25,
         retry_backoff_factor: float = 2.0,
@@ -1701,6 +1871,7 @@ class _BasePortalConnector:
         self.request_timeout = max(1.0, float(request_timeout))
         self.transport = transport
         self.page_size = self._resolve_page_size(page_size)
+        self.request_cost_usd = self._resolve_request_cost(request_cost_usd)
         cache_ttl = self._resolve_cache_ttl(cache_ttl)
         self._cache_manager = cache_manager
         if cache_manager is None:
@@ -1793,6 +1964,23 @@ class _BasePortalConnector:
         if cache_ttl <= 0:
             return 300.0
         return float(cache_ttl)
+
+    def _resolve_request_cost(self, request_cost_usd: float | None) -> float:
+        if request_cost_usd is None:
+            candidate = _read_numeric_env(
+                [
+                    f"{self._config_prefix()}_REQUEST_COST_USD",
+                    "PORTAL_REQUEST_COST_DEFAULT_USD",
+                ],
+                0.0,
+                minimum=0.0,
+            )
+        else:
+            candidate = request_cost_usd
+        try:
+            return max(0.0, float(candidate))
+        except (TypeError, ValueError):
+            return 0.0
 
     def _config_prefix(self) -> str:
         return re.sub(r"[^A-Z0-9]+", "_", self.connector_slug.upper())
@@ -2423,31 +2611,50 @@ class _BasePortalConnector:
         headers: dict[str, str] | None = None,
     ) -> Any:
         self._throttle_remote_request()
+        request_headers = {
+            "Accept": "application/json",
+            "User-Agent": "funding-bot/1.0",
+            **(headers or {}),
+        }
+        inject_context(request_headers)
         resolved_credentials = self._get_resolved_credentials()
         if self.http_client is not None:
-            attempts = (
-                lambda: self.http_client(url, params, resolved_credentials, headers=headers or {}),
-                lambda: self.http_client(url, params, headers=headers or {}),
-                lambda: self.http_client(url, params, resolved_credentials),
-                lambda: self.http_client(url, params),
-            )
-            for attempt in attempts:
+            with start_span(
+                f"connector.http.get.{self.connector_slug}",
+                kind=SpanKind.CLIENT,
+                attributes={
+                    "http.request.method": "GET",
+                    "url.full": url,
+                    "funding_bot.connector.name": self.source_name,
+                    "funding_bot.connector.type": self.connector_slug,
+                },
+            ) as span:
+                attempts = (
+                    lambda: self.http_client(url, params, resolved_credentials, headers=request_headers),
+                    lambda: self.http_client(url, params, headers=request_headers),
+                    lambda: self.http_client(url, params, resolved_credentials),
+                    lambda: self.http_client(url, params),
+                )
+                for attempt in attempts:
+                    try:
+                        return attempt()
+                    except TypeError:
+                        continue
+                    except Exception as exc:
+                        set_span_error(span, exc)
+                        raise
                 try:
-                    return attempt()
-                except TypeError:
-                    continue
-            return self.http_client(url, params)
+                    return self.http_client(url, params)
+                except Exception as exc:
+                    set_span_error(span, exc)
+                    raise
 
         if self._request_session is not None:
             return _perform_json_request(
                 "GET",
                 url,
                 session=self._get_request_session(),
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": "funding-bot/1.0",
-                    **(headers or {}),
-                },
+                headers=request_headers,
                 params=params,
                 timeout=self.request_timeout,
             )
@@ -2463,16 +2670,26 @@ class _BasePortalConnector:
         query_string = urllib.parse.urlencode(query_items, doseq=True)
         request = urllib.request.Request(
             f"{url}?{query_string}" if query_string else url,
-            headers={
-                "Accept": "application/json",
-                "User-Agent": "funding-bot/1.0",
-                **(headers or {}),
-            },
+            headers=request_headers,
             method="GET",
         )
-        with urllib.request.urlopen(request, timeout=15) as response:
-            payload = response.read().decode("utf-8")
-        return json.loads(payload or "{}")
+        with start_span(
+            f"connector.http.get.{self.connector_slug}",
+            kind=SpanKind.CLIENT,
+            attributes={
+                "http.request.method": "GET",
+                "url.full": request.full_url,
+                "funding_bot.connector.name": self.source_name,
+                "funding_bot.connector.type": self.connector_slug,
+            },
+        ) as span:
+            try:
+                with urllib.request.urlopen(request, timeout=15) as response:
+                    payload = response.read().decode("utf-8")
+                return json.loads(payload or "{}")
+            except Exception as exc:
+                set_span_error(span, exc)
+                raise
 
     def _fetch_remote_json(
         self,
@@ -2559,6 +2776,31 @@ class _BasePortalConnector:
             "category": str(row.get("category", row.get("type", ""))),
             "tags": [str(tag) for tag in tags],
         }
+
+    def _build_auth_headers(
+        self,
+        credentials: dict[str, Any],
+        *,
+        api_key_header: str | None = None,
+    ) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        authorization_header = str(credentials.get("authorization_header", "")).strip()
+        if authorization_header:
+            headers["Authorization"] = authorization_header
+        else:
+            access_token = str(
+                credentials.get("access_token") or credentials.get("bearer_token") or ""
+            ).strip()
+            if access_token:
+                token_type = str(credentials.get("token_type", "Bearer")).strip() or "Bearer"
+                headers["Authorization"] = f"{token_type} {access_token}"
+        if api_key_header:
+            for credential_key in ("api_key", "subscription_key", "secret"):
+                api_key = str(credentials.get(credential_key, "")).strip()
+                if api_key:
+                    headers[api_key_header] = api_key
+                    break
+        return headers
 
     def _demo_data(self) -> list[dict[str, Any]]:
         raise NotImplementedError
@@ -2738,16 +2980,27 @@ class GrantsPortalConnector(_BasePortalConnector):
             "Accept": "application/json",
             "Content-Type": "application/json",
             "User-Agent": "funding-bot/1.0",
+            **self._build_auth_headers(credentials, api_key_header="X-API-Key"),
         }
-        authorization_header = str(credentials.get("authorization_header", "")).strip()
-        if authorization_header:
-            headers["Authorization"] = authorization_header
-        elif credentials.get("access_token") or credentials.get("bearer_token"):
-            access_token = credentials.get("access_token") or credentials.get("bearer_token")
-            headers["Authorization"] = "Bearer " + str(access_token)
-        api_key = str(credentials.get("api_key", "")).strip()
+        for key, value in credentials.items():
+            if key in {
+                "auth_type",
+                "access_token",
+                "authorization_header",
+                "bearer_token",
+                "expires_at",
+                "funding_categories",
+                "opp_statuses",
+                "sort_by",
+                "start_record_num",
+                "token_type",
+                "api_key",
+                "agencies",
+            }:
+                continue
+            headers[f"X-Connector-{key.replace('_', '-').title()}"] = str(value)
         if api_key:
-            headers["X-API-Key"] = api_key
+            headers["X-Connector-Api-Key"] = api_key
 
         response = _perform_json_request(
             "POST",
@@ -3184,7 +3437,7 @@ class FoundationDirectoryConnector(_BasePortalConnector):
                     "sort_order": "desc",
                     "transaction": "TA",
                 },
-                headers={"x-api-key": api_key},
+                headers={"X-API-Key": api_key},
             )
             page_payload, _, page_response_keys, next_page = self._parse_remote_page(
                 response,
@@ -4013,6 +4266,8 @@ class SMTPEmailSender:
 
 class FundingBot:
     TASK_STATUSES = ("todo", "in-progress", "done", "blocked")
+    FUNNEL_STAGES = ("discover", "dedupe", "match", "outreach", "response")
+    POSITIVE_RESPONSE_EVENT_TYPES = frozenset({"opened", "clicked", "responded", "replied"})
     TASK_STATUS_ALIASES = {
         "todo": "todo",
         "pending": "todo",
@@ -4040,6 +4295,10 @@ class FundingBot:
     DEFAULT_PRIVACY_POLICY_FORMATS = ("html", "pdf")
     OUTREACH_TEMPLATE_CATALOG = OUTREACH_TEMPLATE_CATALOG_DIR
     DATA_RETENTION_POLICY_KEY = "data_retention_policy"
+    MFA_ISSUER_NAME = "Funding Bot Dashboard"
+    MFA_TOTP_DIGITS = 6
+    MFA_BACKUP_CODE_COUNT = 8
+    MFA_BACKUP_CODE_BYTES = 4
     DATA_CLASSIFICATIONS = _DATA_CLASSIFICATION_LEVELS
     MODEL_DEFAULT_CLASSIFICATIONS = {
         "organization_profile": "internal",
@@ -4129,7 +4388,7 @@ class FundingBot:
         self.connector_registry = connector_registry or DEFAULT_CONNECTOR_REGISTRY
         self._data_residency_status = self.validate_data_storage_location()
         self._active_queue_controllers: dict[str, GracefulShutdownController] = {}
-        self._db_lock = threading.RLock()
+        self._db_lock = threading.Lock()
         self.cache_manager = cache_manager or default_cache_manager()
         if self.db_path == ":memory:":
             self._cache_scope = f"memory-{id(self)}"
@@ -4186,6 +4445,20 @@ class FundingBot:
             CREATE TABLE IF NOT EXISTS credential_refs (
                 alias TEXT PRIMARY KEY,
                 env_var_name TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS auth_security (
+                role TEXT PRIMARY KEY,
+                failed_attempts INTEGER NOT NULL DEFAULT 0,
+                lockout_until TEXT,
+                last_failed_at TEXT,
+                last_success_at TEXT,
+                mfa_enabled INTEGER NOT NULL DEFAULT 0,
+                mfa_secret TEXT,
+                mfa_pending_secret TEXT,
+                mfa_backup_codes_json TEXT NOT NULL DEFAULT '[]',
+                mfa_pending_backup_codes_json TEXT NOT NULL DEFAULT '[]',
+                updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -4466,6 +4739,8 @@ class FundingBot:
                 ON translation_reviews(locale);
             CREATE INDEX IF NOT EXISTS idx_translation_reviews_created_at
                 ON translation_reviews(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_auth_security_lockout_until
+                ON auth_security(lockout_until);
             """
         )
         self._ensure_column("donors", "segment", "TEXT NOT NULL DEFAULT 'unknown'")
@@ -7509,6 +7784,8 @@ class FundingBot:
         keywords: Iterable[str] | None = None,
         trusted_sources: Iterable[str] | None = None,
         discovered_at: datetime | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        dry_run: bool = False,
     ) -> list[dict[str, Any]]:
         return _run_async(
             self.deduplicate_async(
@@ -7516,6 +7793,8 @@ class FundingBot:
                 keywords=keywords,
                 trusted_sources=trusted_sources,
                 discovered_at=discovered_at,
+                progress_callback=progress_callback,
+                dry_run=dry_run,
             )
         )
 
@@ -7526,18 +7805,37 @@ class FundingBot:
         keywords: Iterable[str] | None = None,
         trusted_sources: Iterable[str] | None = None,
         discovered_at: datetime | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        dry_run: bool = False,
     ) -> list[dict[str, Any]]:
         """Filter, deduplicate, and persist opportunity records."""
+        opportunity_list = [dict(opportunity) for opportunity in opportunities]
         keyword_list = [keyword.lower() for keyword in (keywords or [])]
         allowed_sources = {
             source.lower() for source in (trusted_sources or self.trusted_sources or [])
         }
         found: list[dict[str, Any]] = []
         timestamp = self._to_iso(discovered_at)
+        total_opportunities = len(opportunity_list)
+        _emit_progress_event(
+            progress_callback,
+            stage="bulk-persist",
+            description="Persisting discovered opportunities",
+            completed=0,
+            total=total_opportunities,
+        )
         async with self.async_db_session() as session:
-            for opportunity in opportunities:
+            for index, opportunity in enumerate(opportunity_list, start=1):
                 source = str(opportunity.get("source", "")).strip()
                 if allowed_sources and source.lower() not in allowed_sources:
+                    _emit_progress_event(
+                        progress_callback,
+                        stage="bulk-persist",
+                        description="Persisting discovered opportunities",
+                        completed=index,
+                        total=total_opportunities,
+                        item=source or "unknown source",
+                    )
                     continue
 
                 searchable_parts = [
@@ -7548,6 +7846,14 @@ class FundingBot:
                 ]
                 searchable_text = " ".join(searchable_parts).lower()
                 if keyword_list and not any(keyword in searchable_text for keyword in keyword_list):
+                    _emit_progress_event(
+                        progress_callback,
+                        stage="bulk-persist",
+                        description="Persisting discovered opportunities",
+                        completed=index,
+                        total=total_opportunities,
+                        item=str(opportunity.get("title", "Untitled opportunity")),
+                    )
                     continue
 
                 record = {
@@ -7567,31 +7873,50 @@ class FundingBot:
                     (record["signature"],),
                 )
                 if existing:
+                    _emit_progress_event(
+                        progress_callback,
+                        stage="bulk-persist",
+                        description="Persisting discovered opportunities",
+                        completed=index,
+                        total=total_opportunities,
+                        item=record["title"],
+                    )
                     continue
 
-                await session.execute(
-                    """
-                    INSERT INTO opportunities (
-                        signature, source, donor_name, title, portal_url, summary,
-                        category, discovered_at, status, raw_data_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        record["signature"],
-                        record["source"],
-                        record["donor_name"],
-                        record["title"],
-                        record["portal_url"],
-                        record["summary"],
-                        record["category"],
-                        record["discovered_at"],
-                        record["status"],
-                        record["raw_data_json"],
-                    ),
-                )
+                if not dry_run:
+                    await session.execute(
+                        """
+                        INSERT INTO opportunities (
+                            signature, source, donor_name, title, portal_url, summary,
+                            category, discovered_at, status, raw_data_json
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            record["signature"],
+                            record["source"],
+                            record["donor_name"],
+                            record["title"],
+                            record["portal_url"],
+                            record["summary"],
+                            record["category"],
+                            record["discovered_at"],
+                            record["status"],
+                            record["raw_data_json"],
+                        ),
+                    )
                 found.append(record)
+                _emit_progress_event(
+                    progress_callback,
+                    stage="bulk-persist",
+                    description="Persisting discovered opportunities",
+                    completed=index,
+                    total=total_opportunities,
+                    item=record["title"],
+                    persisted_count=len(found),
+                )
 
-        self._log_action("opportunities_discovered", count=len(found), keywords=keyword_list)
+        if not dry_run:
+            self._log_action("opportunities_discovered", count=len(found), keywords=keyword_list)
         return found
 
     def discover_opportunities(
@@ -7601,12 +7926,16 @@ class FundingBot:
         keywords: Iterable[str] | None = None,
         trusted_sources: Iterable[str] | None = None,
         discovered_at: datetime | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        dry_run: bool = False,
     ) -> list[dict[str, Any]]:
         return self.deduplicate(
             opportunities,
             keywords=keywords,
             trusted_sources=trusted_sources,
             discovered_at=discovered_at,
+            progress_callback=progress_callback,
+            dry_run=dry_run,
         )
 
     def run_discovery(
@@ -7616,6 +7945,32 @@ class FundingBot:
         keywords: Iterable[str] | None = None,
         trusted_sources: Iterable[str] | None = None,
         discovered_at: datetime | None = None,
+        batch_size: int | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        dry_run: bool = False,
+    ) -> list[dict[str, Any]]:
+        return _run_async(
+            self.run_discovery_async(
+                connectors=connectors,
+                keywords=keywords,
+                trusted_sources=trusted_sources,
+                discovered_at=discovered_at,
+                batch_size=batch_size,
+                progress_callback=progress_callback,
+                dry_run=dry_run,
+            )
+        )
+
+    async def run_discovery_async(
+        self,
+        connectors: Iterable[PortalConnector] | None = None,
+        *,
+        keywords: Iterable[str] | None = None,
+        trusted_sources: Iterable[str] | None = None,
+        discovered_at: datetime | None = None,
+        batch_size: int | None = None,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+        dry_run: bool = False,
     ) -> list[dict[str, Any]]:
         """Query donation-source connectors and persist new opportunities.
 
@@ -7640,9 +7995,26 @@ class FundingBot:
         else:
             active_connectors = default_connectors(cache_manager=self.cache_manager)
         fallback_mode = self._load_fallback_mode()
+        total_connectors = len(active_connectors)
+
+        scheduler = ConnectorBatchScheduler(
+            batch_size=self._resolve_connector_batch_size(batch_size)
+        )
+        batched_requests = [
+            ConnectorBatchRequest(connector=connector, keywords=tuple(keyword_list))
+            for connector in active_connectors
+        ]
+        batch_results = await scheduler.submit_many(batched_requests)
 
         candidates: list[dict[str, Any]] = []
-        for connector in active_connectors:
+        _emit_progress_event(
+            progress_callback,
+            stage="connector-discovery",
+            description="Discovering opportunities from connectors",
+            completed=0,
+            total=total_connectors,
+        )
+        for index, (connector, result) in enumerate(zip(active_connectors, batch_results), start=1):
             connector_name = self._connector_name(connector)
             cache_key = self._connector_cache_key(connector, keyword_list)
             health = connector.check_health()
@@ -7654,29 +8026,23 @@ class FundingBot:
                     last_error=health.get("last_error"),
                 )
             try:
-                fetch_result = getattr(connector, "fetch_result", None)
-                if callable(fetch_result):
-                    result = fetch_result(keyword_list)
-                    opportunities = [dict(item) for item in result.get("opportunities", [])]
-                    schema_version = int(
-                        result.get("schema_version", getattr(connector, "result_schema_version", _CONNECTOR_RESULT_SCHEMA_VERSION))
-                    )
-                    metadata = dict(result.get("metadata", {}))
-                    source_status = str(metadata.get("source_status", "remote"))
-                    if source_status == "degraded":
-                        raise RuntimeError(
-                            str(
-                                metadata.get("last_error")
-                                or metadata.get("degraded_reason")
-                                or f"{connector_name} is degraded"
-                            )
+                if isinstance(result, Exception):
+                    raise result
+                opportunities = [dict(item) for item in result.get("opportunities", [])]
+                schema_version = int(
+                    result.get("schema_version", getattr(connector, "result_schema_version", _CONNECTOR_RESULT_SCHEMA_VERSION))
+                )
+                metadata = dict(result.get("metadata", {}))
+                source_status = str(metadata.get("source_status", "remote"))
+                if source_status == "degraded":
+                    raise RuntimeError(
+                        str(
+                            metadata.get("last_error")
+                            or metadata.get("degraded_reason")
+                            or f"{connector_name} is degraded"
                         )
-                else:
-                    opportunities = [dict(item) for item in connector.fetch_opportunities(keyword_list)]
-                    schema_version = int(getattr(connector, "result_schema_version", _CONNECTOR_RESULT_SCHEMA_VERSION))
-                    metadata = {"connector_name": connector_name, "source_status": "remote"}
-                    source_status = "remote"
-                self._store_connector_result(
+                    )
+                await self._store_connector_result_async(
                     connector_name=connector_name,
                     cache_key=cache_key,
                     schema_version=schema_version,
@@ -7685,13 +8051,21 @@ class FundingBot:
                     source_status=source_status,
                 )
                 candidates.extend(opportunities)
+                _emit_progress_event(
+                    progress_callback,
+                    stage="connector-discovery",
+                    description=f"Processed connector {connector_name}",
+                    current=connector_name,
+                    completed=index,
+                    total=total_connectors,
+                )
                 continue
             except Exception as exc:
                 error_message = str(exc)
 
             fallback_result = None
             if fallback_mode in {"cache-first", "cache-only"}:
-                fallback_result = self._load_cached_connector_result(connector, keyword_list)
+                fallback_result = await self._load_cached_connector_result_async(connector, keyword_list)
                 if fallback_result is not None:
                     fallback_result["metadata"] = {
                         **dict(fallback_result.get("metadata", {})),
@@ -7712,6 +8086,14 @@ class FundingBot:
                     connector_name,
                     error_message,
                 )
+                _emit_progress_event(
+                    progress_callback,
+                    stage="connector-discovery",
+                    description=f"Processed connector {connector_name}",
+                    current=connector_name,
+                    completed=index,
+                    total=total_connectors,
+                )
                 continue
 
             fallback_result["metadata"] = {
@@ -7720,7 +8102,7 @@ class FundingBot:
                 "cache_key": cache_key,
                 "fallback_activated_at": self._to_iso(),
             }
-            self._store_connector_result(
+            await self._store_connector_result_async(
                 connector_name=connector_name,
                 cache_key=cache_key,
                 schema_version=int(fallback_result["schema_version"]),
@@ -7744,12 +8126,22 @@ class FundingBot:
                 result_count=len(fallback_result["opportunities"]),
             )
             candidates.extend([dict(item) for item in fallback_result["opportunities"]])
+            _emit_progress_event(
+                progress_callback,
+                stage="connector-discovery",
+                description=f"Processed connector {connector_name}",
+                current=connector_name,
+                completed=index,
+                total=total_connectors,
+            )
 
-        return self.discover_opportunities(
+        return await self.deduplicate_async(
             candidates,
             keywords=keyword_list,
             trusted_sources=source_list,
             discovered_at=discovered_at,
+            progress_callback=progress_callback,
+            dry_run=dry_run,
         )
 
     def list_opportunities(self, *, status: str | None = None) -> list[dict[str, Any]]:
@@ -8897,6 +9289,7 @@ class FundingBot:
         sender: Any | None = None,
         sent_at: datetime | None = None,
         locale: str | None = None,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         donor_email = _validate_email(donor_email)
         requested_locale = self._validate_locale(locale) if locale is not None else None
@@ -8905,26 +9298,33 @@ class FundingBot:
             (donor_email,),
         ).fetchone()
         if donor is None:
-            self.upsert_donor(email=donor_email, name=donor_name, locale=requested_locale)
-            donor = self.connection.execute(
-                "SELECT * FROM donors WHERE email = ?",
-                (donor_email,),
-            ).fetchone()
+            if not dry_run:
+                self.upsert_donor(email=donor_email, name=donor_name, locale=requested_locale)
+                donor = self.connection.execute(
+                    "SELECT * FROM donors WHERE email = ?",
+                    (donor_email,),
+                ).fetchone()
         elif requested_locale is not None and donor["locale"] != requested_locale:
-            self.connection.execute(
-                "UPDATE donors SET locale = ? WHERE email = ?",
-                (requested_locale, donor_email),
-            )
-            self.connection.commit()
-            self._invalidate_donor_cache(donor_email)
-            donor = self.connection.execute(
-                "SELECT * FROM donors WHERE email = ?",
-                (donor_email,),
-            ).fetchone()
+            if not dry_run:
+                self.connection.execute(
+                    "UPDATE donors SET locale = ? WHERE email = ?",
+                    (requested_locale, donor_email),
+                )
+                self.connection.commit()
+                self._invalidate_donor_cache(donor_email)
+                donor = self.connection.execute(
+                    "SELECT * FROM donors WHERE email = ?",
+                    (donor_email,),
+                ).fetchone()
 
-        if donor is None:
-            raise FundingBotError(f"Unable to load donor record for {donor_email!r}.")
-        if donor["opted_out"]:
+        would_create_donor = donor is None
+        donor_locale = self._validate_locale(
+            requested_locale or (donor["locale"] if donor is not None else None)
+        )
+        donor_opted_out = bool(donor["opted_out"]) if donor is not None else False
+        donor_last_contact_at = donor["last_contact_at"] if donor is not None else None
+
+        if donor_opted_out:
             raise OptOutError(f"{donor_email} has opted out of outreach.")
 
         consent_context = context or {}
@@ -8936,14 +9336,13 @@ class FundingBot:
             raise OptOutError(f"{donor_email} has opted out of outreach.")
 
         send_time = self._as_utc(sent_at)
-        if donor["last_contact_at"]:
-            last_contact = self._as_utc(datetime.fromisoformat(donor["last_contact_at"]))
+        if donor_last_contact_at:
+            last_contact = self._as_utc(datetime.fromisoformat(donor_last_contact_at))
             if send_time - last_contact < timedelta(days=7):
                 raise OutreachThrottledError(
                     f"{donor_email} was contacted less than seven days ago."
                 )
 
-        donor_locale = self._validate_locale(requested_locale or donor["locale"])
         profile = self.load_organization_profile()
         merged_context = {
             "donor_name": donor_name,
@@ -8958,24 +9357,25 @@ class FundingBot:
         merged_context.update(consent_context)
 
         if latest_consent is None:
-            self.record_consent(
-                donor_email,
-                donor_name=donor_name,
-                consented_at=send_time,
-                channel=merged_context.get("consent_channel", "email"),
-                source=str(merged_context.get("consent_source", "outreach_delivery")),
-                proof=(
-                    str(merged_context["consent_proof"])
-                    if merged_context.get("consent_proof") is not None
-                    else None
-                ),
-                notes=(
-                    str(merged_context["consent_notes"])
-                    if merged_context.get("consent_notes") is not None
-                    else "Consent record captured automatically when outreach was first sent."
-                ),
-                locale=donor["locale"],
-            )
+            if not dry_run:
+                self.record_consent(
+                    donor_email,
+                    donor_name=donor_name,
+                    consented_at=send_time,
+                    channel=merged_context.get("consent_channel", "email"),
+                    source=str(merged_context.get("consent_source", "outreach_delivery")),
+                    proof=(
+                        str(merged_context["consent_proof"])
+                        if merged_context.get("consent_proof") is not None
+                        else None
+                    ),
+                    notes=(
+                        str(merged_context["consent_notes"])
+                        if merged_context.get("consent_notes") is not None
+                        else "Consent record captured automatically when outreach was first sent."
+                    ),
+                    locale=donor_locale,
+                )
 
         subject = subject_template.format(**merged_context)
         body = body_template.format(**merged_context).rstrip()
@@ -8983,10 +9383,28 @@ class FundingBot:
             opt_out_notice = self._localized_opt_out_notice(donor_locale).format(**merged_context)
             body = f"{body}\n\n{opt_out_notice}"
 
-        if sender is not None:
+        if sender is not None and not dry_run:
             sender(donor_email, subject, body)
 
         sent_iso = self._to_iso(send_time)
+        preview = {
+            "would_create_donor": would_create_donor,
+            "would_record_consent": latest_consent is None,
+            "would_send_email": True,
+            "would_log_communication": True,
+            "would_update_last_contact": True,
+        }
+        result = {
+            "email": donor_email,
+            "subject": subject,
+            "body": body,
+            "sent_at": sent_iso,
+            "locale": donor_locale,
+            "dry_run": dry_run,
+            "preview": preview,
+        }
+        if dry_run:
+            return result
         cursor = self.connection.execute(
             """
             INSERT INTO communications (donor_email, donor_name, subject, body, channel, sent_at)
@@ -9013,13 +9431,7 @@ class FundingBot:
             subject=subject,
             locale=donor_locale,
         )
-        return {
-            "email": donor_email,
-            "subject": subject,
-            "body": body,
-            "sent_at": sent_iso,
-            "locale": donor_locale,
-        }
+        return result
 
     def send_outreach_task(
         self,
@@ -9094,6 +9506,7 @@ class FundingBot:
         sender: Any | None = None,
         sent_at: datetime | None = None,
         locale: str | None = None,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
         """Send outreach using a stored template."""
         donor = self.connection.execute(
@@ -9133,6 +9546,7 @@ class FundingBot:
             sender=sender,
             sent_at=sent_at,
             locale=donor_locale,
+            dry_run=dry_run,
         )
         result["template_name"] = template_name
         return result
@@ -9182,7 +9596,7 @@ class FundingBot:
             counts[row["event_type"]] = row["total"]
         return counts
 
-    def gdpr_export(self, donor_email: str) -> dict[str, Any]:
+    def gdpr_export(self, donor_email: str, *, dry_run: bool = False) -> dict[str, Any]:
         """Export all donor-related records stored by the bot."""
         donor = self.connection.execute(
             "SELECT * FROM donors WHERE email = ?",
@@ -9226,8 +9640,15 @@ class FundingBot:
                     (f"%{donor_email}%",),
                 ).fetchall()
             ],
+            "dry_run": dry_run,
+            "preview": {
+                "would_log_audit_export": True,
+                "communication_count": len(communications),
+                "outreach_event_count": len(events),
+            },
         }
-        self._log_action("gdpr_exported", donor_email=donor_email)
+        if not dry_run:
+            self._log_action("gdpr_exported", donor_email=donor_email)
         return export
 
     def gdpr_delete(self, donor_email: str) -> None:
@@ -10134,18 +10555,147 @@ def _print_rows(rows: Iterable[dict[str, Any]], columns: Iterable[str] | None = 
     """Print dictionaries as a simple tab-separated table."""
     row_list = list(rows)
     if not row_list:
-        print("No records found.")
+        _cli_print("No records found.", level="warning")
         return
     column_list = list(columns or row_list[0].keys())
-    print("\t".join(column_list))
+    _cli_print("\t".join(column_list))
     for row in row_list:
-        print("\t".join(str(row.get(column, "")) for column in column_list))
+        _cli_print("\t".join(str(row.get(column, "")) for column in column_list))
 
 
 def _parse_csv_argument(raw_value: str | None) -> list[str] | None:
     if raw_value is None:
         return None
     return _normalize_text_list(raw_value.split(","))
+
+
+def _coerce_cli_bool(value: Any, *, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _config_lookup(config: dict[str, Any], *path: str) -> Any:
+    current: Any = config
+    for key in path:
+        if not isinstance(current, dict) or key not in current:
+            return _UNSET
+        current = current[key]
+    return current
+
+
+def _coerce_cli_list_default(value: Any) -> str | None:
+    if value in (_UNSET, None):
+        return None
+    if isinstance(value, str):
+        normalized = _normalize_text_list(value.split(","))
+        return ",".join(normalized) if normalized else None
+    if isinstance(value, Iterable):
+        normalized = _normalize_text_list(str(item) for item in value)
+        return ",".join(normalized) if normalized else None
+    return str(value)
+
+
+def _resolve_cli_defaults(argv: list[str] | None = None) -> dict[str, Any]:
+    config = load_cli_config(argv=argv)
+
+    def _value(
+        *path: str,
+        env_name: str | None = None,
+        default: Any = None,
+        bool_value: bool = False,
+        csv_value: bool = False,
+    ) -> Any:
+        if env_name and env_name in os.environ:
+            raw_env = os.environ[env_name]
+            if bool_value:
+                return _coerce_cli_bool(raw_env, default=bool(default))
+            if csv_value:
+                return _coerce_cli_list_default(raw_env)
+            return raw_env
+        raw_config = _config_lookup(config, *path)
+        if raw_config is _UNSET:
+            return default
+        if bool_value:
+            return _coerce_cli_bool(raw_config, default=bool(default))
+        if csv_value:
+            return _coerce_cli_list_default(raw_config)
+        return raw_config
+
+    return {
+        "config_path": _config_lookup(config, "_loaded_from"),
+        "db": _value("db", env_name="BOT_DB_PATH", default="funding_bot.db"),
+        "summary_recipient": _value(
+            "send_daily_summary",
+            "recipient",
+            env_name="DAILY_SUMMARY_RECIPIENT",
+            default="lupael@i4e.com.bd",
+        ),
+        "summary_dry_run": _value(
+            "send_daily_summary",
+            "dry_run",
+            env_name="DAILY_SUMMARY_DRY_RUN",
+            default=False,
+            bool_value=True,
+        ),
+        "discover_keywords": _value(
+            "discover",
+            "keywords",
+            env_name="FUNDING_BOT_DISCOVER_KEYWORDS",
+            default=None,
+            csv_value=True,
+        ),
+        "discover_trusted_sources": _value(
+            "discover",
+            "trusted_sources",
+            env_name="FUNDING_BOT_DISCOVER_TRUSTED_SOURCES",
+            default=None,
+            csv_value=True,
+        ),
+        "discover_dry_run": _value(
+            "discover",
+            "dry_run",
+            env_name="FUNDING_BOT_DISCOVER_DRY_RUN",
+            default=False,
+            bool_value=True,
+        ),
+        "outreach_email": _value("send_outreach", "email", env_name="FUNDING_BOT_OUTREACH_EMAIL"),
+        "outreach_name": _value("send_outreach", "name", env_name="FUNDING_BOT_OUTREACH_NAME"),
+        "outreach_template_name": _value(
+            "send_outreach",
+            "template_name",
+            env_name="FUNDING_BOT_OUTREACH_TEMPLATE_NAME",
+            default=FundingBot.DEFAULT_OUTREACH_TEMPLATE,
+        ),
+        "outreach_subject": _value("send_outreach", "subject", env_name="FUNDING_BOT_OUTREACH_SUBJECT"),
+        "outreach_body": _value("send_outreach", "body", env_name="FUNDING_BOT_OUTREACH_BODY"),
+        "outreach_locale": _value("send_outreach", "locale", env_name="FUNDING_BOT_OUTREACH_LOCALE"),
+        "outreach_dry_run": _value(
+            "send_outreach",
+            "dry_run",
+            env_name="FUNDING_BOT_OUTREACH_DRY_RUN",
+            default=False,
+            bool_value=True,
+        ),
+        "gdpr_export_email": _value("gdpr_export", "email", env_name="FUNDING_BOT_EXPORT_EMAIL"),
+        "gdpr_export_output": _value("gdpr_export", "output", env_name="FUNDING_BOT_EXPORT_OUTPUT"),
+        "gdpr_export_dry_run": _value(
+            "gdpr_export",
+            "dry_run",
+            env_name="FUNDING_BOT_EXPORT_DRY_RUN",
+            default=False,
+            bool_value=True,
+        ),
+    }
 
 
 def _resolve_cli_log_level(*, verbose: bool = False, quiet: bool = False) -> int:
@@ -10156,9 +10706,24 @@ def _resolve_cli_log_level(*, verbose: bool = False, quiet: bool = False) -> int
     return logging.WARNING
 
 
-def _configure_cli_logging(*, verbose: bool = False, quiet: bool = False) -> int:
+def _configure_cli_logging(
+    *,
+    verbose: bool = False,
+    quiet: bool = False,
+    no_color: bool = False,
+) -> int:
     level = _resolve_cli_log_level(verbose=verbose, quiet=quiet)
-    logging.basicConfig(level=level, format="%(levelname)s:%(name)s:%(message)s", force=True)
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        _CliColorFormatter(
+            "%(levelname)s:%(name)s:%(message)s",
+            color_enabled=_should_use_color(sys.stderr, no_color=no_color),
+        )
+    )
+    root_logger.addHandler(handler)
+    root_logger.setLevel(level)
     return level
 
 
@@ -10181,7 +10746,7 @@ def _json_dumps(payload: Any) -> str:
 
 
 def _emit_cli_json(payload: dict[str, Any]) -> None:
-    print(_json_dumps(payload))
+    _cli_print(_json_dumps(payload))
 
 
 def _cli_payload(command: str, **payload: Any) -> dict[str, Any]:
@@ -10199,8 +10764,10 @@ def _queue_async_task(
     task_callable: Any,
     *,
     task_kwargs: dict[str, Any],
+    progress_reporter: _CliProgressReporter | None = None,
 ) -> dict[str, Any]:
-    async_result = task_callable.delay(**task_kwargs)
+    with _bind_cli_progress(progress_reporter):
+        async_result = task_callable.delay(**task_kwargs)
     payload: dict[str, Any] = {
         "task": {
             "label": task_label,
@@ -10220,13 +10787,13 @@ def _queue_async_task(
 
 def _print_queued_task(payload: dict[str, Any], *, ready_renderer: Callable[[dict[str, Any]], None] | None = None) -> None:
     task = payload["task"]
-    print(f"Queued {task['label']} task {task['id']}.")
-    print(f"Task status: {task['status']}.")
+    _cli_print(f"Queued {task['label']} task {task['id']}.", level="success")
+    _cli_print(f"Task status: {_colorize_status_text(task['status'])}.")
     result = payload.get("result")
     if isinstance(result, dict) and ready_renderer is not None:
         ready_renderer(result)
     elif payload.get("tracking_hint"):
-        print(payload["tracking_hint"])
+        _cli_print(payload["tracking_hint"], level="warning")
 
 
 def _render_discover_task_result_text(result: dict[str, Any]) -> None:
@@ -10234,29 +10801,29 @@ def _render_discover_task_result_text(result: dict[str, Any]) -> None:
     if found:
         _print_rows(found, ["signature", "source", "donor_name", "title", "category"])
     else:
-        print("No new opportunities found.")
+        _cli_print("No new opportunities found.", level="warning")
 
 
 def _render_outreach_task_result_text(result: dict[str, Any]) -> None:
     if result.get("template_name"):
-        print(f"Template: {result['template_name']}")
+        _cli_print(f"Template: {result['template_name']}")
     if result.get("locale"):
-        print(f"Locale: {result['locale']}")
-    print(f"Subject: {result['subject']}\n")
-    print(result["body"])
+        _cli_print(f"Locale: {result['locale']}")
+    _cli_print(f"Subject: {result['subject']}\n")
+    _cli_print(result["body"])
     if result.get("dry_run"):
-        print("\n(dry run: no email was actually sent)")
+        _cli_print("\n(dry run: no email was actually sent)", level="warning")
     else:
-        print(f"\nOutreach email sent to {result['email']}.")
+        _cli_print(f"\nOutreach email sent to {result['email']}.", level="success")
 
 
 def _render_daily_summary_task_result_text(result: dict[str, Any]) -> None:
-    print(f"Subject: {result['subject']}\n")
-    print(result["body"])
+    _cli_print(f"Subject: {result['subject']}\n")
+    _cli_print(result["body"])
     if result.get("dry_run"):
-        print("\n(dry run: no email was actually sent)")
+        _cli_print("\n(dry run: no email was actually sent)", level="warning")
     else:
-        print(f"\nDaily summary sent to {result['recipient']}.")
+        _cli_print(f"\nDaily summary sent to {result['recipient']}.", level="success")
 
 
 def _redact_service_url(url: str | None) -> str | None:
@@ -10332,13 +10899,29 @@ def _collect_redis_diagnostics(*, broker_url: str, result_backend: str) -> dict[
     }
 
 
-def _collect_connector_diagnostics(*, keywords: Iterable[str] | None = None) -> dict[str, Any]:
+def _collect_connector_diagnostics(
+    *,
+    keywords: Iterable[str] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     connectors = []
-    for connector_name in sorted(connector_registry().keys()):
+    connector_names = sorted(connector_registry().keys())
+    _emit_progress_event(
+        progress_callback,
+        stage="connector-diagnostics",
+        description="Running connector diagnostics",
+        completed=0,
+        total=len(connector_names),
+    )
+    for index, connector_name in enumerate(connector_names, start=1):
         try:
             connector = create_connector(connector_name)
             health = connector.check_health()
-            validation = connector.validate_connectivity(keywords, sample_limit=0)
+            validation = connector.validate_connectivity(
+                keywords,
+                sample_limit=0,
+                progress_callback=progress_callback,
+            )
             status = str(validation.get("status", "ok"))
             if health.get("healthy") is False and status == "ok":
                 status = "degraded"
@@ -10351,6 +10934,14 @@ def _collect_connector_diagnostics(*, keywords: Iterable[str] | None = None) -> 
                     "validation": validation,
                 }
             )
+            _emit_progress_event(
+                progress_callback,
+                stage="connector-diagnostics",
+                description=f"Running connector diagnostics ({connector_name})",
+                current=connector_name,
+                completed=index,
+                total=len(connector_names),
+            )
         except Exception as exc:
             connectors.append(
                 {
@@ -10359,6 +10950,14 @@ def _collect_connector_diagnostics(*, keywords: Iterable[str] | None = None) -> 
                     "healthy": False,
                     "error": str(exc),
                 }
+            )
+            _emit_progress_event(
+                progress_callback,
+                stage="connector-diagnostics",
+                description=f"Running connector diagnostics ({connector_name})",
+                current=connector_name,
+                completed=index,
+                total=len(connector_names),
             )
     statuses = {entry["status"] for entry in connectors}
     if "error" in statuses:
@@ -10374,7 +10973,12 @@ def _collect_connector_diagnostics(*, keywords: Iterable[str] | None = None) -> 
     }
 
 
-def _collect_doctor_report(*, db_path: str, connector_keywords: Iterable[str] | None = None) -> dict[str, Any]:
+def _collect_doctor_report(
+    *,
+    db_path: str,
+    connector_keywords: Iterable[str] | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
     from task_queue import celery_app, get_queue_status, load_queue_config
 
     configuration = {
@@ -10441,7 +11045,10 @@ def _collect_doctor_report(*, db_path: str, connector_keywords: Iterable[str] | 
             broker_url=queue_config.broker_url,
             result_backend=queue_config.result_backend,
         ),
-        "connectors": _collect_connector_diagnostics(keywords=connector_keywords),
+        "connectors": _collect_connector_diagnostics(
+            keywords=connector_keywords,
+            progress_callback=progress_callback,
+        ),
     }
     severity = {"ok": 0, "disabled": 0, "degraded": 1, "error": 2}
     overall_status = max((check.get("status", "ok") for check in checks.values()), key=lambda value: severity.get(value, 2))
@@ -10449,40 +11056,44 @@ def _collect_doctor_report(*, db_path: str, connector_keywords: Iterable[str] | 
 
 
 def _print_doctor_report(report: dict[str, Any]) -> None:
-    print("Funding Bot doctor")
-    print(f"Overall status: {report['overall_status']}")
-    print()
+    _cli_print("Funding Bot doctor")
+    _cli_print(f"Overall status: {_colorize_status_text(report['overall_status'])}")
+    _cli_print()
     configuration = report["configuration"]
-    print("Configuration")
-    print(f"- Database path: {configuration['database_path']}")
-    print(f"- Celery broker: {configuration.get('celery_broker_url') or '(default)'}")
-    print(f"- Celery result backend: {configuration.get('celery_result_backend') or '(default)'}")
-    print(f"- Encryption key configured: {'yes' if configuration['encryption_key_set'] else 'no'}")
-    print()
-    print("Checks")
+    _cli_print("Configuration")
+    _cli_print(f"- Database path: {configuration['database_path']}")
+    _cli_print(f"- Celery broker: {configuration.get('celery_broker_url') or '(default)'}")
+    _cli_print(f"- Celery result backend: {configuration.get('celery_result_backend') or '(default)'}")
+    _cli_print(f"- Encryption key configured: {'yes' if configuration['encryption_key_set'] else 'no'}")
+    _cli_print()
+    _cli_print("Checks")
     database_check = report["checks"]["database"]
-    print(
-        f"- database: {database_check['status']} "
+    _cli_print(
+        f"- database: {_colorize_status_text(database_check['status'])} "
         f"(connected={database_check.get('connected', False)}, tables={database_check.get('table_count', 0)})"
     )
     celery_check = report["checks"]["celery"]
-    print(
-        f"- celery: {celery_check['status']} "
+    _cli_print(
+        f"- celery: {_colorize_status_text(celery_check['status'])} "
         f"(mode={celery_check['mode']}, workers={celery_check['worker_count']}, queue={celery_check['queue_name']})"
     )
     redis_check = report["checks"]["redis"]
     if not redis_check.get("checked"):
-        print(f"- redis: {redis_check['status']} ({redis_check['message']})")
+        _cli_print(
+            f"- redis: {_colorize_status_text(redis_check['status'])} ({redis_check['message']})"
+        )
     else:
         redis_statuses = ", ".join(
-            f"{entry['role']}={entry['status']}" for entry in redis_check.get("targets", [])
+            f"{entry['role']}={_colorize_status_text(entry['status'])}"
+            for entry in redis_check.get("targets", [])
         )
-        print(f"- redis: {redis_check['status']} ({redis_statuses})")
+        _cli_print(f"- redis: {_colorize_status_text(redis_check['status'])} ({redis_statuses})")
     connector_check = report["checks"]["connectors"]
     connector_statuses = ", ".join(
-        f"{entry['connector']}={entry['status']}" for entry in connector_check["connectors"]
+        f"{entry['connector']}={_colorize_status_text(entry['status'])}"
+        for entry in connector_check["connectors"]
     )
-    print(f"- connectors: {connector_check['status']} ({connector_statuses})")
+    _cli_print(f"- connectors: {_colorize_status_text(connector_check['status'])} ({connector_statuses})")
 
 
 def _cli_completion_spec() -> dict[str, Any]:
@@ -10967,6 +11578,7 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     retention_policy_parser.add_argument("--audit-logs-days", type=int, metavar="DAYS")
     retention_policy_parser.add_argument("--communications-days", type=int, metavar="DAYS")
     retention_policy_parser.add_argument("--documents-days", type=int, metavar="DAYS")
+    retention_policy_parser.add_argument("--opportunities-days", type=int, metavar="DAYS")
     retention_policy_parser.add_argument("--submission-attempts-days", type=int, metavar="DAYS")
     retention_policy_parser.add_argument("--completed-tasks-days", type=int, metavar="DAYS")
 
@@ -10984,6 +11596,39 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
         "--as-of",
         metavar="ISO8601",
         help="Evaluate retention as of the provided UTC timestamp.",
+    )
+    retention_enforcement_parser.add_argument(
+        "--no-archive",
+        action="store_true",
+        help="Skip writing archival payloads before deleting expired records.",
+    )
+
+    warehouse_export_parser = subparsers.add_parser(
+        "export-data-warehouse",
+        help="Export warehouse-friendly datasets in JSON, CSV, or Parquet format.",
+        parents=[command_parent],
+    )
+    warehouse_export_parser.add_argument(
+        "--datasets",
+        metavar="DATASETS",
+        help="Comma-separated dataset names (default: donors,tasks,matches,results).",
+    )
+    warehouse_export_parser.add_argument(
+        "--format",
+        dest="export_format",
+        choices=("json", "csv", "parquet"),
+        default="json",
+        help="Export format (default: json).",
+    )
+    warehouse_export_parser.add_argument(
+        "--output-dir",
+        default="generated/exports",
+        help="Directory for generated export files (default: generated/exports).",
+    )
+    warehouse_export_parser.add_argument(
+        "--archive",
+        action="store_true",
+        help="Copy generated export files to configured cold storage/S3 targets.",
     )
 
     completion_parser = subparsers.add_parser(
@@ -11169,6 +11814,7 @@ def main(argv: list[str] | None = None) -> None:
                     "audit_logs_days": args.audit_logs_days,
                     "communications_days": args.communications_days,
                     "documents_days": args.documents_days,
+                    "opportunities_days": args.opportunities_days,
                     "submission_attempts_days": args.submission_attempts_days,
                     "completed_tasks_days": args.completed_tasks_days,
                 }
@@ -11182,12 +11828,29 @@ def main(argv: list[str] | None = None) -> None:
                     print(_json_dumps(policy))
             elif args.command == "enforce-data-retention":
                 as_of = datetime.fromisoformat(args.as_of) if args.as_of else None
-                report = get_bot().enforce_data_retention(now=as_of, dry_run=args.dry_run)
+                report = get_bot().enforce_data_retention(
+                    now=as_of,
+                    dry_run=args.dry_run,
+                    archive=not args.no_archive,
+                )
                 payload = _cli_payload("enforce-data-retention", report=report)
                 if args.json_output:
                     _emit_cli_json(payload)
                 else:
                     print(_json_dumps(report))
+            elif args.command == "export-data-warehouse":
+                export_report = get_bot().export_data_warehouse(
+                    datasets=_parse_csv_argument(args.datasets)
+                    or ["donors", "tasks", "matches", "results"],
+                    export_format=args.export_format,
+                    output_dir=args.output_dir,
+                    archive=args.archive,
+                )
+                payload = _cli_payload("export-data-warehouse", report=export_report)
+                if args.json_output:
+                    _emit_cli_json(payload)
+                else:
+                    print(_json_dumps(export_report))
             elif args.command == "gdpr-self-check-report":
                 report = get_bot().build_gdpr_compliance_report(cadence=args.cadence)
                 payload = _cli_payload(

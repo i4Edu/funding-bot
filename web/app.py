@@ -39,7 +39,12 @@ from funding_bot import (  # noqa: E402
     _validate_email,
     default_connectors,
 )
-from task_queue import dispatch_discovery, get_queue_status, load_queue_config  # noqa: E402
+from task_queue import (  # noqa: E402
+    dispatch_discovery,
+    dispatch_export,
+    get_queue_status,
+    load_queue_config,
+)
 
 app = Flask(__name__, template_folder=str(Path(__file__).resolve().parent / "templates"))
 app.config["JSON_SORT_KEYS"] = False
@@ -567,6 +572,23 @@ def _read_task_import_csv() -> str:
     return request.get_data(cache=False, as_text=True)
 
 
+def _export_schedule_snapshot() -> dict[str, Any]:
+    return {
+        "hour": int(os.environ.get("DATA_EXPORT_SCHEDULE_HOUR", "1")),
+        "minute": int(os.environ.get("DATA_EXPORT_SCHEDULE_MINUTE", "0")),
+        "datasets": [
+            dataset.strip()
+            for dataset in os.environ.get(
+                "DATA_EXPORT_DATASETS", "donors,tasks,matches,results"
+            ).split(",")
+            if dataset.strip()
+        ],
+        "format": os.environ.get("DATA_EXPORT_FORMAT", "json"),
+        "output_dir": os.environ.get("DATA_EXPORT_OUTPUT_DIR", "generated/exports"),
+        "archive": _env_flag("DATA_EXPORT_ARCHIVE", default=True),
+    }
+
+
 def _task_scope_for_role(role: str | None) -> str | None:
     if role in {"admin", "auditor"}:
         return None
@@ -839,7 +861,9 @@ def _queue_health_timeout_seconds() -> float:
 
 
 def _health_check_timeout_seconds() -> float:
-    configured = os.environ.get("HEALTH_CHECK_TIMEOUT_SECONDS", str(DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS))
+    configured = os.environ.get(
+        "HEALTH_CHECK_TIMEOUT_SECONDS", str(DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS)
+    )
     try:
         timeout = float(configured)
     except ValueError:
@@ -866,19 +890,21 @@ def _health_check_metrics_snapshot() -> dict[str, Any]:
     with _HEALTH_CHECK_METRICS_LOCK:
         return {
             "endpoints": {
-                name: dict(metrics)
-                for name, metrics in _HEALTH_CHECK_METRICS["endpoints"].items()
+                name: dict(metrics) for name, metrics in _HEALTH_CHECK_METRICS["endpoints"].items()
             },
             "components": {
-                name: dict(metrics)
-                for name, metrics in _HEALTH_CHECK_METRICS["components"].items()
+                name: dict(metrics) for name, metrics in _HEALTH_CHECK_METRICS["components"].items()
             },
         }
 
 
-def _record_health_check_metrics(endpoint: str, checks: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def _record_health_check_metrics(
+    endpoint: str, checks: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
     failing_components = [
-        name for name, result in checks.items() if str(result.get("status", "error")) not in {"ok", "disabled"}
+        name
+        for name, result in checks.items()
+        if str(result.get("status", "error")) not in {"ok", "disabled"}
     ]
     with _HEALTH_CHECK_METRICS_LOCK:
         endpoint_metrics = _HEALTH_CHECK_METRICS["endpoints"].setdefault(
@@ -927,7 +953,9 @@ def _redis_ping(url: str, *, timeout: float) -> dict[str, Any]:
         connection = socket.create_connection((host, port), timeout=timeout)
         try:
             if parsed.scheme == "rediss":
-                connection = ssl.create_default_context().wrap_socket(connection, server_hostname=host)
+                connection = ssl.create_default_context().wrap_socket(
+                    connection, server_hostname=host
+                )
             connection.sendall(b"*1\r\n$4\r\nPING\r\n")
             response = connection.recv(16)
         finally:
@@ -1029,10 +1057,21 @@ def _check_connector_health(bot: FundingBot) -> dict[str, Any]:
     checks = []
     for connector in active_connectors:
         connector_name = str(
-            getattr(connector, "connector_slug", getattr(connector, "source_name", type(connector).__name__))
+            getattr(
+                connector,
+                "connector_slug",
+                getattr(connector, "source_name", type(connector).__name__),
+            )
         )
         source_name = str(getattr(connector, "source_name", connector_name))
-        mode = "remote" if (getattr(connector, "http_client", None) is not None or getattr(connector, "transport", "") == "http") else "demo"
+        mode = (
+            "remote"
+            if (
+                getattr(connector, "http_client", None) is not None
+                or getattr(connector, "transport", "") == "http"
+            )
+            else "demo"
+        )
         try:
             health = connector.check_health()
             healthy = bool(health.get("healthy", True))
@@ -1066,7 +1105,9 @@ def _check_connector_health(bot: FundingBot) -> dict[str, Any]:
             "connectors": [],
         }
     statuses = {entry["status"] for entry in checks}
-    overall_status = "error" if "error" in statuses else ("degraded" if "degraded" in statuses else "ok")
+    overall_status = (
+        "error" if "error" in statuses else ("degraded" if "degraded" in statuses else "ok")
+    )
     return {
         "status": overall_status,
         "checked": True,
@@ -1108,11 +1149,15 @@ def _build_health_payload(endpoint: str) -> dict[str, Any]:
         }
     overall_status = (
         "ok"
-        if all(str(result.get("status", "error")) in {"ok", "disabled"} for result in checks.values())
+        if all(
+            str(result.get("status", "error")) in {"ok", "disabled"} for result in checks.values()
+        )
         else "degraded"
     )
     failing_checks = [
-        name for name, result in checks.items() if str(result.get("status", "error")) not in {"ok", "disabled"}
+        name
+        for name, result in checks.items()
+        if str(result.get("status", "error")) not in {"ok", "disabled"}
     ]
     metrics = _record_health_check_metrics(endpoint, checks)
     payload = {
@@ -1933,6 +1978,54 @@ def export_tasks_route() -> Response:
     return jsonify({"tasks": tasks, "count": len(tasks)})
 
 
+@app.get("/api/exports")
+@export_rate_limit
+@require_role("admin", "auditor")
+def list_exports_route() -> Response:
+    audits = [
+        _serialize_audit_log(entry)
+        for entry in _bot().list_audit_logs(limit=20)
+        if entry.get("action") in {"data_warehouse_exported", "data_retention_enforced"}
+    ]
+    return jsonify(
+        {"schedule": _export_schedule_snapshot(), "exports": audits, "count": len(audits)}
+    )
+
+
+@app.post("/api/exports")
+@export_rate_limit
+@require_role("admin", "auditor")
+def create_export_route() -> Response:
+    payload = _get_request_json()
+    datasets = payload.get("datasets")
+    if datasets is not None and not isinstance(datasets, list):
+        raise ValueError("Field 'datasets' must be a list of dataset names.")
+    export_format = str(payload.get("format", "json")).strip().lower()
+    output_dir = str(
+        payload.get("output_dir", os.environ.get("DATA_EXPORT_OUTPUT_DIR", "generated/exports"))
+    ).strip()
+    if not output_dir:
+        raise ValueError("Field 'output_dir' must not be empty.")
+    archive = _coerce_bool(payload.get("archive", True), "archive")
+    async_requested = _coerce_bool(payload.get("async", False), "async")
+    if async_requested:
+        status_code, result = dispatch_export(
+            datasets=None if datasets is None else [str(dataset) for dataset in datasets],
+            export_format=export_format,
+            output_dir=output_dir,
+            archive=archive,
+            db_path=os.environ.get("BOT_DB_PATH", "funding_bot.db"),
+        )
+        return jsonify(result), status_code
+    result = _bot().export_data_warehouse(
+        datasets=None if datasets is None else [str(dataset) for dataset in datasets],
+        export_format=export_format,
+        output_dir=output_dir,
+        archive=archive,
+    )
+    return jsonify(result), 201
+
+
 @app.post("/api/tasks/sync")
 @api_rate_limit
 @require_role("admin")
@@ -2184,6 +2277,7 @@ def metrics() -> Response:
         "# TYPE funding_bot_communications_total counter",
         f"funding_bot_communications_total {communications_total}",
         *FundingBot.render_connector_metrics_prometheus(),
+        *FundingBot.render_batch_metrics_prometheus(),
         "# HELP funding_bot_tasks_total Total collaboration tasks",
         "# TYPE funding_bot_tasks_total gauge",
         f"funding_bot_tasks_total {tasks_total}",

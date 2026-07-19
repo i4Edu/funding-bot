@@ -17,7 +17,6 @@ from funding_bot import (
     NGODirectoryConnector,
 )
 
-
 CONNECTOR_OPPORTUNITY_SCHEMA = {
     "type": "object",
     "required": [

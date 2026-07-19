@@ -1,7 +1,7 @@
 import json
 import os
-import urllib.error
 import unittest
+import urllib.error
 from unittest import mock
 
 import requests
@@ -9,12 +9,12 @@ import requests
 import funding_bot
 from cache_manager import CacheManager
 from funding_bot import (
-    CSRNetworkConnector,
-    CredentialNotFoundError,
     ConnectionSecurityError,
     ConnectorConfigError,
     ConnectorRegistry,
+    CredentialNotFoundError,
     CrowdfundingConnector,
+    CSRNetworkConnector,
     FoundationDirectoryConnector,
     FundingBotError,
     GlobalGivingConnector,

@@ -119,7 +119,7 @@ Before increasing dashboard replicas or worker counts, run the concurrent admin-
   - active task count
   - queue depth / pending tasks
   - whether legacy cron is still enabled
-- `GET /health/database` returns SQLAlchemy pool status, configured sizing, and lifecycle counters
+- `GET /health/database` returns SQLAlchemy pool status, configured sizing, lifecycle counters, and aggregated query-monitoring data
 - `GET /health/cache` returns cache backend/reachability details
 
 Use `/health/queue` for worker-specific alerts and `/health` for general readiness/liveness checks.
@@ -156,14 +156,26 @@ to require login for the Flower UI.
 
 ### Metrics and alerts
 
-The `/metrics` endpoint exports queue metrics alongside app metrics, SQLAlchemy pool counters, and cache hit/miss/set/invalidation metrics. Alert on:
+The `/metrics` endpoint exports queue metrics alongside app metrics, SQLAlchemy pool counters, database query histograms/counters, and cache hit/miss/set/invalidation metrics. Alert on:
 
 - queue health status dropping to `0`
 - worker count dropping below the expected replica count
 - queue depth growing continuously over multiple scrape intervals
 - active tasks staying high with no drop in pending depth
 - database pool checked-out connections remaining near the configured size
+- database query error rate exceeding your SLO
+- database query timeouts or lock timeouts appearing at all
+- slow query ratio or p95 latency staying above the tuned threshold
 - cache miss ratios jumping unexpectedly for donor/profile lookups
+
+Example assets are checked into `monitoring/`:
+
+- `prometheus.yml` scrape config
+- `prometheus-alert-rules.yml` alert rules
+- `alertmanager.yml` Slack/email notification routing
+- `grafana-dashboards/database-query-performance.json` query dashboard
+
+See `docs/ALERTING.md` for threshold tuning and secret wiring.
 
 ## Scaling strategy
 

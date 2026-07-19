@@ -2,10 +2,10 @@ import hashlib
 import string
 import unittest
 
-from hypothesis import given, settings, strategies as st
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from funding_bot import FundingBot
-
 
 ASCII_TEXT = st.text(
     alphabet=string.ascii_letters + string.digits + " -_/:.&",

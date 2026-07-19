@@ -242,56 +242,80 @@ def create_celery_app(config: QueueConfig | None = None) -> Any:
                 "control_folder": str(BROKER_CONTROL_DIR),
             }
         )
-    celery_app.conf.update(beat_schedule={
-        "daily-summary": {
-            "task": "funding_bot.send_daily_summary",
-            "schedule": crontab(
-                minute=int(
-                    os.environ.get(
-                        "DAILY_SUMMARY_SCHEDULE_MINUTE", str(DEFAULT_DAILY_SUMMARY_MINUTE)
-                    )
+    celery_app.conf.update(
+        beat_schedule={
+            "daily-summary": {
+                "task": "funding_bot.send_daily_summary",
+                "schedule": crontab(
+                    minute=int(
+                        os.environ.get(
+                            "DAILY_SUMMARY_SCHEDULE_MINUTE", str(DEFAULT_DAILY_SUMMARY_MINUTE)
+                        )
+                    ),
+                    hour=int(
+                        os.environ.get(
+                            "DAILY_SUMMARY_SCHEDULE_HOUR", str(DEFAULT_DAILY_SUMMARY_HOUR)
+                        )
+                    ),
                 ),
-                hour=int(
-                    os.environ.get("DAILY_SUMMARY_SCHEDULE_HOUR", str(DEFAULT_DAILY_SUMMARY_HOUR))
+                "kwargs": {
+                    "recipient": os.environ.get("DAILY_SUMMARY_RECIPIENT", "lupael@i4e.com.bd"),
+                    "dry_run": _coerce_bool(os.environ.get("DAILY_SUMMARY_DRY_RUN"), default=False),
+                    "db_path": os.environ.get("BOT_DB_PATH", "funding_bot.db"),
+                },
+            },
+            "warehouse-export": {
+                "task": "funding_bot.export_data_warehouse",
+                "schedule": crontab(
+                    minute=int(
+                        os.environ.get(
+                            "DATA_EXPORT_SCHEDULE_MINUTE", str(DEFAULT_WAREHOUSE_EXPORT_MINUTE)
+                        )
+                    ),
+                    hour=int(
+                        os.environ.get(
+                            "DATA_EXPORT_SCHEDULE_HOUR", str(DEFAULT_WAREHOUSE_EXPORT_HOUR)
+                        )
+                    ),
                 ),
-            ),
-            "kwargs": {
-                "recipient": os.environ.get("DAILY_SUMMARY_RECIPIENT", "lupael@i4e.com.bd"),
-                "dry_run": _coerce_bool(os.environ.get("DAILY_SUMMARY_DRY_RUN"), default=False),
-                "db_path": os.environ.get("BOT_DB_PATH", "funding_bot.db"),
+                "kwargs": {
+                    "datasets": [
+                        dataset.strip()
+                        for dataset in os.environ.get(
+                            "DATA_EXPORT_DATASETS", "donors,tasks,matches,results"
+                        ).split(",")
+                        if dataset.strip()
+                    ],
+                    "export_format": os.environ.get("DATA_EXPORT_FORMAT", "json"),
+                    "output_dir": os.environ.get("DATA_EXPORT_OUTPUT_DIR", "generated/exports"),
+                    "archive": _coerce_bool(os.environ.get("DATA_EXPORT_ARCHIVE"), default=True),
+                    "db_path": os.environ.get("BOT_DB_PATH", "funding_bot.db"),
+                },
             },
-        }),
-        "warehouse-export": {
-            "task": "funding_bot.export_data_warehouse",
-            "schedule": crontab(
-                minute=int(os.environ.get("DATA_EXPORT_SCHEDULE_MINUTE", str(DEFAULT_WAREHOUSE_EXPORT_MINUTE))),
-                hour=int(os.environ.get("DATA_EXPORT_SCHEDULE_HOUR", str(DEFAULT_WAREHOUSE_EXPORT_HOUR))),
-            ),
-            "kwargs": {
-                "datasets": [
-                    dataset.strip()
-                    for dataset in os.environ.get("DATA_EXPORT_DATASETS", "donors,tasks,matches,results").split(",")
-                    if dataset.strip()
-                ],
-                "export_format": os.environ.get("DATA_EXPORT_FORMAT", "json"),
-                "output_dir": os.environ.get("DATA_EXPORT_OUTPUT_DIR", "generated/exports"),
-                "archive": _coerce_bool(os.environ.get("DATA_EXPORT_ARCHIVE"), default=True),
-                "db_path": os.environ.get("BOT_DB_PATH", "funding_bot.db"),
+            "data-retention-cleanup": {
+                "task": "funding_bot.enforce_data_retention",
+                "schedule": crontab(
+                    minute=int(
+                        os.environ.get(
+                            "DATA_RETENTION_SCHEDULE_MINUTE", str(DEFAULT_RETENTION_CLEANUP_MINUTE)
+                        )
+                    ),
+                    hour=int(
+                        os.environ.get(
+                            "DATA_RETENTION_SCHEDULE_HOUR", str(DEFAULT_RETENTION_CLEANUP_HOUR)
+                        )
+                    ),
+                ),
+                "kwargs": {
+                    "dry_run": _coerce_bool(
+                        os.environ.get("DATA_RETENTION_DRY_RUN"), default=False
+                    ),
+                    "archive": _coerce_bool(os.environ.get("DATA_RETENTION_ARCHIVE"), default=True),
+                    "db_path": os.environ.get("BOT_DB_PATH", "funding_bot.db"),
+                },
             },
-        },
-        "data-retention-cleanup": {
-            "task": "funding_bot.enforce_data_retention",
-            "schedule": crontab(
-                minute=int(os.environ.get("DATA_RETENTION_SCHEDULE_MINUTE", str(DEFAULT_RETENTION_CLEANUP_MINUTE))),
-                hour=int(os.environ.get("DATA_RETENTION_SCHEDULE_HOUR", str(DEFAULT_RETENTION_CLEANUP_HOUR))),
-            ),
-            "kwargs": {
-                "dry_run": _coerce_bool(os.environ.get("DATA_RETENTION_DRY_RUN"), default=False),
-                "archive": _coerce_bool(os.environ.get("DATA_RETENTION_ARCHIVE"), default=True),
-                "db_path": os.environ.get("BOT_DB_PATH", "funding_bot.db"),
-            },
-        },
-    }
+        }
+    )
     return celery_app
 
 

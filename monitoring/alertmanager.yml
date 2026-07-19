@@ -1,0 +1,57 @@
+global:
+  resolve_timeout: 5m
+
+route:
+  receiver: funding-bot-default
+  group_by:
+    - alertname
+    - severity
+    - service
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers:
+        - team="funding-bot"
+        - severity="critical"
+      receiver: funding-bot-critical
+    - matchers:
+        - team="funding-bot"
+      receiver: funding-bot-default
+
+receivers:
+  - name: funding-bot-default
+    slack_configs:
+      - api_url_file: /etc/alertmanager/secrets/slack-webhook-url
+        channel: '#funding-bot-alerts'
+        send_resolved: true
+        username: funding-bot-alertmanager
+        title: '[{{ .Status | toUpper }}] {{ .CommonLabels.alertname }}'
+        text: >-
+          {{ range .Alerts }}• {{ .Annotations.summary }}\n{{ .Annotations.description }}\n{{ end }}
+    email_configs:
+      - to: funding-bot-alerts@example.org
+        from: alertmanager@example.org
+        smarthost: smtp.example.org:587
+        auth_username: alertmanager@example.org
+        auth_password_file: /etc/alertmanager/secrets/email-password
+        require_tls: true
+        send_resolved: true
+
+  - name: funding-bot-critical
+    slack_configs:
+      - api_url_file: /etc/alertmanager/secrets/slack-webhook-url
+        channel: '#funding-bot-critical'
+        send_resolved: true
+        username: funding-bot-alertmanager
+        title: '[{{ .Status | toUpper }}][CRITICAL] {{ .CommonLabels.alertname }}'
+        text: >-
+          {{ range .Alerts }}• {{ .Annotations.summary }}\n{{ .Annotations.description }}\n{{ end }}
+    email_configs:
+      - to: funding-bot-oncall@example.org
+        from: alertmanager@example.org
+        smarthost: smtp.example.org:587
+        auth_username: alertmanager@example.org
+        auth_password_file: /etc/alertmanager/secrets/email-password
+        require_tls: true
+        send_resolved: true

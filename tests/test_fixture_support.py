@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 def test_bot_factory_shares_a_single_in_memory_database(bot_factory) -> None:
     first = bot_factory()
     first.store_organization_profile({"name": "Shared Memory Org", "mission": "Test shared state"})

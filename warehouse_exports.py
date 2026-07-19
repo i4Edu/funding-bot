@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable
@@ -43,8 +44,7 @@ DATASET_ALIASES = {
 
 
 def _env_flag(name: str, *, default: bool) -> bool:
-    raw_value = Path if False else None
-    value = __import__("os").environ.get(name)
+    value = os.environ.get(name)
     if value is None:
         return default
     normalized = value.strip().lower()
@@ -116,12 +116,12 @@ class ArchiveManager:
     @classmethod
     def from_env(cls) -> "ArchiveManager":
         return cls(
-            cold_storage_dir=__import__("os").environ.get(
+            cold_storage_dir=os.environ.get(
                 "EXPORT_ARCHIVE_DIR",
                 str(DEFAULT_ARCHIVE_DIR),
             ),
-            s3_bucket=__import__("os").environ.get("ARCHIVE_S3_BUCKET"),
-            s3_prefix=__import__("os").environ.get("ARCHIVE_S3_PREFIX", "funding-bot"),
+            s3_bucket=os.environ.get("ARCHIVE_S3_BUCKET"),
+            s3_prefix=os.environ.get("ARCHIVE_S3_PREFIX", "funding-bot"),
         )
 
     def _client(self) -> Any:

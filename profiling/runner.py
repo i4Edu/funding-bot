@@ -21,10 +21,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from funding_bot import FundingBot, GrantsPortalConnector  # noqa: E402
-from web.app import (  # noqa: E402
+from web.app import (
     _dashboard_context,
     _task_dashboard_context,
-    app as flask_app,
+)
+from web.app import app as flask_app  # noqa: E402
+from web.app import (
     list_donors,
     list_opportunities,
 )

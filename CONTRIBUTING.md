@@ -29,7 +29,7 @@ Common contribution areas include:
 - Python 3.11+
 - `pip`
 - Docker and Docker Compose (recommended for full-stack testing)
-- Node.js/npm only if you need to run accessibility checks
+- Node.js/npm if you need to run accessibility or Playwright browser checks
 
 ### Initial environment
 
@@ -52,29 +52,45 @@ Common contribution areas include:
    pip install -r requirements-dev.txt
    ```
 
-4. Optional: install accessibility test dependencies:
+4. Install local pre-commit hooks:
+
+   ```bash
+   python -m pre_commit install
+   ```
+
+5. Optional: install accessibility test dependencies:
 
    ```bash
    npm install
    ```
 
-5. Set local environment values in `.env` for at least:
+6. Set local environment values in `.env` for at least:
    - `ADMIN_PASSWORD`, `STAFF_PASSWORD`, `AUDITOR_PASSWORD`
    - `BOT_DB_PATH`
    - SMTP variables if you plan to test real delivery
    - `ENABLE_TASK_QUEUE`, `CELERY_BROKER_URL`, and `CELERY_RESULT_BACKEND` if you plan to test queue-backed workflows
+
+7. Install browser binaries when you plan to run Playwright:
+
+    ```bash
+    npx playwright install chromium
+    ```
 
 ### Running locally
 
 - Run tests:
 
   ```bash
-  python -m unittest
+  ./bin/dev-runner.sh test
+  pytest
   ```
+
+  Use `pytest -n 0` to temporarily disable parallel workers while debugging.
 
 - Run the web dashboard:
 
   ```bash
+  ./bin/dev-runner.sh run
   python -m flask --app web.app run
   ```
 
@@ -91,6 +107,22 @@ Common contribution areas include:
   ```
 
 See [README.md](README.md), [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md), and [docs/COLLABORATION.md](docs/COLLABORATION.md) for runtime and workflow details.
+
+### Formatting standards
+
+Funding Bot uses:
+
+- `black` with a 100-character line length
+- `isort` with the `black` compatibility profile
+- `ruff` for import, syntax, and Django/Flask-oriented web checks
+
+Run the shared formatter workflow before opening a pull request:
+
+```bash
+./bin/dev-runner.sh format
+./bin/dev-runner.sh lint
+python -m pre_commit run --all-files
+```
 
 ## Branching and pull request guidelines
 
@@ -153,16 +185,31 @@ When you change contributor-facing, operator-facing, or user-facing behavior:
 Run the smallest relevant existing test scope first, then widen if your change crosses boundaries. Examples:
 
 ```bash
+./bin/dev-runner.sh lint
+./bin/dev-runner.sh test
 python -m unittest tests.test_funding_bot -v
 python -m unittest tests.test_web_app -v
 python -m unittest tests.test_celery_tasks -v
 python -m unittest tests.test_signature_properties -v
+python -m pytest tests/test_regression.py -q
+python scripts/snapshot_tool.py validate
 pytest tests/test_smoke.py -m quick -q
 pytest tests/test_smoke.py -m smoke -q
 npm run test:a11y
+npm run test:e2e
+bash scripts/run_mutation_tests.sh
 ```
 
 For dashboard concurrency validation, follow [docs/LOAD_TESTING.md](docs/LOAD_TESTING.md).
+
+When a change intentionally updates stable generated output, refresh the committed snapshots with:
+
+```bash
+python scripts/snapshot_tool.py update
+```
+
+See [docs/REGRESSION_TESTING.md](docs/REGRESSION_TESTING.md) for the full regression-testing
+process and the CI workflows used for validation and snapshot refreshes.
 
 For release-critical coverage, run the smoke suite with flaky detection before merging:
 

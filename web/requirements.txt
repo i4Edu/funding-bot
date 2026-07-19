@@ -7,5 +7,8 @@ watchdog==6.0.0
 SQLAlchemy>=2.0.36,<2.1
 Babel>=2.14.0,<4
 requests>=2.32.3,<3
+opentelemetry-api==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0
 jsonschema>=4.23.0,<5
 coverage>=7.6,<8

@@ -22,7 +22,7 @@ cd funding-bot
 ### Python app dependencies
 
 ```bash
-python3 -m pip install -r web/requirements.txt
+python3 -m pip install -r requirements-dev.txt
 ```
 
 ### Accessibility test dependencies (optional)
@@ -60,6 +60,12 @@ The repository includes a helper script that can generate and populate `.env`:
 ./scripts/onboard.sh --skip-docker
 ```
 
+Install the local formatter hooks:
+
+```bash
+python3 -m pre_commit install
+```
+
 ## 4. First run
 
 ### Option A: Run locally with Python
@@ -67,7 +73,7 @@ The repository includes a helper script that can generate and populate `.env`:
 Start the dashboard:
 
 ```bash
-python3 -m flask --app web.app run --host 127.0.0.1 --port 5000
+./bin/dev-runner.sh run
 ```
 
 Open:
@@ -105,6 +111,9 @@ Services:
 ## 5. Useful validation commands
 
 ```bash
+./bin/dev-runner.sh format
+./bin/dev-runner.sh lint
+./bin/dev-runner.sh test
 python3 -m unittest discover -s tests
 pytest tests/test_smoke.py -m quick -q
 pytest tests/test_smoke.py -m smoke -q
@@ -140,7 +149,7 @@ Set `SESSION_COOKIE_SECURE=0` in `.env` when running over plain HTTP on localhos
 Reinstall Python dependencies:
 
 ```bash
-python3 -m pip install -r web/requirements.txt
+python3 -m pip install -r requirements-dev.txt
 ```
 
 ### Database path errors

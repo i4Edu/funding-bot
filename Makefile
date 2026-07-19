@@ -19,6 +19,7 @@ DOCS_BUILD_DIR ?= docs/_build
 DOCKER_ENV_FILE ?= .env
 COMPOSE_PROFILES ?=
 PYTHON_SOURCES ?= funding_bot.py celery_app.py celery_tasks.py task_queue.py web tests
+DEV_PYTHON_TOOLS ?= pre-commit ruff black isort mypy flake8
 DOCKER_APP_COMMAND ?= python -m flask --app web.app run --host 0.0.0.0 --port 5000
 COMPOSE_PROFILE_FLAGS := $(foreach profile,$(COMPOSE_PROFILES),--profile $(profile))
 
@@ -60,7 +61,7 @@ install: ensure-runtime ## Install dependencies for the selected execution mode.
 	@if [ "$(EXECUTION_MODE)" = "docker" ]; then \
 		echo "Python dependencies are baked into $(IMAGE_NAME)."; \
 	else \
-		$(PYTHON_EXEC) 'python -m pip install --upgrade pip && python -m pip install -r requirements.txt -r requirements-dev.txt pre-commit'; \
+		$(PYTHON_EXEC) 'python -m pip install --upgrade pip && python -m pip install -r requirements.txt -r requirements-dev.txt $(DEV_PYTHON_TOOLS)'; \
 	fi
 	@$(NODE_EXEC) 'if [ -f package-lock.json ]; then npm ci; elif [ -f package.json ]; then npm install; else echo "Skipping Node.js dependencies: no package.json found."; fi'
 
@@ -69,9 +70,7 @@ test: ensure-runtime ## Run the Python test suite.
 
 lint: ensure-runtime ## Run configured linters, or fall back to Python syntax checks.
 	@$(PYTHON_EXEC) 'set -e; \
-		if command -v pre-commit >/dev/null 2>&1 && [ -f .pre-commit-config.yaml ]; then \
-			pre-commit run flake8 --all-files; \
-		elif python -m ruff --version >/dev/null 2>&1; then \
+		if python -m ruff --version >/dev/null 2>&1; then \
 			python -m ruff check $(PYTHON_SOURCES); \
 		elif python -m flake8 --version >/dev/null 2>&1; then \
 			python -m flake8 $(PYTHON_SOURCES); \
@@ -82,10 +81,7 @@ lint: ensure-runtime ## Run configured linters, or fall back to Python syntax ch
 
 format: ensure-runtime ## Run the configured formatter when available.
 	@$(PYTHON_EXEC) 'set -e; \
-		if command -v pre-commit >/dev/null 2>&1 && [ -f .pre-commit-config.yaml ]; then \
-			pre-commit run black --all-files; \
-			pre-commit run isort --all-files; \
-		elif python -m ruff format --help >/dev/null 2>&1; then \
+		if python -m ruff format --help >/dev/null 2>&1; then \
 			python -m ruff format $(PYTHON_SOURCES); \
 		elif python -m black --version >/dev/null 2>&1 && python -m isort --version >/dev/null 2>&1; then \
 			python -m black $(PYTHON_SOURCES); \
@@ -98,9 +94,7 @@ format: ensure-runtime ## Run the configured formatter when available.
 
 type-check: ensure-runtime ## Run the configured type checker, or fall back to Python syntax checks.
 	@$(PYTHON_EXEC) 'set -e; \
-		if command -v pre-commit >/dev/null 2>&1 && [ -f .pre-commit-config.yaml ]; then \
-			pre-commit run mypy --all-files; \
-		elif python -m mypy --version >/dev/null 2>&1; then \
+		if python -m mypy --version >/dev/null 2>&1; then \
 			python -m mypy .; \
 		elif command -v pyright >/dev/null 2>&1; then \
 			pyright; \

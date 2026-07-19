@@ -5,14 +5,15 @@ import logging
 import os
 import signal
 import types
-import urllib.error
 import unittest
 import unittest.mock
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from shutil import rmtree
 from zipfile import ZipFile
 
+import task_queue
 from funding_bot import (
     DuplicateSubmissionError,
     FundingBot,
@@ -25,8 +26,6 @@ from funding_bot import (
     Task,
     TaskTransitionError,
 )
-import task_queue
-
 
 TEST_ARTIFACTS_DIR = Path(".test-artifacts")
 
@@ -112,6 +111,36 @@ class FundingBotTests(unittest.TestCase):
         self.assertIn("checkouts", metrics)
         self.assertIn("checked_out", metrics)
         self.assertIn("pool_class", metrics)
+
+    def test_database_query_metrics_track_counts_errors_and_slow_queries(self):
+        before = self.bot.get_database_query_metrics()["summary"]["count"]
+
+        self.bot.connection.execute("SELECT 1").fetchone()
+        with self.assertRaises(sqlite3.OperationalError):
+            self.bot.connection.execute("SELECT * FROM missing_query_metrics_table").fetchone()
+
+        metrics = self.bot.get_database_query_metrics()
+
+        self.assertGreaterEqual(metrics["summary"]["count"], before + 2)
+        self.assertGreaterEqual(metrics["summary"]["error"], 1)
+        self.assertIn("select", metrics["statements"])
+        self.assertGreaterEqual(metrics["summary"]["max_duration_seconds"], 0.0)
+
+    def test_database_query_metrics_respect_slow_query_threshold_configuration(self):
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"FUNDING_BOT_DB_SLOW_QUERY_THRESHOLD_SECONDS": "0"},
+            clear=False,
+        ):
+            bot = FundingBot(db_path=":memory:")
+        try:
+            bot.connection.execute("SELECT 1").fetchone()
+            metrics = bot.get_database_query_metrics()
+        finally:
+            bot.close()
+
+        self.assertEqual(0.0, metrics["slow_query_threshold_seconds"])
+        self.assertGreater(metrics["summary"]["slow"], 0)
 
     def _discover_sample_opportunity(self):
         found = self.bot.discover_opportunities(
@@ -1151,8 +1180,8 @@ class QueueExecutionTests(unittest.TestCase):
 
 
 from funding_bot import (
-    CSRNetworkConnector,
     CrowdfundingConnector,
+    CSRNetworkConnector,
     FileVault,
     FoundationDirectoryConnector,
     GlobalGivingConnector,

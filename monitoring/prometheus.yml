@@ -1,0 +1,17 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - prometheus-alert-rules.yml
+
+scrape_configs:
+  - job_name: funding-bot
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets:
+          - funding-bot:5000
+    basic_auth:
+      username: admin
+      password: change-me

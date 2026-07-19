@@ -10,6 +10,7 @@ The Nonprofit Funding Bot helps staff discover funding opportunities, prevent du
 
 For planned milestones and release scope, see [roadmap.md](roadmap.md).
 For connector implementation and keyword-mapping guidance, see [docs/CONNECTORS.md](docs/CONNECTORS.md).
+For async connector/database flow, batching, and coalescing details, see [docs/ASYNC_ARCHITECTURE.md](docs/ASYNC_ARCHITECTURE.md).
 For the full Flask endpoint reference, example requests, authentication rules, and error formats, see [docs/API.md](docs/API.md).
 For collaboration workflow, permissions, and task API examples, see [docs/COLLABORATION.md](docs/COLLABORATION.md).
 For the complete JSON/text API contract, schemas, diagrams, and curl examples, see [docs/API_REFERENCE.md](docs/API_REFERENCE.md).
@@ -153,7 +154,7 @@ Secret donor preferences and organization-profile payloads are encrypted at rest
 ### Database pooling and caching
 
 - SQLAlchemy manages SQLite connections with configurable pool sizing, overflow, timeout, recycle, and pre-ping checks.
-- `/metrics` exports connection-pool gauges/counters plus cache hit/miss/set/invalidation metrics.
+- `/metrics` exports connection-pool, database query, queue, connector, and cache metrics for Prometheus/Grafana.
 - The cache layer supports a Redis backend (`FUNDING_BOT_CACHE_BACKEND=redis`) with an in-process fallback for local/test environments.
 - TTL defaults:
   - donor records: 5 minutes
@@ -265,6 +266,12 @@ The core bot uses the Python standard library plus Babel for locale-aware docume
 pip install -r requirements.txt
 ```
 
+For browser, pytest, and mutation tooling used in local QA and CI:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
 Set `FUNDING_BOT_ENCRYPTION_KEY` in deployed environments so encrypted donor and organization fields use a deployment-specific key.
 `requirements.txt` also installs `py-spy` so the profiling utilities can emit SVG flame graphs in addition to `cProfile` reports.
 
@@ -278,7 +285,7 @@ pre-commit install
 pre-commit run --all-files
 ```
 
-The configured hooks run `black`, `isort`, `flake8`, `mypy`, `bandit`, `safety`, and `pip-audit`. Dependency scans cover both `requirements.txt` and `web/requirements.txt`.
+The configured hooks run `ruff`, `black`, `isort`, `mypy`, `bandit`, `safety`, and `pip-audit`. Dependency scans cover both `requirements.txt` and `web/requirements.txt`.
 
 ## Makefile workflow
 
@@ -318,11 +325,11 @@ make test EXECUTION_MODE=docker
 | --- | --- |
 | `help` | Show available targets plus the most important variables. |
 | `setup` | Install dependencies and initialize the configured SQLite database. |
-| `install` | Install `requirements.txt`, `requirements-dev.txt`, `pre-commit`, and Node.js dependencies locally, or prepare the Docker runtime plus Node.js dependencies when `EXECUTION_MODE=docker`. |
+| `install` | Install `requirements.txt`, `requirements-dev.txt`, common Python development tools (`pre-commit`, `ruff`, `black`, `isort`, `mypy`, `flake8`), and Node.js dependencies locally, or prepare the Docker runtime plus Node.js dependencies when `EXECUTION_MODE=docker`. |
 | `test` | Run the Python unittest suite. |
-| `lint` | Run the configured `flake8` pre-commit hook when available, otherwise fall back to `ruff`, `flake8`, or Python syntax checks. |
-| `format` | Run the configured `black` and `isort` hooks when available, otherwise use local formatter binaries if present. |
-| `type-check` | Run the configured `mypy` hook when available, otherwise fall back to `mypy`, `pyright`, or Python syntax checks. |
+| `lint` | Run `ruff`, `black --check`, and `isort --check-only` through the shared development runner. |
+| `format` | Apply `ruff --fix`, `isort`, and `black` through the shared development runner. |
+| `type-check` | Run `mypy` when available, otherwise fall back to `pyright` or Python syntax checks. |
 | `docker-build` | Build the application Docker image from the top-level `Dockerfile`. |
 | `docker-run` | Run the Flask dashboard in Docker with the data directory mounted into the container. |
 | `compose-up` / `compose-down` | Start or stop the Docker Compose stack, optionally with profiles such as `queue`. |
@@ -369,25 +376,46 @@ If a translation is missing for the requested locale, document generation falls 
 
 ## Quick Start
 
+### Development runner
+
+```bash
+./bin/dev-runner.sh setup
+./bin/dev-runner.sh format
+./bin/dev-runner.sh lint
+./bin/dev-runner.sh test
+./bin/dev-runner.sh run
+```
+
 ### Run tests
 
 ```bash
-python -m unittest discover -s tests
+./bin/dev-runner.sh test
+pip install -r requirements-dev.txt
+pytest
 ```
 
 ```bash
 python -m coverage run --rcfile=.coveragerc -m unittest tests.test_connector_coverage
 python -m coverage html
+python -m pytest tests/test_regression.py -q
+python scripts/snapshot_tool.py validate
+python scripts/snapshot_tool.py update
 pytest tests/test_smoke.py -m quick -q
 pytest tests/test_smoke.py -m smoke -q
 pytest tests/test_mock_connector_server.py tests/test_fixture_support.py -q
+npm run test:e2e
+bash scripts/run_mutation_tests.sh
 ```
+
+For the regression and snapshot workflow, see [docs/REGRESSION_TESTING.md](docs/REGRESSION_TESTING.md).
 
 ### Run integration tests
 
 ```bash
 python -m unittest discover -s tests -p 'test_integration.py'
 ```
+
+`pytest` uses `pytest-xdist` with `-n auto --dist loadscope` by default. Use `pytest -n 0` for single-process debugging, and see [docs/TEST_FIXTURES.md](docs/TEST_FIXTURES.md) for shared donor/task/connector/document fixtures.
 
 The integration suite uses mocked portal/browser dependencies and an in-memory
 SQLite database so the full discover → apply → summary workflow can be verified
@@ -411,6 +439,15 @@ pytest tests/test_smoke.py -m smoke -q --reruns 2 --reruns-delay 1 \
 The flaky report records rerun-backed passes and emits Prometheus-style reliability
 metrics (`stable_pass_rate`, `eventual_pass_rate`, and `flake_rate`) for CI artifacts.
 
+### Format and lint code
+
+```bash
+./bin/dev-runner.sh format
+./bin/dev-runner.sh lint
+python -m pre_commit install
+python -m pre_commit run --all-files
+```
+
 ### Shared pytest fixtures
 
 `tests/conftest.py` now provides shared test fixtures for connector and web flows:
@@ -427,6 +464,36 @@ mock-server thread automatically at the end of each test.
 npm install
 npm run test:a11y
 ```
+
+### Run browser end-to-end tests
+
+The Playwright suite boots `tests/e2e/run_server.py`, seeds a deterministic
+SQLite database, and exercises the browser flows for authentication, dashboard
+navigation, settings updates, connector discovery, donor outreach, task
+creation/editing/status changes, and JSON export.
+
+```bash
+npm install
+npx playwright install chromium
+npm run test:e2e
+```
+
+### Run mutation testing
+
+Mutation testing is configured with `mutmut` in `pyproject.toml` and currently
+focuses on `web/app.py` and `task_queue.py`, where the browser and workflow
+orchestration logic lives.
+
+```bash
+pip install -r requirements-dev.txt
+bash scripts/run_mutation_tests.sh
+
+# Optional: narrow the run while strengthening tests for a specific module
+bash scripts/run_mutation_tests.sh "web.app*"
+```
+
+The helper script runs the focused pytest baseline first, then executes
+`mutmut run` and exports CI-friendly statistics into `mutants/`.
 
 ### Run dashboard load tests
 
@@ -518,6 +585,7 @@ python -m funding_bot list-donors --segment corporate
 ### Run the web dashboard
 
 ```bash
+./bin/dev-runner.sh run
 python scripts/run_dev_web.py
 ```
 
@@ -544,6 +612,8 @@ Container**. The devcontainer starts these services from
 Useful commands inside the container:
 
 ```bash
+./bin/dev-runner.sh lint
+./bin/dev-runner.sh test
 python -m unittest discover -s tests
 python scripts/mock_connector_server.py --host 0.0.0.0 --port 8080
 python scripts/run_dev_web.py
@@ -945,6 +1015,14 @@ The `/metrics` endpoint exposes the following gauges and counters in the Prometh
 | `funding_bot_connector_latency_seconds_sum{connector_name,connector_type}` | counter | Total connector request latency in seconds |
 | `funding_bot_connector_latency_seconds_count{connector_name,connector_type}` | counter | Connector latency observations |
 | `funding_bot_uptime_seconds` | gauge | Seconds since the web process started |
+| `funding_bot_db_queries_total{statement,status}` | counter | Database queries by SQL statement verb and final status |
+| `funding_bot_db_query_errors_total{statement}` | counter | Database query failures by statement |
+| `funding_bot_db_query_timeouts_total{statement}` | counter | Database query timeouts / lock timeouts by statement |
+| `funding_bot_db_slow_queries_total{statement}` | counter | Queries exceeding `FUNDING_BOT_DB_SLOW_QUERY_THRESHOLD_SECONDS` |
+| `funding_bot_db_query_duration_seconds_bucket{statement,le}` | histogram | Query execution time histogram by statement |
+| `funding_bot_db_query_duration_seconds_max{statement}` | gauge | Maximum observed query latency by statement |
+| `funding_bot_db_queries_in_flight{statement}` | gauge | Queries currently executing |
+| `funding_bot_db_query_slow_threshold_seconds` | gauge | Configured slow-query threshold |
 | `funding_bot_queue_health_status` | gauge | Queue health state (`1` = broker reachable and metrics collected; `0` = disabled or degraded) |
 | `funding_bot_queue_broker_up` | gauge | Whether the Celery broker is reachable |
 | `funding_bot_queue_active_tasks` | gauge | Active Celery tasks currently executing |
@@ -959,7 +1037,7 @@ The `/metrics` endpoint exposes the following gauges and counters in the Prometh
 | `funding_bot_dead_letter_queue_total` | gauge | Queue task runs currently stored in the dead-letter queue |
 | `funding_bot_queue_duplicate_preventions_total` | counter | Duplicate queue executions prevented by idempotency keys |
 
-Add a scrape target pointing to `http://<host>:5000/metrics` in your Prometheus configuration or Grafana Agent config, and authenticate with an `admin` or `auditor` dashboard role.
+Example Prometheus, Alertmanager, and Grafana assets live under `monitoring/`. Add a scrape target pointing to `http://<host>:5000/metrics`, authenticate with an `admin` or `auditor` dashboard role, and import `monitoring/grafana-dashboards/database-query-performance.json` for the query dashboard. See `docs/ALERTING.md` for alert thresholds, Slack/email wiring, and tuning guidance.
 
 ### Task filter API
 
