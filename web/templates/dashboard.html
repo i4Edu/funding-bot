@@ -47,6 +47,8 @@
     </nav>
 
     <main id="main-content" class="container py-4" tabindex="-1">
+      {% set tracing_summary = tracing_summary if tracing_summary is defined else {"enabled": false, "exporter": "disabled"} %}
+      {% set slo_summary = slo_summary if slo_summary is defined else [] %}
       <h1 class="visually-hidden">Operations Dashboard</h1>
       <div class="row g-4 mb-4" role="region" aria-label="Summary statistics">
         <div class="col-md-6 col-xl-2">
@@ -104,6 +106,55 @@
           </div>
         </div>
       </div>
+
+      <section class="row g-4 mb-4" role="region" aria-labelledby="slo-dashboard-heading">
+        <div class="col-lg-12">
+          <div class="card border-0 shadow-sm">
+            <div class="card-header bg-white d-flex justify-content-between align-items-center">
+              <div>
+                <h2 class="h5 mb-0" id="slo-dashboard-heading">Service-level objectives</h2>
+                <p class="text-muted small mb-0">24-hour compliance for connector latency, task queue throughput, and dashboard response time.</p>
+              </div>
+              <span class="badge {% if tracing_summary.enabled %}text-bg-success{% else %}text-bg-secondary{% endif %}">
+                Tracing {{ tracing_summary.exporter }}
+              </span>
+            </div>
+            <div class="card-body">
+              <div class="row g-3">
+                {% for slo in slo_summary %}
+                <div class="col-md-4">
+                  <article class="border rounded-3 p-3 h-100 {% if slo.compliant %}border-success-subtle bg-success-subtle{% else %}border-warning-subtle bg-warning-subtle{% endif %}">
+                    <div class="d-flex justify-content-between align-items-start gap-3">
+                      <div>
+                        <h3 class="h6 mb-1">{{ slo.label }}</h3>
+                        <p class="small text-muted mb-2">{{ slo.description }}</p>
+                      </div>
+                      <span class="badge {% if slo.compliant %}text-bg-success{% else %}text-bg-warning{% endif %}">
+                        {% if slo.compliant %}On target{% else %}Needs attention{% endif %}
+                      </span>
+                    </div>
+                    <dl class="row small mb-0">
+                      <dt class="col-7">p95 latency</dt>
+                      <dd class="col-5 text-end">{{ "%.0f"|format(slo.latency_p95_seconds * 1000) }} ms</dd>
+                      <dt class="col-7">Target</dt>
+                      <dd class="col-5 text-end">{{ "%.0f"|format(slo.latency_target_seconds * 1000) }} ms</dd>
+                      <dt class="col-7">Error rate</dt>
+                      <dd class="col-5 text-end">{{ "%.1f"|format(slo.error_rate * 100) }}%</dd>
+                      <dt class="col-7">Budget</dt>
+                      <dd class="col-5 text-end">{{ "%.1f"|format(slo.max_error_rate * 100) }}%</dd>
+                      <dt class="col-7">Throughput</dt>
+                      <dd class="col-5 text-end">{{ "%.1f"|format(slo.throughput_per_hour) }}/hr</dd>
+                      <dt class="col-7">Samples</dt>
+                      <dd class="col-5 text-end">{{ slo.samples }}</dd>
+                    </dl>
+                  </article>
+                </div>
+                {% endfor %}
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
 
       <section class="row g-4 mb-4" role="region" aria-labelledby="overdue-tasks-heading">
         <div class="col-lg-12">

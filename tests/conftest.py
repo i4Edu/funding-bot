@@ -7,8 +7,10 @@ import re
 import shutil
 import sqlite3
 import sys
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 
@@ -645,6 +647,8 @@ def funding_bot(monkeypatch: pytest.MonkeyPatch, db_path: Path) -> FundingBot:
     monkeypatch.setenv("BOT_DB_PATH", str(db_path))
     monkeypatch.setenv("DATA_RESIDENCY", "EU")
     monkeypatch.setenv("DATA_STORAGE_REGION", "EU")
+    monkeypatch.setenv("CELERY_BROKER_URL", "filesystem://")
+    monkeypatch.setenv("CELERY_RESULT_BACKEND", "cache+memory://")
     FundingBot.reset_connector_metrics()
     bot = FundingBot(db_path=str(db_path))
     yield bot
@@ -664,6 +668,8 @@ def db_transaction(
     monkeypatch.setenv("BOT_DB_PATH", str(db_path))
     monkeypatch.setenv("DATA_RESIDENCY", "EU")
     monkeypatch.setenv("DATA_STORAGE_REGION", "EU")
+    monkeypatch.setenv("CELERY_BROKER_URL", "filesystem://")
+    monkeypatch.setenv("CELERY_RESULT_BACKEND", "cache+memory://")
     bot = FundingBot(db_path=str(db_path))
     savepoint_name = f"pytest_{_slugify(request.node.nodeid)[:48]}"
     bot.connection.execute(f"SAVEPOINT {savepoint_name}")
@@ -685,19 +691,112 @@ def transactional_funding_bot(db_transaction: DatabaseTransaction) -> FundingBot
 @pytest.fixture()
 def bot_factory(monkeypatch: pytest.MonkeyPatch, artifact_dir: Path) -> Callable[..., FundingBot]:
     created_bots: list[FundingBot] = []
+    shared_db_path = artifact_dir / "shared-bot.db"
 
     def factory(
         *, name: str = "bot", connector_configs: dict[str, Any] | None = None, **kwargs: Any
     ) -> FundingBot:
-        bot_db_path = artifact_dir / f"{name}.db"
-        monkeypatch.setenv("BOT_DB_PATH", str(bot_db_path))
-        bot = FundingBot(db_path=str(bot_db_path), connector_configs=connector_configs, **kwargs)
+        monkeypatch.setenv("BOT_DB_PATH", str(shared_db_path))
+        monkeypatch.setenv("DATA_RESIDENCY", "EU")
+        monkeypatch.setenv("DATA_STORAGE_REGION", "EU")
+        monkeypatch.setenv("CELERY_BROKER_URL", "filesystem://")
+        monkeypatch.setenv("CELERY_RESULT_BACKEND", "cache+memory://")
+        bot = FundingBot(
+            db_path=str(shared_db_path),
+            connector_configs=connector_configs,
+            **kwargs,
+        )
         created_bots.append(bot)
         return bot
 
     yield factory
     for bot in reversed(created_bots):
         bot.close()
+
+
+@pytest.fixture()
+def seeded_database(bot_factory: Callable[..., FundingBot]) -> dict[str, object]:
+    bot = bot_factory()
+    bot.store_organization_profile(
+        {"name": "i4Edu", "mission": "Expand access to equitable education."}
+    )
+    opportunities = bot.discover_opportunities(
+        [
+            {
+                "source": "Grants Portal",
+                "donor_name": "UNICEF",
+                "title": "Education Innovation Grant",
+                "portal_url": "https://example.org/opportunities/education-innovation-grant",
+                "summary": "Funding for school improvement and digital learning.",
+                "category": "Education",
+                "tags": ["education", "innovation"],
+            },
+            {
+                "source": "CSR Network",
+                "donor_name": "Acme Foundation",
+                "title": "Community Technology Fund",
+                "portal_url": "https://example.org/opportunities/community-technology-fund",
+                "summary": "CSR support for nonprofit technology access.",
+                "category": "Technology",
+                "tags": ["csr", "technology"],
+            },
+        ],
+        keywords=["education", "technology", "csr"],
+    )
+    task = bot.create_task(
+        title="Seeded task",
+        assigned_to="staff",
+        description="Verify seeded fixtures",
+        due_date="2026-08-10",
+    )
+    bot.upsert_donor(
+        email="seeded-donor@example.org",
+        name="Seeded Donor",
+        segment="institutional",
+        locale="en",
+    )
+    bot.submit_translation_review(
+        locale="bn",
+        translation_key="dashboard.title",
+        source_text="Dashboard",
+        translated_text="ড্যাশবোর্ড",
+        submitted_by_role="staff",
+    )
+    return {
+        "db_path": Path(bot.db_path),
+        "organization_name": "i4Edu",
+        "task_id": task["id"],
+        "counts": {
+            "opportunities": len(opportunities),
+            "tasks": len(bot.list_tasks()),
+            "donors": len(bot.list_donors()),
+            "translation_reviews": len(bot.list_translation_reviews()),
+        },
+    }
+
+
+@pytest.fixture()
+def seeded_app_client(
+    seeded_database: dict[str, object],
+    monkeypatch: pytest.MonkeyPatch,
+) -> dict[str, object]:
+    db_path = Path(str(seeded_database["db_path"]))
+    monkeypatch.setenv("BOT_DB_PATH", str(db_path))
+    monkeypatch.setenv("DATA_RESIDENCY", "EU")
+    monkeypatch.setenv("DATA_STORAGE_REGION", "EU")
+    monkeypatch.setenv("CELERY_BROKER_URL", "filesystem://")
+    monkeypatch.setenv("CELERY_RESULT_BACKEND", "cache+memory://")
+    FundingBot.reset_connector_metrics()
+    web_app_module.reset_health_check_metrics()
+    app.config["TESTING"] = True
+    client = app.test_client()
+    return {
+        "client": client,
+        "seed_data": seeded_database,
+        "admin_headers": _auth_header("admin", "admin-secret"),
+        "staff_headers": _auth_header("staff", "staff-secret"),
+        "auditor_headers": _auth_header("auditor", "auditor-secret"),
+    }
 
 
 @pytest.fixture()
@@ -893,6 +992,83 @@ def service_mocks(
 
 
 @pytest.fixture()
+def mock_connector_server(monkeypatch: pytest.MonkeyPatch) -> dict[str, str]:
+    class MockConnectorHandler(BaseHTTPRequestHandler):
+        server_version = "FundingBotMock/1.0"
+
+        def _send_json(self, payload: dict[str, Any], status_code: int = 200) -> None:
+            encoded = json.dumps(payload).encode("utf-8")
+            self.send_response(status_code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path.startswith("/health"):
+                self._send_json({"status": "ok", "connectors": ["grants-portal", "csr-network"]})
+                return
+            if self.path.startswith("/csr-network"):
+                self._send_json(
+                    {
+                        "results": [
+                            {
+                                "title": "Mock CSR Digital Learning Fund",
+                                "organization": "Mock CSR Network",
+                                "url": "https://example.org/csr-digital-learning",
+                                "summary": "Remote CSR opportunity for digital learning.",
+                            }
+                        ]
+                    }
+                )
+                return
+            self._send_json({"error": "not_found"}, status_code=404)
+
+        def do_POST(self) -> None:  # noqa: N802
+            if self.path.startswith("/grants-portal"):
+                self._send_json(
+                    {
+                        "data": {
+                            "hitCount": 1,
+                            "oppHits": [
+                                {
+                                    "id": "mock-education-grant",
+                                    "title": "Mock Education Innovation Grant",
+                                    "organization": "Mock Grants Portal",
+                                    "url": "https://example.org/mock-education-innovation-grant",
+                                    "description": "Remote grants portal opportunity for education innovation.",
+                                }
+                            ],
+                        }
+                    }
+                )
+                return
+            self._send_json({"error": "not_found"}, status_code=404)
+
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), MockConnectorHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+
+    monkeypatch.setattr(funding_bot_module, "_require_https_url", lambda url, **_: url)
+
+    base_url = f"http://127.0.0.1:{server.server_port}"
+    try:
+        yield {
+            "base_url": base_url,
+            "health_url": f"{base_url}/health",
+            "grants_portal_url": f"{base_url}/grants-portal",
+            "csr_network_url": f"{base_url}/csr-network",
+        }
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.fixture()
 def smoke_client(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
 ) -> dict[str, object]:
@@ -914,6 +1090,8 @@ def smoke_client(
     monkeypatch.setenv("BOT_DB_PATH", str(db_path))
     monkeypatch.setenv("DATA_RESIDENCY", "EU")
     monkeypatch.setenv("DATA_STORAGE_REGION", "EU")
+    monkeypatch.setenv("CELERY_BROKER_URL", "filesystem://")
+    monkeypatch.setenv("CELERY_RESULT_BACKEND", "cache+memory://")
     FundingBot.reset_connector_metrics()
     web_app_module.reset_health_check_metrics()
     app.config["TESTING"] = True

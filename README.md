@@ -15,6 +15,7 @@ For the full Flask endpoint reference, example requests, authentication rules, a
 For collaboration workflow, permissions, and task API examples, see [docs/COLLABORATION.md](docs/COLLABORATION.md).
 For the complete JSON/text API contract, schemas, diagrams, and curl examples, see [docs/API_REFERENCE.md](docs/API_REFERENCE.md).
 For deployment and scaling guidance, see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+For CLI config-file defaults, dry-run previews, and override precedence, see [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
 For common runtime problems, diagnostic commands, and error recovery, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 For common setup, connector, deduplication, export, and API questions, see [docs/FAQ.md](docs/FAQ.md).
 For Kubernetes rollout details, see [docs/KUBERNETES.md](docs/KUBERNETES.md).
@@ -41,6 +42,7 @@ For the operational breach runbook, see [docs/INCIDENT_RESPONSE.md](docs/INCIDEN
 - [API reference](docs/API.md)
 - [Collaboration guide](docs/COLLABORATION.md)
 - [Deployment guide](docs/DEPLOYMENT.md)
+- [Configuration guide](docs/CONFIGURATION.md)
 - [Backup and recovery runbook](docs/BACKUP_RECOVERY.md)
 - [Database indexing guide](docs/INDEXING.md)
 - [Environment variable reference](docs/ENV_VARS.md)
@@ -264,7 +266,7 @@ Kubernetes (scaled)
 
 For the fastest local setup path, start with [docs/QUICKSTART.md](docs/QUICKSTART.md). For a full list of supported configuration values, see [docs/ENV_VARS.md](docs/ENV_VARS.md).
 
-The core bot uses the Python standard library plus Babel for locale-aware document formatting, and the web/task-queue stack uses Flask, Celery, Redis, and SQLAlchemy:
+The core bot uses the Python standard library plus Babel for locale-aware document formatting, Colorama for ANSI-safe CLI colors, Rich for progress bars/ETA output, and the web/task-queue stack uses Flask, Celery, Redis, and SQLAlchemy:
 
 ```bash
 pip install -r requirements.txt
@@ -289,7 +291,7 @@ pre-commit install
 pre-commit run --all-files
 ```
 
-The configured hooks run `ruff`, `black`, `isort`, `mypy`, `bandit`, `safety`, and `pip-audit`. Dependency scans cover both `requirements.txt` and `web/requirements.txt`.
+The configured hooks run `black`, `isort`, `flake8`, `mypy`, `bandit`, `safety`, and `pip-audit`. Dependency scans cover both `requirements.txt` and `web/requirements.txt`.
 
 ## Makefile workflow
 
@@ -544,6 +546,9 @@ python -m funding_bot --non-interactive test-connector --connector grants-portal
 # Show informational CLI logs
 python -m funding_bot --verbose discover --keywords education
 
+# Disable ANSI colors (useful for CI logs)
+python -m funding_bot --no-color doctor
+
 # Silence non-error logs
 python -m funding_bot --quiet list-opportunities
 
@@ -559,6 +564,9 @@ python -m funding_bot completion --shell zsh
 
 # Run diagnostics for SQLite, Celery, Redis, and connectors
 python -m funding_bot doctor --json
+
+# Export warehouse datasets with progress + ETA
+python -m funding_bot export-data-warehouse --format csv --output-dir generated/exports
 
 # Queue delivery of the daily summary via SMTP
 python -m funding_bot send-daily-summary --recipient lupael@i4e.com.bd
@@ -634,6 +642,7 @@ Global option:
 | `--quiet` | Reduce CLI logging to `ERROR` so only failures are emitted. |
 | `--non-interactive` | Disable `input()` prompts and fail fast when required command options are missing. |
 | `--json` | Emit structured JSON envelopes for every CLI command. You can also place `--json` after the subcommand. |
+| `--no-color` | Disable ANSI colors for success/warning/error output while leaving progress reporting enabled. |
 
 ## CLI logging and interactive prompts
 
@@ -649,6 +658,12 @@ Commands with required options (`send-outreach`, `test-connector`, and
 `register-credential`) prompt for missing values by default. Use
 `--non-interactive` in scripts or CI so missing required flags fail immediately
 instead of waiting for input.
+
+By default, the CLI colors success messages green, warnings yellow, and errors
+red when attached to a terminal. Long-running connector discovery, warehouse
+exports, and report/export flows show Rich progress bars with completed,
+remaining, and estimated time remaining. Use `--no-color` (or `NO_COLOR=1`) to
+disable ANSI colors.
 
 Examples:
 
@@ -673,6 +688,7 @@ Command reference:
 | `list-donors` | `v0.3.0` | `--segment {corporate,institutional,individual,unknown}` | List donor records and segment membership. | Available |
 | `monthly-audit-report` | `v1.0.0` | `--year YEAR`, `--month MONTH`, `--output FILE` | Generate a monthly GDPR/ISO compliance audit report as JSON. | Available |
 | `gdpr-self-check-report` | `v1.0.0` | `--cadence {weekly,monthly}`, `--output FILE` | Generate a GDPR self-check report covering consent coverage, retention, exports, and deletions. | Available |
+| `export-data-warehouse` | `v1.0.0` | `--datasets DATASETS`, `--format {json,csv,parquet}`, `--output-dir DIR`, `--archive` | Export warehouse-friendly donor/task/match/result datasets with progress tracking and optional archival. | Available |
 | `discover` | `v0.3.0` | `--keywords KEYWORDS`, `--trusted-sources SOURCES` | Query every configured portal connector and persist new opportunities (proves donation search). | Available |
 | `test-connector` | `v1.0.0` | `--connector NAME`, `--keywords KEYWORDS`, `--limit N` | Validate one connector in isolation and print sample results plus connector-specific keyword mappings. | Available |
 | `send-outreach` | `v0.3.0` | `--email EMAIL`, `--name NAME`, `--template-name NAME`, `--locale {en,bn}`, `--subject TEMPLATE`, `--body TEMPLATE`, `--dry-run` | Compose and send (or preview) a personalized donor outreach email, including locale-specific built-in templates. | Available |
@@ -786,7 +802,8 @@ Environment variables:
 | `PORTAL_CACHE_TTL` | `300` | Global connector cache TTL in seconds. |
 | `GRANTS_GOV_API_CREDENTIALS` | *(unset)* | Optional Grants.gov auth JSON (`api_key`, `access_token`, or OAuth2 client-credentials config). |
 | `CSR_NETWORK_API_CREDENTIALS` | *(unset)* | Candid Open RFP subscription key JSON for the CSR connector. |
-| `FOUNDATION_DIRECTORY_API_CREDENTIALS` | *(unset)* | Candid Grants API credentials JSON (`api_key`) for the Foundation Directory connector. |
+| `NGO_DIRECTORY_API_CREDENTIALS` | *(unset)* | Optional NGO Directory auth JSON for authenticated proxies/gateways (`authorization_header`, `access_token`, or OAuth2 client-credentials config). |
+| `FOUNDATION_DIRECTORY_API_CREDENTIALS` | *(unset)* | Candid Grants API credentials JSON (`api_key`, `secret`, `authorization_header`, or OAuth2 client-credentials config). |
 | `GRANTS_GOV_API_BASE_URL` | `https://api.grants.gov/v1/api/search2` | Grants.gov search endpoint override. |
 | `CSR_NETWORK_API_BASE_URL` | `https://api.candid.org/rfp/v1/opportunity` | CSR connector endpoint override. |
 | `NGO_DIRECTORY_API_BASE_URL` | `https://projects.propublica.org/nonprofits/api/v2/search.json` | ProPublica Nonprofit Explorer search endpoint override. |
@@ -953,7 +970,7 @@ Use one of these usernames as the role name:
 | `/donors/<email>/opt-out` | `POST` | `admin` | Mark a donor as opted out. |
 | `/analytics` | `GET` | `admin`, `auditor` | Return outreach analytics data. |
 | `/audit-log` | `GET` | `admin`, `auditor` | Return the latest audit log entries. |
-| `/settings` | `GET` | `staff`, `admin`, `auditor` | Self-service settings panel: organization profile, search keywords, credential aliases, and proof-of-capability actions. |
+| `/settings` | `GET` | `staff`, `admin`, `auditor` | Self-service settings panel: organization profile, search keywords, credential aliases, queue-monitoring UI, and proof-of-capability actions. |
 | `/settings/organization` | `POST` | `admin` | Update the organization profile. |
 | `/settings/search` | `POST` | `admin` | Update donation-search keyword filters and trusted sources. |
 | `/settings/credentials` | `POST` | `admin` | Register a credential alias (never exposes secret values). |
@@ -970,6 +987,7 @@ Use one of these usernames as the role name:
 | `/health` | `GET` | Public | Lightweight liveness endpoint for the web process and database. |
 | `/ready` | `GET` | Public | Dependency-aware readiness endpoint for database, Redis, Celery, and connectors. |
 | `/health/queue` | `GET` | Public | Queue health snapshot including queue depth, worker status, and cron/queue migration mode. |
+| `/monitoring/queue` | `GET` | `staff`, `admin`, `auditor` | Authenticated queue-monitoring payload for the settings UI, including Flower URL, queue depth, retry totals, and task runtime metrics. |
 
 ### Keyboard navigation and screen reader checks
 
@@ -1045,6 +1063,10 @@ The `/metrics` endpoint exposes the following gauges and counters in the Prometh
 | `funding_bot_queue_task_retries_total` | counter | Retry attempts scheduled with exponential backoff |
 | `funding_bot_dead_letter_queue_total` | gauge | Queue task runs currently stored in the dead-letter queue |
 | `funding_bot_queue_duplicate_preventions_total` | counter | Duplicate queue executions prevented by idempotency keys |
+| `funding_bot_queue_task_duration_seconds_sum` | counter | Total runtime for completed queue tasks |
+| `funding_bot_queue_task_duration_seconds_count` | counter | Completed queue tasks included in runtime metrics |
+| `funding_bot_queue_task_duration_seconds_average` | gauge | Average runtime for completed queue tasks |
+| `funding_bot_queue_task_duration_seconds_max` | gauge | Longest runtime for a completed queue task |
 
 Example Prometheus, Alertmanager, and Grafana assets live under `monitoring/`. Add a scrape target pointing to `http://<host>:5000/metrics`, authenticate with an `admin` or `auditor` dashboard role, and import `monitoring/grafana-dashboards/database-query-performance.json` for the query dashboard. See `docs/ALERTING.md` for alert thresholds, Slack/email wiring, and tuning guidance.
 
@@ -1121,6 +1143,10 @@ Possible `status` values:
 - `degraded`: broker unreachable, Celery unavailable, or the health probe timed out
 
 When `status` is `degraded`, the endpoint responds with HTTP `503` and includes an `error` field describing the timeout or broker failure.
+
+The `/settings` page also includes a **Queue Monitoring** card that surfaces the
+same queue-health snapshot, persisted retry/dead-letter counts from SQLite, and
+average/max task runtimes, with a direct link to Flower for worker inspection.
 
 ### Partner feedback
 
@@ -1221,7 +1247,9 @@ python funding_bot.py send-outreach \
 1. Sign in to `/settings` as `admin`.
 2. Click **Run discovery now** under "Prove: Donation Search" to query every portal
    connector and see newly discovered opportunities rendered as JSON.
-3. Fill in a donor email/name under "Prove: Donor Communication" and click
+3. Review the **Queue Monitoring** card to confirm queue depth, worker count,
+   retry totals, task runtimes, and the Flower link exposed to operators.
+4. Fill in a donor email/name under "Prove: Donor Communication" and click
    **Send test outreach**. With "Dry run" checked, the email is composed and logged
    without being delivered; uncheck it (with SMTP credentials configured) to deliver
    a real message.
@@ -1319,6 +1347,7 @@ Celery is the preferred replacement for cron for new asynchronous work in this r
 | `CELERY_HEALTH_TIMEOUT_SECONDS` | `2.0` in `.env.example` | Timeout for `/health/queue` broker and worker checks. |
 | `CELERY_TASK_ALWAYS_EAGER` | `0` | Execute queued work inline for tests and local debugging. |
 | `FLOWER_BASIC_AUTH` | *(empty)* | Optional `user:password` pair for protecting the Flower UI. |
+| `FLOWER_DASHBOARD_URL` | `http://127.0.0.1:5555` | URL surfaced by the settings queue-monitoring card. |
 
 Queue task execution metadata is stored in SQLite (`task_runs` and `task_history`), including:
 
@@ -1357,9 +1386,10 @@ Start the stack with:
 docker compose --profile queue up --build
 ```
 
-Flower can be protected with `FLOWER_BASIC_AUTH=user:password` in `.env`. The
-worker service uses `SIGTERM` plus a 45-second grace window so queue tasks can
-persist shutdown state before containers stop.
+Flower can be protected with `FLOWER_BASIC_AUTH=user:password` in `.env`. Set
+`FLOWER_DASHBOARD_URL` when operators reach Flower through a reverse proxy or a
+non-default hostname. The worker service uses `SIGTERM` plus a 45-second grace
+window so queue tasks can persist shutdown state before containers stop.
 
 ### Legacy cron fallback
 

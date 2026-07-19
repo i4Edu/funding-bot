@@ -953,7 +953,9 @@ def _configure_cli_output(
     return _CLI_OUTPUT_SETTINGS
 
 
-def _style_cli_text(message: str, *, level: str | None = None, stream: Any = sys.stdout) -> str:
+def _style_cli_text(message: str, *, level: str | None = None, stream: Any | None = None) -> str:
+    if stream is None:
+        stream = sys.stdout
     color_enabled = (
         _CLI_OUTPUT_SETTINGS.stderr_color
         if stream is sys.stderr
@@ -970,8 +972,9 @@ def _style_cli_text(message: str, *, level: str | None = None, stream: Any = sys
     return f"{color}{message}{Style.RESET_ALL}" if color else message
 
 
-def _cli_print(message: str = "", *, level: str | None = None, file: Any = sys.stdout) -> None:
-    print(_style_cli_text(message, level=level, stream=file), file=file)
+def _cli_print(message: str = "", *, level: str | None = None, file: Any | None = None) -> None:
+    stream = sys.stdout if file is None else file
+    print(_style_cli_text(message, level=level, stream=stream), file=stream)
 
 
 def _colorize_status_text(status: str) -> str:
@@ -1051,7 +1054,7 @@ class _CliProgressReporter:
     def __enter__(self) -> "_CliProgressReporter":
         if _CLI_OUTPUT_SETTINGS.progress_enabled and Console is not None and Progress is not None:
             self._console = Console(
-                file=sys.stdout,
+                file=sys.stderr,
                 no_color=_CLI_OUTPUT_SETTINGS.no_color,
                 highlight=False,
             )
@@ -1114,7 +1117,8 @@ class _CliProgressReporter:
         self._last_snapshot[key] = snapshot
         _cli_print(
             f"{description}: {normalized_completed}/{normalized_total} complete, "
-            f"{remaining} remaining, ETA {_format_eta(eta)}"
+            f"{remaining} remaining, ETA {_format_eta(eta)}",
+            file=sys.stderr,
         )
 
     def update_from_event(self, event: dict[str, Any]) -> None:
@@ -2731,12 +2735,6 @@ class _BasePortalConnector:
         headers: dict[str, str] | None = None,
     ) -> Any:
         self._throttle_remote_request()
-        request_headers = {
-            "Accept": "application/json",
-            "User-Agent": "funding-bot/1.0",
-            **(headers or {}),
-        }
-        inject_context(request_headers)
         resolved_credentials = self._get_resolved_credentials()
         if self.http_client is not None:
             with start_span(
@@ -2749,6 +2747,7 @@ class _BasePortalConnector:
                     "funding_bot.connector.type": self.connector_slug,
                 },
             ) as span:
+                request_headers = dict(headers or {})
                 attempts = (
                     lambda: self.http_client(
                         url, params, resolved_credentials, headers=request_headers
@@ -2771,6 +2770,12 @@ class _BasePortalConnector:
                     set_span_error(span, exc)
                     raise
 
+        request_headers = {
+            "Accept": "application/json",
+            "User-Agent": "funding-bot/1.0",
+            **(headers or {}),
+        }
+        inject_context(request_headers)
         if self._request_session is not None:
             return _perform_json_request(
                 "GET",
@@ -5711,6 +5716,15 @@ class FundingBot:
                 ),
             },
             {
+                "name": "idx_tasks_status_created_at",
+                "table": "tasks",
+                "columns": ("status", "created_at"),
+                "sql": (
+                    "CREATE INDEX IF NOT EXISTS idx_tasks_status_created_at "
+                    "ON tasks(status, created_at DESC)"
+                ),
+            },
+            {
                 "name": "idx_tasks_assigned_to_status",
                 "table": "tasks",
                 "columns": ("assigned_to", "status"),
@@ -7226,9 +7240,10 @@ class FundingBot:
             backoff_max_seconds=backoff_max_seconds,
         )
         task_started_at = time.perf_counter()
+        consumer_span_kind = getattr(SpanKind, "CONSUMER", getattr(SpanKind, "INTERNAL", None))
         with start_span(
             f"task_queue.execute.{normalized_task_name}",
-            kind=SpanKind.CONSUMER,
+            kind=consumer_span_kind,
             attributes={
                 "messaging.system": "celery",
                 "messaging.destination.name": normalized_task_name,
@@ -11048,6 +11063,432 @@ class FundingBot:
         for row in self.connection.execute(query, params).fetchall():
             counts[row["event_type"]] = row["total"]
         return counts
+
+    def get_funnel_analytics(
+        self,
+        *,
+        start_at: datetime | str | None = None,
+        end_at: datetime | str | None = None,
+        connector_name: str | None = None,
+    ) -> dict[str, Any]:
+        where_clause, params, window = self._analytics_window_clause(
+            start_at=start_at,
+            end_at=end_at,
+            timestamp_column="happened_at",
+        )
+        if connector_name:
+            where_clause += (" AND " if where_clause else " WHERE ") + "connector_name = ?"
+            params.append(str(connector_name).strip())
+        rows = self.connection.execute(
+            """
+            SELECT
+                stage,
+                COALESCE(connector_name, 'unattributed') AS connector_name,
+                COUNT(DISTINCT entity_key) AS attempts,
+                COUNT(DISTINCT CASE WHEN success = 1 THEN entity_key END) AS successes
+            FROM funnel_events
+            """
+            + where_clause
+            + """
+            GROUP BY stage, COALESCE(connector_name, 'unattributed')
+            """,
+            params,
+        ).fetchall()
+        attempts_by_stage = {stage: 0 for stage in self.FUNNEL_STAGES}
+        counts_by_stage = {stage: 0 for stage in self.FUNNEL_STAGES}
+        per_connector: dict[str, dict[str, dict[str, int]]] = {}
+        for row in rows:
+            stage = str(row["stage"])
+            connector = str(row["connector_name"])
+            attempts = int(row["attempts"])
+            successes = int(row["successes"])
+            attempts_by_stage[stage] += attempts
+            counts_by_stage[stage] += successes
+            bucket = per_connector.setdefault(
+                connector,
+                {
+                    "attempts": {name: 0 for name in self.FUNNEL_STAGES},
+                    "counts": {name: 0 for name in self.FUNNEL_STAGES},
+                },
+            )
+            bucket["attempts"][stage] = attempts
+            bucket["counts"][stage] = successes
+        connectors = [
+            {
+                "connector_name": connector,
+                "stages": self._build_funnel_stage_rows(bucket["counts"], bucket["attempts"]),
+            }
+            for connector, bucket in sorted(per_connector.items())
+        ]
+        return {
+            "window": window,
+            "stages": self._build_funnel_stage_rows(counts_by_stage, attempts_by_stage),
+            "connectors": connectors,
+        }
+
+    def get_source_attribution_analytics(
+        self,
+        *,
+        start_at: datetime | str | None = None,
+        end_at: datetime | str | None = None,
+    ) -> list[dict[str, Any]]:
+        opportunity_where, opportunity_params, _window = self._analytics_window_clause(
+            start_at=start_at,
+            end_at=end_at,
+            timestamp_column="discovered_at",
+        )
+        communication_where, communication_params, _ = self._analytics_window_clause(
+            start_at=start_at,
+            end_at=end_at,
+            timestamp_column="sent_at",
+        )
+        application_where, application_params, _ = self._analytics_window_clause(
+            start_at=start_at,
+            end_at=end_at,
+            timestamp_column="submitted_at",
+        )
+        task_where, task_params, _ = self._analytics_window_clause(
+            start_at=start_at,
+            end_at=end_at,
+            timestamp_column="created_at",
+        )
+        connectors: dict[str, dict[str, Any]] = {}
+
+        def ensure(name: str | None) -> dict[str, Any]:
+            key = str(name or "unattributed")
+            return connectors.setdefault(
+                key,
+                {
+                    "connector_name": key,
+                    "discovered": 0,
+                    "matched": 0,
+                    "outreach": 0,
+                    "responses": 0,
+                    "applications_submitted": 0,
+                    "tasks_created": 0,
+                    "tasks_completed": 0,
+                    "successful_outcomes": 0,
+                },
+            )
+
+        for row in self.connection.execute(
+            "SELECT source AS connector_name, COUNT(*) AS total FROM opportunities"
+            + opportunity_where
+            + " GROUP BY source",
+            opportunity_params,
+        ).fetchall():
+            ensure(row["connector_name"])["discovered"] = int(row["total"])
+        for row in self.connection.execute(
+            (
+                "SELECT attributed_connector AS connector_name, COUNT(*) AS total FROM tasks"
+                + task_where
+                + " WHERE attributed_connector IS NOT NULL GROUP BY attributed_connector"
+                if not task_where
+                else "SELECT attributed_connector AS connector_name, COUNT(*) AS total FROM tasks"
+                + task_where
+                + " AND attributed_connector IS NOT NULL GROUP BY attributed_connector"
+            ),
+            task_params,
+        ).fetchall():
+            ensure(row["connector_name"])["tasks_created"] = int(row["total"])
+        for row in self.connection.execute(
+            (
+                "SELECT attributed_connector AS connector_name, COUNT(*) AS total FROM tasks"
+                + task_where
+                + " WHERE status = 'done' AND attributed_connector IS NOT NULL GROUP BY attributed_connector"
+                if not task_where
+                else "SELECT attributed_connector AS connector_name, COUNT(*) AS total FROM tasks"
+                + task_where
+                + " AND status = 'done' AND attributed_connector IS NOT NULL GROUP BY attributed_connector"
+            ),
+            task_params,
+        ).fetchall():
+            ensure(row["connector_name"])["tasks_completed"] = int(row["total"])
+        for row in self.connection.execute(
+            (
+                "SELECT attributed_connector AS connector_name, COUNT(*) AS total FROM communications"
+                + communication_where
+                + " WHERE attributed_connector IS NOT NULL GROUP BY attributed_connector"
+                if not communication_where
+                else "SELECT attributed_connector AS connector_name, COUNT(*) AS total FROM communications"
+                + communication_where
+                + " AND attributed_connector IS NOT NULL GROUP BY attributed_connector"
+            ),
+            communication_params,
+        ).fetchall():
+            ensure(row["connector_name"])["outreach"] = int(row["total"])
+        for row in self.connection.execute(
+            """
+            SELECT c.attributed_connector AS connector_name, COUNT(DISTINCT c.id) AS total
+            FROM communications c
+            JOIN outreach_events oe ON oe.communication_id = c.id
+            """
+            + (
+                (
+                    " WHERE c.attributed_connector IS NOT NULL"
+                    " AND oe.event_type IN ('opened','clicked','responded','replied')"
+                )
+                if not communication_where
+                else communication_where.replace(
+                    " WHERE ", " WHERE c.attributed_connector IS NOT NULL AND "
+                )
+                + " AND oe.event_type IN ('opened','clicked','responded','replied')"
+            )
+            + " GROUP BY c.attributed_connector",
+            communication_params,
+        ).fetchall():
+            ensure(row["connector_name"])["responses"] = int(row["total"])
+        for row in self.connection.execute(
+            (
+                "SELECT attributed_connector AS connector_name, COUNT(*) AS total FROM applications"
+                + application_where
+                + " WHERE attributed_connector IS NOT NULL GROUP BY attributed_connector"
+                if not application_where
+                else "SELECT attributed_connector AS connector_name, COUNT(*) AS total FROM applications"
+                + application_where
+                + " AND attributed_connector IS NOT NULL GROUP BY attributed_connector"
+            ),
+            application_params,
+        ).fetchall():
+            ensure(row["connector_name"])["applications_submitted"] = int(row["total"])
+        funnel = self.get_funnel_analytics(start_at=start_at, end_at=end_at)
+        for connector_row in funnel["connectors"]:
+            connector_bucket = ensure(connector_row["connector_name"])
+            for stage_row in connector_row["stages"]:
+                if stage_row["stage"] == "match":
+                    connector_bucket["matched"] = int(stage_row["count"])
+                    break
+        for connector_bucket in connectors.values():
+            connector_bucket["successful_outcomes"] = int(connector_bucket["responses"]) + int(
+                connector_bucket["applications_submitted"]
+            )
+        return sorted(connectors.values(), key=lambda row: row["connector_name"])
+
+    def get_connector_cost_analytics(
+        self,
+        *,
+        start_at: datetime | str | None = None,
+        end_at: datetime | str | None = None,
+        connector_name: str | None = None,
+    ) -> dict[str, Any]:
+        where_clause, params, window = self._analytics_window_clause(
+            start_at=start_at,
+            end_at=end_at,
+            timestamp_column="happened_at",
+        )
+        if connector_name:
+            where_clause += (" AND " if where_clause else " WHERE ") + "connector_name = ?"
+            params.append(str(connector_name).strip())
+        rows = self.connection.execute(
+            """
+            SELECT
+                connector_name,
+                connector_type,
+                operation,
+                COUNT(*) AS calls,
+                SUM(request_count) AS request_count,
+                SUM(cost_usd) AS total_cost_usd,
+                AVG(cost_usd) AS average_cost_usd,
+                AVG(latency_seconds) AS average_latency_seconds,
+                SUM(errored) AS errors
+            FROM connector_call_metrics
+            """
+            + where_clause
+            + """
+            GROUP BY connector_name, connector_type, operation
+            ORDER BY connector_name, operation
+            """,
+            params,
+        ).fetchall()
+        connectors: dict[str, dict[str, Any]] = {}
+        total_cost = 0.0
+        total_calls = 0
+        total_errors = 0
+        for row in rows:
+            name = str(row["connector_name"])
+            bucket = connectors.setdefault(
+                name,
+                {
+                    "connector_name": name,
+                    "connector_type": str(row["connector_type"]),
+                    "calls": 0,
+                    "request_count": 0,
+                    "errors": 0,
+                    "total_cost_usd": 0.0,
+                    "average_latency_seconds": 0.0,
+                    "operations": [],
+                },
+            )
+            operation_calls = int(row["calls"] or 0)
+            operation_latency = self._safe_float(row["average_latency_seconds"])
+            operation_cost = self._safe_float(row["total_cost_usd"])
+            operation_errors = int(row["errors"] or 0)
+            bucket["calls"] += operation_calls
+            bucket["request_count"] += int(row["request_count"] or 0)
+            bucket["errors"] += operation_errors
+            bucket["total_cost_usd"] += operation_cost
+            bucket["operations"].append(
+                {
+                    "operation": str(row["operation"]),
+                    "calls": operation_calls,
+                    "request_count": int(row["request_count"] or 0),
+                    "errors": operation_errors,
+                    "total_cost_usd": operation_cost,
+                    "average_cost_usd": self._safe_float(row["average_cost_usd"]),
+                    "average_latency_seconds": operation_latency,
+                }
+            )
+        for bucket in connectors.values():
+            call_count = max(1, int(bucket["calls"]))
+            weighted_latency = sum(
+                operation["average_latency_seconds"] * operation["calls"]
+                for operation in bucket["operations"]
+            )
+            bucket["average_latency_seconds"] = weighted_latency / call_count
+            bucket["average_cost_usd"] = self._safe_float(bucket["total_cost_usd"]) / call_count
+            bucket["error_rate"] = self._safe_float(bucket["errors"]) / call_count
+            total_cost += self._safe_float(bucket["total_cost_usd"])
+            total_calls += int(bucket["calls"])
+            total_errors += int(bucket["errors"])
+        return {
+            "window": window,
+            "summary": {
+                "total_cost_usd": total_cost,
+                "total_calls": total_calls,
+                "average_cost_usd": (total_cost / total_calls) if total_calls else 0.0,
+                "error_rate": (total_errors / total_calls) if total_calls else 0.0,
+            },
+            "connectors": sorted(connectors.values(), key=lambda row: row["connector_name"]),
+        }
+
+    def detect_metric_anomalies(
+        self,
+        *,
+        end_at: datetime | str | None = None,
+        current_window_hours: int = 24,
+        baseline_days: int = 7,
+        min_calls: int = 3,
+    ) -> dict[str, Any]:
+        end_dt = self._as_utc(datetime.fromisoformat(end_at) if isinstance(end_at, str) else end_at)
+        current_start = end_dt - timedelta(hours=max(1, int(current_window_hours)))
+        baseline_start = current_start - timedelta(days=max(1, int(baseline_days)))
+        current_rows = self.connection.execute(
+            """
+            SELECT
+                connector_name,
+                COUNT(*) AS calls,
+                SUM(errored) AS errors,
+                AVG(latency_seconds) AS average_latency_seconds,
+                SUM(cost_usd) AS total_cost_usd
+            FROM connector_call_metrics
+            WHERE happened_at >= ? AND happened_at <= ?
+            GROUP BY connector_name
+            """,
+            (self._to_iso(current_start), self._to_iso(end_dt)),
+        ).fetchall()
+        baseline_rows = self.connection.execute(
+            """
+            SELECT
+                connector_name,
+                substr(happened_at, 1, 10) AS day,
+                COUNT(*) AS calls,
+                SUM(errored) AS errors,
+                AVG(latency_seconds) AS average_latency_seconds,
+                SUM(cost_usd) AS total_cost_usd
+            FROM connector_call_metrics
+            WHERE happened_at >= ? AND happened_at < ?
+            GROUP BY connector_name, substr(happened_at, 1, 10)
+            """,
+            (self._to_iso(baseline_start), self._to_iso(current_start)),
+        ).fetchall()
+        baseline_by_connector: dict[str, dict[str, list[float]]] = {}
+        for row in baseline_rows:
+            bucket = baseline_by_connector.setdefault(
+                str(row["connector_name"]),
+                {"error_rate": [], "average_latency_seconds": [], "total_cost_usd": []},
+            )
+            calls = max(1, int(row["calls"] or 0))
+            bucket["error_rate"].append(int(row["errors"] or 0) / calls)
+            bucket["average_latency_seconds"].append(
+                self._safe_float(row["average_latency_seconds"])
+            )
+            bucket["total_cost_usd"].append(self._safe_float(row["total_cost_usd"]))
+        alerts: list[dict[str, Any]] = []
+        for row in current_rows:
+            connector = str(row["connector_name"])
+            calls = int(row["calls"] or 0)
+            if calls < min_calls:
+                continue
+            current_metrics = {
+                "error_rate": int(row["errors"] or 0) / max(1, calls),
+                "average_latency_seconds": self._safe_float(row["average_latency_seconds"]),
+                "total_cost_usd": self._safe_float(row["total_cost_usd"]),
+            }
+            baseline_metrics = baseline_by_connector.get(
+                connector,
+                {"error_rate": [], "average_latency_seconds": [], "total_cost_usd": []},
+            )
+            for metric_name, current_value in current_metrics.items():
+                history = baseline_metrics.get(metric_name, [])
+                baseline_mean = mean(history) if history else 0.0
+                baseline_std = pstdev(history) if len(history) > 1 else 0.0
+                triggered = False
+                severity = "medium"
+                if metric_name == "error_rate":
+                    threshold = max(0.2, baseline_mean + max(0.1, 3 * baseline_std))
+                    triggered = current_value > threshold and current_value > baseline_mean * 1.5
+                    severity = "high" if current_value >= max(0.4, threshold * 1.5) else "medium"
+                elif metric_name == "average_latency_seconds":
+                    threshold = max(1.0, baseline_mean + max(0.5, 3 * baseline_std))
+                    if baseline_mean > 0:
+                        threshold = max(threshold, baseline_mean * 1.75)
+                    triggered = current_value > threshold
+                    severity = "high" if current_value >= threshold * 1.5 else "medium"
+                elif metric_name == "total_cost_usd":
+                    threshold = max(5.0, baseline_mean + max(1.0, 3 * baseline_std))
+                    if baseline_mean > 0:
+                        threshold = max(threshold, baseline_mean * 2.0)
+                    triggered = current_value > threshold
+                    severity = "warning" if current_value < threshold * 1.5 else "medium"
+                if triggered:
+                    alerts.append(
+                        {
+                            "connector_name": connector,
+                            "metric_name": metric_name,
+                            "severity": severity,
+                            "current_value": current_value,
+                            "baseline_mean": baseline_mean,
+                            "baseline_stddev": baseline_std,
+                            "window_calls": calls,
+                            "message": (
+                                f"{connector} {metric_name} is elevated "
+                                f"({current_value:.4f} vs baseline {baseline_mean:.4f})."
+                            ),
+                        }
+                    )
+        return {
+            "window": {
+                "start_at": self._to_iso(current_start),
+                "end_at": self._to_iso(end_dt),
+                "baseline_start_at": self._to_iso(baseline_start),
+            },
+            "alerts": alerts,
+        }
+
+    def get_analytics_dashboard_data(
+        self,
+        *,
+        start_at: datetime | str | None = None,
+        end_at: datetime | str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "generated_at": self._to_iso(),
+            "outreach": self.get_outreach_analytics(),
+            "funnel": self.get_funnel_analytics(start_at=start_at, end_at=end_at),
+            "costs": self.get_connector_cost_analytics(start_at=start_at, end_at=end_at),
+            "attribution": self.get_source_attribution_analytics(start_at=start_at, end_at=end_at),
+            "alerts": self.detect_metric_anomalies(end_at=end_at),
+        }
 
     def gdpr_export(self, donor_email: str, *, dry_run: bool = False) -> dict[str, Any]:
         """Export all donor-related records stored by the bot."""

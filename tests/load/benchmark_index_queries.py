@@ -3,9 +3,12 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from funding_bot import FundingBot
 

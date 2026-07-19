@@ -7,6 +7,8 @@ services:
     command: ["python", "-m", "funding_bot", "send-daily-summary"]
     env_file:
       - .env
+    depends_on:
+      - jaeger
     volumes:
       - bot_data:/app/data
 
@@ -33,6 +35,7 @@ services:
     depends_on:
       - redis
       - rabbitmq
+      - jaeger
     volumes:
       - bot_data:/app/data
 
@@ -58,6 +61,7 @@ services:
       - redis
       - rabbitmq
       - worker
+      - jaeger
     ports:
       - "5555:5555"
     volumes:
@@ -85,6 +89,7 @@ services:
       - .env
     depends_on:
       - bot
+      - jaeger
     ports:
       - "5000:5000"
     volumes:
@@ -102,6 +107,12 @@ services:
     ports:
       - "5672:5672"
       - "15672:15672"
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.67.0
+    ports:
+      - "16686:16686"
+      - "4318:4318"
 
 volumes:
   bot_data:

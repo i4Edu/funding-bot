@@ -25,9 +25,31 @@ def _sample_opportunity(*, title: str, portal_url: str, summary: str, category: 
     }
 
 
+def _normalize_report_snapshot(report):
+    normalized = dict(report)
+    normalized["generated_at"] = "<generated-at>"
+    return normalized
+
+
 @pytest.fixture
 def bot():
     instance = FundingBot(trusted_sources={"Grants Portal"})
+    instance.connection.execute("""
+        CREATE TABLE IF NOT EXISTS funnel_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stage TEXT NOT NULL,
+            entity_key TEXT NOT NULL,
+            connector_name TEXT,
+            opportunity_signature TEXT,
+            task_id INTEGER,
+            communication_id INTEGER,
+            event_type TEXT,
+            success INTEGER NOT NULL DEFAULT 1,
+            happened_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        )
+        """)
+    instance.connection.commit()
     instance.store_organization_profile(
         {
             "name": "i4Edu",
@@ -134,7 +156,7 @@ def test_monthly_audit_report_empty_month_regression(bot, monkeypatch, snapshot)
 
     report = bot.build_monthly_audit_report(year=2026, month=1)
 
-    assert report == snapshot
+    assert _normalize_report_snapshot(report) == snapshot
 
 
 def test_monthly_audit_report_leap_year_regression(bot, monkeypatch, snapshot):
@@ -174,7 +196,7 @@ def test_monthly_audit_report_leap_year_regression(bot, monkeypatch, snapshot):
 
     report = bot.build_monthly_audit_report(year=2024, month=2)
 
-    assert report == snapshot
+    assert _normalize_report_snapshot(report) == snapshot
 
 
 def test_deduplication_results_snapshot(bot, snapshot):

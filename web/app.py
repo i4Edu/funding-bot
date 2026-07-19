@@ -474,14 +474,68 @@ def _bot() -> FundingBot:
     return bot
 
 
+def _is_dashboard_request_path(path: str) -> bool:
+    return path == "/dashboard" or path.startswith("/dashboard/")
+
+
+@app.before_request
+def _start_request_trace() -> None:
+    g.request_started_at = time.perf_counter()
+    request_span = start_span(
+        f"{request.method} {request.path}",
+        kind=SpanKind.SERVER,
+        carrier=dict(request.headers),
+        attributes={
+            "http.request.method": request.method,
+            "url.path": request.path,
+            "url.query": request.query_string.decode("utf-8", errors="ignore"),
+        },
+    )
+    g.request_span_context_manager = request_span
+    g.request_span = request_span.__enter__()
+
+
+@app.after_request
+def _finish_request_trace(response: Response) -> Response:
+    started_at = getattr(g, "request_started_at", None)
+    span = getattr(g, "request_span", None)
+    if span is not None:
+        span.set_attribute("http.response.status_code", int(response.status_code))
+        trace_id = current_trace_id()
+        if trace_id:
+            response.headers["X-Trace-Id"] = trace_id
+        inject_context(response.headers)
+    if isinstance(started_at, (int, float)) and _is_dashboard_request_path(request.path):
+        record_slo_event(
+            "dashboard_response_time",
+            component=request.path,
+            latency_seconds=time.perf_counter() - started_at,
+            success=response.status_code < 500,
+            metadata={"status_code": response.status_code},
+            connection=_bot().connection,
+        )
+    context_manager = g.pop("request_span_context_manager", None)
+    if context_manager is not None:
+        context_manager.__exit__(None, None, None)
+    g.pop("request_span", None)
+    return response
+
+
 def _mapping_or_default(value: Any, default: dict[str, Any]) -> dict[str, Any]:
     return value if isinstance(value, dict) else dict(default)
 
 
 def _json_error(
-    message: str, status_code: int, *, headers: dict[str, str] | None = None
+    message: str,
+    status_code: int,
+    *,
+    headers: dict[str, str] | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> Response:
-    return _build_json_response({"error": message}, status_code, headers=headers)
+    body = {"error": message}
+    if payload:
+        body.update(payload)
+    return _build_json_response(body, status_code, headers=headers)
 
 
 def _auth_challenge(
@@ -557,34 +611,90 @@ def _get_session_role() -> str | None:
     return role
 
 
+def _mfa_code_from_request() -> str | None:
+    raw_code = request.headers.get("X-MFA-Code") or request.headers.get("X-Backup-Code")
+    if raw_code is None:
+        return None
+    return sanitize_user_string(
+        raw_code,
+        field_name="mfa_code",
+        allow_empty=False,
+        max_length=64,
+    )
+
+
+def _raise_auth_failure(
+    role: str, *, reason: str, message: str = "Invalid authentication credentials"
+) -> None:
+    result = _bot().record_failed_authentication(
+        role,
+        lockout_threshold=_login_lockout_attempts(),
+        lockout_minutes=_login_lockout_minutes(),
+        reason=reason,
+    )
+    if result["locked"]:
+        raise AuthenticationChallengeError(
+            f"Account '{role}' is temporarily locked.",
+            status_code=423,
+            headers={"Retry-After": str(_login_lockout_minutes() * 60)},
+            payload={"lockout_until": result["lockout_until"]},
+        )
+    raise AuthenticationChallengeError(message)
+
+
 def _get_authenticated_role() -> str:
     header = request.headers.get("Authorization", "")
     if not header:
         session_role = _get_session_role()
         if session_role is not None:
             return session_role
-        raise PermissionError("Authentication required")
+        raise AuthenticationChallengeError("Authentication required")
     if not header.startswith("Basic "):
-        raise PermissionError("Invalid authentication credentials")
+        raise AuthenticationChallengeError("Invalid authentication credentials")
 
     token = header.split(" ", 1)[1].strip()
     try:
         decoded = base64.b64decode(token, validate=True).decode("utf-8")
     except (ValueError, UnicodeDecodeError, binascii.Error) as exc:
-        raise PermissionError("Invalid authentication credentials") from exc
+        raise AuthenticationChallengeError("Invalid authentication credentials") from exc
 
     username, separator, password = decoded.partition(":")
     if not separator:
-        raise PermissionError("Invalid authentication credentials")
+        raise AuthenticationChallengeError("Invalid authentication credentials")
 
     role = username.strip().lower()
     if role not in ROLE_PASSWORD_ENV_VARS:
-        raise PermissionError("Invalid authentication credentials")
+        raise AuthenticationChallengeError("Invalid authentication credentials")
+
+    try:
+        _bot().assert_account_not_locked(role)
+    except AccountLockedError as exc:
+        state = _bot().get_auth_security_state(role)
+        raise AuthenticationChallengeError(
+            str(exc),
+            status_code=423,
+            headers={"Retry-After": str(_login_lockout_minutes() * 60)},
+            payload={"lockout_until": state["lockout_until"]},
+        ) from exc
 
     expected_password = os.environ.get(ROLE_PASSWORD_ENV_VARS[role])
     if not expected_password or not hmac.compare_digest(password, expected_password):
-        raise PermissionError("Invalid authentication credentials")
+        _raise_auth_failure(role, reason="password")
 
+    state = _bot().get_auth_security_state(role)
+    if state["mfa_enabled"]:
+        mfa_code = _mfa_code_from_request()
+        if not mfa_code:
+            raise AuthenticationChallengeError(
+                "MFA code required.",
+                headers={"X-MFA-Required": "1"},
+                payload={"mfa_required": True},
+            )
+        verification = _bot().verify_mfa_code(role, mfa_code)
+        if not verification["verified"]:
+            _raise_auth_failure(role, reason="mfa", message="Invalid MFA code.")
+
+    _bot().clear_auth_failures(role)
     _establish_authenticated_session(role)
     return role
 
@@ -732,6 +842,13 @@ def require_role(*roles: str) -> Callable[[Callable[..., Any]], Callable[..., An
         def wrapped(*args: Any, **kwargs: Any) -> Any:
             try:
                 role = _get_authenticated_role()
+            except AuthenticationChallengeError as exc:
+                return _auth_challenge(
+                    str(exc),
+                    status_code=exc.status_code,
+                    headers=exc.headers,
+                    payload=exc.payload,
+                )
             except PermissionError:
                 return _auth_challenge()
 
@@ -773,9 +890,27 @@ def _coerce_list(value: Any, field_name: str) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        return [item.strip() for item in value.split(",") if item.strip()]
+        return [
+            sanitize_user_string(
+                item,
+                field_name=field_name,
+                allow_empty=False,
+                html_escape=True,
+            )
+            for item in value.split(",")
+            if item.strip()
+        ]
     if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
+        return [
+            sanitize_user_string(
+                item,
+                field_name=field_name,
+                allow_empty=False,
+                html_escape=True,
+            )
+            for item in value
+            if str(item).strip()
+        ]
     raise ValueError(f"Field '{field_name}' must be a list or comma-separated string.")
 
 
@@ -901,7 +1036,7 @@ def _get_request_json() -> dict[str, Any]:
 def _normalize_optional_query_value(value: str | None) -> str | None:
     if value is None:
         return None
-    normalized = value.strip()
+    normalized = sanitize_user_string(value, field_name="query", max_length=256)
     return normalized or None
 
 
@@ -961,132 +1096,117 @@ def _resolve_ui_locale() -> dict[str, Any]:
 
 
 def _dashboard_context() -> dict[str, Any]:
-    now = datetime.now(timezone.utc)
-    recent_cutoff = (now - timedelta(days=7)).isoformat()
-    current_role = getattr(g, "current_role", None)
-    task_scope = _task_scope_for_role(current_role)
+    with start_span("dashboard.load_context", kind=SpanKind.INTERNAL):
+        now = datetime.now(timezone.utc)
+        recent_cutoff = (now - timedelta(days=7)).isoformat()
+        current_role = getattr(g, "current_role", None)
+        task_scope = _task_scope_for_role(current_role)
+        bot = _bot()
 
-    new_opportunities_count = (
-        _bot()
-        .connection.execute(
+        new_opportunities_count = bot.connection.execute(
             "SELECT COUNT(*) FROM opportunities WHERE discovered_at >= ?",
             (recent_cutoff,),
-        )
-        .fetchone()[0]
-    )
-    applications_submitted_count = (
-        _bot()
-        .connection.execute(
+        ).fetchone()[0]
+        applications_submitted_count = bot.connection.execute(
             "SELECT COUNT(*) FROM applications",
-        )
-        .fetchone()[0]
-    )
-    pending_applications_count = (
-        _bot()
-        .connection.execute(
+        ).fetchone()[0]
+        pending_applications_count = bot.connection.execute(
             "SELECT COUNT(*) FROM applications WHERE status IN ('pending', 'submitted', 'in_review')",
-        )
-        .fetchone()[0]
-    )
-    donor_communications_count = (
-        _bot()
-        .connection.execute(
+        ).fetchone()[0]
+        donor_communications_count = bot.connection.execute(
             "SELECT COUNT(*) FROM communications",
-        )
-        .fetchone()[0]
-    )
-    pending_translation_reviews_count = (
-        _bot()
-        .connection.execute(
+        ).fetchone()[0]
+        pending_translation_reviews_count = bot.connection.execute(
             "SELECT COUNT(*) FROM translation_reviews WHERE status = 'pending'",
-        )
-        .fetchone()[0]
-    )
+        ).fetchone()[0]
 
-    recent_opportunities = [
-        _serialize_opportunity(row)
-        for row in _bot()
-        .connection.execute("SELECT * FROM opportunities ORDER BY discovered_at DESC LIMIT 10")
-        .fetchall()
-    ]
-    recent_applications = [_serialize_application(row) for row in _bot().connection.execute("""
-            SELECT
-                applications.opportunity_signature,
-                opportunities.title,
-                applications.donor_name,
-                applications.status,
-                applications.next_action,
-                applications.submission_reference,
-                applications.submitted_at
-            FROM applications
-            JOIN opportunities
-                ON opportunities.signature = applications.opportunity_signature
-            ORDER BY applications.submitted_at DESC
-            LIMIT 10
-            """).fetchall()]
-    my_task_counts = _bot().get_task_status_counts(assigned_to=task_scope) if current_role else {}
-    overdue_tasks = [
-        _serialize_task(task)
-        for task in _bot().list_tasks(
-            assigned_to=task_scope,
-            due_date_before=now.date().isoformat(),
-            sort="due_date",
-        )
-        if task.get("is_overdue")
-    ][:5]
+        recent_opportunities = [
+            _serialize_opportunity(row)
+            for row in bot.connection.execute(
+                "SELECT * FROM opportunities ORDER BY discovered_at DESC LIMIT 10"
+            ).fetchall()
+        ]
+        recent_applications = [_serialize_application(row) for row in bot.connection.execute("""
+                SELECT
+                    applications.opportunity_signature,
+                    opportunities.title,
+                    applications.donor_name,
+                    applications.status,
+                    applications.next_action,
+                    applications.submission_reference,
+                    applications.submitted_at
+                FROM applications
+                JOIN opportunities
+                    ON opportunities.signature = applications.opportunity_signature
+                ORDER BY applications.submitted_at DESC
+                LIMIT 10
+                """).fetchall()]
+        my_task_counts = bot.get_task_status_counts(assigned_to=task_scope) if current_role else {}
+        overdue_tasks = [
+            _serialize_task(task)
+            for task in bot.list_tasks(
+                assigned_to=task_scope,
+                due_date_before=now.date().isoformat(),
+                sort="due_date",
+            )
+            if task.get("is_overdue")
+        ][:5]
 
-    return {
-        "current_role": current_role,
-        "new_opportunities_count": new_opportunities_count,
-        "applications_submitted_count": applications_submitted_count,
-        "pending_applications_count": pending_applications_count,
-        "donor_communications_count": donor_communications_count,
-        "pending_translation_reviews_count": pending_translation_reviews_count,
-        "my_tasks_count": sum(my_task_counts.values()),
-        "my_open_tasks_count": sum(
-            count for status, count in my_task_counts.items() if status != "done"
-        ),
-        "overdue_tasks": overdue_tasks,
-        "overdue_tasks_count": len(overdue_tasks),
-        "recent_opportunities": recent_opportunities,
-        "recent_applications": recent_applications,
-        "ui_locale": _resolve_ui_locale(),
-    }
+        return {
+            "current_role": current_role,
+            "new_opportunities_count": new_opportunities_count,
+            "applications_submitted_count": applications_submitted_count,
+            "pending_applications_count": pending_applications_count,
+            "donor_communications_count": donor_communications_count,
+            "pending_translation_reviews_count": pending_translation_reviews_count,
+            "my_tasks_count": sum(my_task_counts.values()),
+            "my_open_tasks_count": sum(
+                count for status, count in my_task_counts.items() if status != "done"
+            ),
+            "overdue_tasks": overdue_tasks,
+            "overdue_tasks_count": len(overdue_tasks),
+            "recent_opportunities": recent_opportunities,
+            "recent_applications": recent_applications,
+            "slo_summary": bot.get_slo_summary(),
+            "tracing_summary": tracing_configuration_summary(),
+            "ui_locale": _resolve_ui_locale(),
+        }
 
 
 def _task_dashboard_context(filters: dict[str, str | None]) -> dict[str, Any]:
-    current_role = getattr(g, "current_role", None)
-    tasks = [
-        _serialize_task(task)
-        for task in _bot().list_tasks(
-            assigned_to=filters["assignee"],
-            status=filters["status"],
-            due_date_before=filters["due_date_before"],
-            due_date_after=filters["due_date_after"],
-            sort=filters["sort"],
-        )
-    ]
-    for task in tasks:
-        task["can_move"] = _can_move_task(current_role, task)
-    counts = _task_status_counts(tasks)
-    return {
-        "current_role": current_role,
-        "tasks": tasks,
-        "task_columns": _group_tasks_by_status(tasks),
-        "task_counts": counts,
-        "total_tasks": len(tasks),
-        "task_filters": filters,
-        "task_board_columns": TASK_BOARD_COLUMNS,
-        "task_status_labels": TASK_STATUS_LABELS,
-        "task_sort_options": TASK_SORT_OPTIONS,
-        "task_assignee_options": _task_assignee_options(),
-        "task_assignment_options": _task_assignment_options(),
-        "can_filter_all_assignees": current_role in {"admin", "auditor"},
-        "can_reassign_tasks": current_role == "admin",
-        "can_manage_tasks": current_role == "admin",
-        "can_export_tasks": current_role in {"admin", "auditor"},
-        "ui_locale": _resolve_ui_locale(),
-    }
+    with start_span("dashboard.load_task_board", kind=SpanKind.INTERNAL):
+        current_role = getattr(g, "current_role", None)
+        tasks = [
+            _serialize_task(task)
+            for task in _bot().list_tasks(
+                assigned_to=filters["assignee"],
+                status=filters["status"],
+                due_date_before=filters["due_date_before"],
+                due_date_after=filters["due_date_after"],
+                sort=filters["sort"],
+            )
+        ]
+        for task in tasks:
+            task["can_move"] = _can_move_task(current_role, task)
+        counts = _task_status_counts(tasks)
+        return {
+            "current_role": current_role,
+            "tasks": tasks,
+            "task_columns": _group_tasks_by_status(tasks),
+            "task_counts": counts,
+            "total_tasks": len(tasks),
+            "task_filters": filters,
+            "task_board_columns": TASK_BOARD_COLUMNS,
+            "task_status_labels": TASK_STATUS_LABELS,
+            "task_sort_options": TASK_SORT_OPTIONS,
+            "task_assignee_options": _task_assignee_options(),
+            "task_assignment_options": _task_assignment_options(),
+            "can_filter_all_assignees": current_role in {"admin", "auditor"},
+            "can_reassign_tasks": current_role == "admin",
+            "can_manage_tasks": current_role == "admin",
+            "can_export_tasks": current_role in {"admin", "auditor"},
+            "ui_locale": _resolve_ui_locale(),
+        }
 
 
 def _queue_health_timeout_seconds() -> float:
@@ -1281,12 +1401,13 @@ def _check_redis_health(queue_config: Any) -> dict[str, Any]:
     cache_url = os.environ.get("FUNDING_BOT_CACHE_URL", "")
     if cache_backend == "redis" and cache_url:
         targets.append({"role": "cache", **_redis_ping(cache_url, timeout=timeout_seconds)})
-    for role, url in (
-        ("broker", getattr(queue_config, "broker_url", "")),
-        ("result_backend", getattr(queue_config, "result_backend", "")),
-    ):
-        if urlparse(str(url)).scheme in {"redis", "rediss"}:
-            targets.append({"role": role, **_redis_ping(str(url), timeout=timeout_seconds)})
+    if getattr(queue_config, "enable_task_queue", False):
+        for role, url in (
+            ("broker", getattr(queue_config, "broker_url", "")),
+            ("result_backend", getattr(queue_config, "result_backend", "")),
+        ):
+            if urlparse(str(url)).scheme in {"redis", "rediss"}:
+                targets.append({"role": role, **_redis_ping(str(url), timeout=timeout_seconds)})
     if not targets:
         return {
             "status": "disabled",
@@ -1413,7 +1534,10 @@ def _status_code_for_health(payload_status: str) -> int:
 
 def _build_health_payload(endpoint: str) -> dict[str, Any]:
     db_path = os.environ.get("BOT_DB_PATH", "funding_bot.db")
-    bot, bot_initialization_error = _try_create_bot_for_health()
+    bot: FundingBot | None = None
+    bot_initialization_error: str | None = None
+    if endpoint != "health":
+        bot, bot_initialization_error = _try_create_bot_for_health()
     queue_config = load_queue_config()
     checked_at = datetime.now(timezone.utc).isoformat()
     queue_mode = {
@@ -1425,23 +1549,11 @@ def _build_health_payload(endpoint: str) -> dict[str, Any]:
     if endpoint == "health":
         checks = {
             "application": {
-                "status": "ok" if bot_initialization_error is None else "error",
+                "status": "ok",
                 "checked": True,
                 "uptime_seconds": round(time.time() - _APP_START_TIME, 3),
-                **(
-                    {"error": bot_initialization_error}
-                    if bot_initialization_error is not None
-                    else {}
-                ),
             },
-            "database": (
-                _check_database_health(bot)
-                if bot is not None
-                else _check_database_health_from_path(
-                    db_path,
-                    initialization_error=bot_initialization_error,
-                )
-            ),
+            "database": _check_database_health_from_path(db_path),
         }
     else:
         checks = {
@@ -1722,6 +1834,7 @@ def handle_value_error(exc: ValueError) -> Response:
 @app.errorhandler(Exception)
 def handle_unexpected_error(exc: Exception) -> Response:
     # Do not expose internal details (stack traces, db paths, etc.) to clients.
+    set_span_error(getattr(g, "request_span", None), exc)
     app.logger.exception("Unhandled exception: %s", exc)
     return _json_error("Internal server error", 500)
 
@@ -1843,23 +1956,22 @@ def list_donors() -> Response:
 def upsert_donor() -> Response:
     payload = _get_request_json()
     email = str(payload.get("email", "")).strip()
-    name = str(payload.get("name", "")).strip()
+    name = sanitize_user_string(
+        payload.get("name", ""),
+        field_name="name",
+        allow_empty=False,
+        html_escape=True,
+    )
     opted_out = _coerce_bool(payload.get("opted_out", False), "opted_out")
-    preferences = payload.get("preferences", {})
+    preferences = sanitize_user_mapping(payload.get("preferences", {}), field_name="preferences")
     locale = payload.get("locale")
     data_classification = payload.get("data_classification")
     field_classifications = payload.get("field_classifications")
 
     if not email:
         raise ValueError("Field 'email' is required.")
-    if not name:
-        raise ValueError("Field 'name' is required.")
     # Validate email format before passing to the bot layer.
     email = _validate_email(email)
-    if preferences is None:
-        preferences = {}
-    if not isinstance(preferences, dict):
-        raise ValueError("Field 'preferences' must be an object.")
     if field_classifications is not None and not isinstance(field_classifications, dict):
         raise ValueError("Field 'field_classifications' must be an object.")
 
@@ -1893,8 +2005,80 @@ def opt_out_donor(email: str) -> Response:
 @api_rate_limit
 @require_role("admin", "auditor")
 def get_analytics() -> Response:
-    stats = _bot().get_outreach_analytics()
-    return jsonify({"stats": stats})
+    bot = _bot()
+    start_at = request.args.get("start_at")
+    end_at = request.args.get("end_at")
+    return jsonify(
+        {
+            "stats": bot.get_outreach_analytics(),
+            "dashboard": bot.get_analytics_dashboard_data(start_at=start_at, end_at=end_at),
+        }
+    )
+
+
+@app.get("/analytics/funnel")
+@api_rate_limit
+@require_role("admin", "auditor")
+def get_funnel_analytics() -> Response:
+    return jsonify(
+        _bot().get_funnel_analytics(
+            start_at=request.args.get("start_at"),
+            end_at=request.args.get("end_at"),
+            connector_name=request.args.get("connector_name"),
+        )
+    )
+
+
+@app.get("/analytics/costs")
+@api_rate_limit
+@require_role("admin", "auditor")
+def get_cost_analytics() -> Response:
+    return jsonify(
+        _bot().get_connector_cost_analytics(
+            start_at=request.args.get("start_at"),
+            end_at=request.args.get("end_at"),
+            connector_name=request.args.get("connector_name"),
+        )
+    )
+
+
+@app.get("/analytics/attribution")
+@api_rate_limit
+@require_role("admin", "auditor")
+def get_attribution_analytics() -> Response:
+    return jsonify(
+        {
+            "connectors": _bot().get_source_attribution_analytics(
+                start_at=request.args.get("start_at"),
+                end_at=request.args.get("end_at"),
+            )
+        }
+    )
+
+
+@app.get("/analytics/anomalies")
+@api_rate_limit
+@require_role("admin", "auditor")
+def get_analytics_anomalies() -> Response:
+    return jsonify(
+        _bot().detect_metric_anomalies(
+            end_at=request.args.get("end_at"),
+            current_window_hours=int(request.args.get("current_window_hours", "24")),
+            baseline_days=int(request.args.get("baseline_days", "7")),
+        )
+    )
+
+
+@app.get("/analytics/dashboard")
+@api_rate_limit
+@require_role("admin", "auditor")
+def get_analytics_dashboard() -> Response:
+    return jsonify(
+        _bot().get_analytics_dashboard_data(
+            start_at=request.args.get("start_at"),
+            end_at=request.args.get("end_at"),
+        )
+    )
 
 
 @app.get("/audit-log")
@@ -1930,6 +2114,67 @@ def settings_page() -> str:
         "supported_locales": bot.list_locale_definitions(),
     }
     return render_template("settings.html", **context)
+
+
+@app.get("/settings/security/mfa")
+@api_rate_limit
+@require_role("staff", "admin", "auditor")
+def mfa_status_route() -> Response:
+    role = getattr(g, "current_role", None)
+    if role is None:
+        return _auth_challenge()
+    return jsonify({"mfa": _bot().get_auth_security_state(role)})
+
+
+@app.post("/settings/security/mfa/setup")
+@api_rate_limit
+@require_role("staff", "admin", "auditor")
+def mfa_setup_route() -> Response:
+    role = getattr(g, "current_role", None)
+    if role is None:
+        return _auth_challenge()
+    setup = _bot().begin_mfa_setup(role)
+    return jsonify({"mfa_setup": setup}), 201
+
+
+@app.post("/settings/security/mfa/verify")
+@api_rate_limit
+@require_role("staff", "admin", "auditor")
+def mfa_verify_route() -> Response:
+    role = getattr(g, "current_role", None)
+    if role is None:
+        return _auth_challenge()
+    payload = _get_request_json()
+    enabled = _bot().enable_mfa(
+        role,
+        sanitize_user_string(
+            payload.get("code", ""),
+            field_name="code",
+            allow_empty=False,
+            max_length=64,
+        ),
+    )
+    return jsonify({"mfa": enabled})
+
+
+@app.post("/settings/security/mfa/backup-codes/regenerate")
+@api_rate_limit
+@require_role("staff", "admin", "auditor")
+def regenerate_backup_codes_route() -> Response:
+    role = getattr(g, "current_role", None)
+    if role is None:
+        return _auth_challenge()
+    payload = _get_request_json()
+    code = sanitize_user_string(
+        payload.get("code", ""),
+        field_name="code",
+        allow_empty=False,
+        max_length=64,
+    )
+    verification = _bot().verify_mfa_code(role, code)
+    if not verification["verified"]:
+        raise ValueError("Invalid MFA code.")
+    return jsonify({"mfa": _bot().regenerate_backup_codes(role)})
 
 
 @app.get("/translations")
@@ -2056,12 +2301,8 @@ def update_search_settings() -> Response:
 @require_role("admin")
 def register_credential_route() -> Response:
     payload = _get_request_json()
-    alias = str(payload.get("alias", "")).strip()
-    env_var_name = str(payload.get("env_var_name", "")).strip()
-    if not alias:
-        raise ValueError("Field 'alias' is required.")
-    if not env_var_name:
-        raise ValueError("Field 'env_var_name' is required.")
+    alias = validate_credential_alias(str(payload.get("alias", "")))
+    env_var_name = validate_env_var_name(str(payload.get("env_var_name", "")))
 
     _bot().register_credential(alias, env_var_name)
     return jsonify({"credentials": _bot().list_credentials()}), 201
@@ -2078,7 +2319,7 @@ def run_discovery_now() -> Response:
     the saved keyword/source settings (or an ad-hoc override), and persists
     any newly discovered opportunities.
     """
-    payload = request.get_json(silent=True) or {}
+    payload = _get_request_json() if request.get_data(cache=True) else {}
     keywords = _coerce_list(payload.get("keywords"), "keywords") if "keywords" in payload else None
     trusted_sources = (
         _coerce_list(payload.get("trusted_sources"), "trusted_sources")
@@ -2099,13 +2340,14 @@ def run_discovery_now() -> Response:
 @require_role("admin")
 def generate_privacy_policy() -> Response:
     payload = _get_request_json()
-    output_dir = str(
+    output_dir = sanitize_user_string(
         payload.get(
             "output_dir", os.environ.get("PRIVACY_POLICY_OUTPUT_DIR", "generated/privacy_policies")
-        )
-    ).strip()
-    if not output_dir:
-        raise ValueError("Field 'output_dir' must not be empty.")
+        ),
+        field_name="output_dir",
+        allow_empty=False,
+        max_length=512,
+    )
 
     generated = _bot().generate_privacy_policies(
         output_dir=output_dir,
@@ -2146,7 +2388,12 @@ def send_test_outreach() -> Response:
     """
     payload = _get_request_json()
     email = str(payload.get("email", "")).strip()
-    name = str(payload.get("name", "")).strip()
+    name = sanitize_user_string(
+        payload.get("name", ""),
+        field_name="name",
+        allow_empty=False,
+        html_escape=True,
+    )
     dry_run = _coerce_bool(payload.get("dry_run", True), "dry_run")
     subject_template = payload.get("subject_template")
     body_template = payload.get("body_template")
@@ -2154,8 +2401,7 @@ def send_test_outreach() -> Response:
 
     if not email:
         raise ValueError("Field 'email' is required.")
-    if not name:
-        raise ValueError("Field 'name' is required.")
+    email = _validate_email(email)
 
     sender = None if dry_run else SMTPEmailSender.from_env()
     if subject_template is None and body_template is None:
@@ -2182,8 +2428,19 @@ def send_test_outreach() -> Response:
         result = _bot().send_outreach(
             donor_email=email,
             donor_name=name,
-            subject_template=subject_template,
-            body_template=body_template,
+            subject_template=sanitize_user_string(
+                subject_template,
+                field_name="subject_template",
+                allow_empty=False,
+                html_escape=True,
+            ),
+            body_template=sanitize_user_string(
+                body_template,
+                field_name="body_template",
+                allow_empty=False,
+                multiline=True,
+                html_escape=True,
+            ),
             sender=sender,
             locale=None if locale is None else str(locale),
         )
@@ -2244,6 +2501,8 @@ def create_task_route() -> Response:
         due_date=due_date,
         external_id=payload.get("external_id"),
         source=str(payload.get("source", "manual")),
+        attributed_connector=payload.get("attributed_connector"),
+        opportunity_signature=payload.get("opportunity_signature"),
         assignee_email=payload.get("assignee_email"),
         assignee_name=payload.get("assignee_name"),
         sender=_task_assignment_sender(),
@@ -2268,6 +2527,8 @@ def update_task_route(task_id: int) -> Response:
         assignee=assignee,
         status=payload.get("status"),
         due_date=payload.get("due_date"),
+        attributed_connector=payload.get("attributed_connector"),
+        opportunity_signature=payload.get("opportunity_signature"),
     )
     return jsonify({"task": task})
 
@@ -2514,6 +2775,19 @@ def cache_health() -> Response:
     return jsonify(_bot().get_cache_metrics()["health"])
 
 
+@app.get("/api/slo")
+@api_rate_limit
+@require_role("admin", "auditor")
+def slo_dashboard() -> Response:
+    return jsonify(
+        {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "tracing": tracing_configuration_summary(),
+            "slos": _bot().get_slo_summary(),
+        }
+    )
+
+
 @app.get("/metrics")
 @api_rate_limit
 @require_role("admin", "auditor")
@@ -2625,6 +2899,7 @@ def metrics() -> Response:
         f"funding_bot_communications_total {communications_total}",
         *FundingBot.render_connector_metrics_prometheus(),
         *FundingBot.render_batch_metrics_prometheus(),
+        *bot.render_slo_metrics_prometheus(),
         "# HELP funding_bot_tasks_total Total collaboration tasks",
         "# TYPE funding_bot_tasks_total gauge",
         f"funding_bot_tasks_total {tasks_total}",
@@ -2754,11 +3029,11 @@ def metrics() -> Response:
     )
     for index_row in index_metrics.get("indexes", []):
         lines.append(
-            'funding_bot_db_index_present{index_name="'
+            "funding_bot_db_index_present{index_name="
             + _prometheus_label_value(str(index_row.get("name", "")))
-            + '",table="'
+            + ",table="
             + _prometheus_label_value(str(index_row.get("table", "")))
-            + '"} '
+            + "} "
             + str(1 if index_row.get("present") else 0)
         )
     lines.extend(
@@ -2769,9 +3044,9 @@ def metrics() -> Response:
     )
     for plan in index_metrics.get("query_plans", []):
         lines.append(
-            'funding_bot_db_query_plan_uses_index{query_name="'
+            "funding_bot_db_query_plan_uses_index{query_name="
             + _prometheus_label_value(str(plan.get("name", "")))
-            + '"} '
+            + "} "
             + str(1 if plan.get("uses_index") else 0)
         )
     lines.extend(
@@ -2782,9 +3057,9 @@ def metrics() -> Response:
     )
     for connector_response in index_metrics.get("connector_responses", []):
         lines.append(
-            'funding_bot_connector_response_cache_total{source_status="'
+            "funding_bot_connector_response_cache_total{source_status="
             + _prometheus_label_value(str(connector_response.get("source_status", "")))
-            + '"} '
+            + "} "
             + str(int(connector_response.get("total", 0) or 0))
         )
     lines.extend(
@@ -2873,18 +3148,19 @@ def submit_feedback() -> Response:
     """
     payload = _get_request_json()
     category = str(payload.get("category", "general")).strip().lower()
-    message = str(payload.get("message", "")).strip()
+    message = sanitize_user_string(
+        payload.get("message", ""),
+        field_name="message",
+        allow_empty=False,
+        multiline=True,
+        html_escape=True,
+        max_length=MAX_FEEDBACK_MESSAGE_LENGTH,
+    )
     contact = str(payload.get("contact", "")).strip() or None
 
     allowed_categories = {"feature_request", "bug_report", "general"}
     if category not in allowed_categories:
         raise ValueError(f"Field 'category' must be one of {sorted(allowed_categories)}.")
-    if not message:
-        raise ValueError("Field 'message' is required.")
-    if len(message) > MAX_FEEDBACK_MESSAGE_LENGTH:
-        raise ValueError(
-            f"Field 'message' must not exceed {MAX_FEEDBACK_MESSAGE_LENGTH} characters."
-        )
     if contact:
         contact = _validate_email(contact)
 

@@ -126,6 +126,8 @@ Operators and contributors should:
 - keep the default security headers enabled; if you override `WEB_CONTENT_SECURITY_POLICY`, review every directive for least privilege
 - restrict `WEB_API_CORS_ALLOWED_ORIGINS` to exact trusted dashboard/browser origins and avoid wildcard patterns
 - enforce strong unique passwords for `admin`, `staff`, and `auditor` roles
+- enable TOTP MFA for every dashboard role and store backup codes in an offline password manager or vault
+- tune `WEB_LOGIN_LOCKOUT_ATTEMPTS` and `WEB_LOGIN_LOCKOUT_MINUTES` so repeated failed logins trigger temporary account lockouts
 - run the dashboard and Flower behind authentication and trusted network boundaries
 - use HTTPS/TLS in every non-local deployment
 - keep `WEB_HSTS_MAX_AGE_SECONDS` at one year or longer for public HTTPS deployments unless you have a deliberate rollback plan
@@ -136,6 +138,16 @@ Operators and contributors should:
 - back up the SQLite database and verify restore procedures
 - minimize donor data retention and follow documented GDPR deletion/export processes
 - validate security changes in CI and again before release
+
+## Input handling and authentication hardening
+
+- use parameterized SQL queries for every database read or write; never concatenate user input into SQL fragments
+- validate structured inputs early (role names, emails, locales, environment-variable aliases, dates, and status values)
+- normalize free-text fields before persistence by stripping control characters and escaping HTML-sensitive characters to reduce stored XSS risk
+- sanitize nested JSON payloads such as donor preferences and organization profile fields before storing or rendering them
+- treat task titles, task comments, donor names, outreach templates, feedback text, and search keywords as untrusted input
+- prefer allowlisted sort keys and enum-like values over dynamic query construction for filters and ordering
+- require MFA setup verification before enabling TOTP secrets and rotate backup codes after recovery use or suspected exposure
 
 ## Out of scope
 

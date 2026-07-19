@@ -363,9 +363,10 @@ def _run_task_with_trace(
     attributes: dict[str, Any] | None = None,
     callback: Callable[[], dict[str, Any]],
 ) -> dict[str, Any]:
+    span_kind = getattr(SpanKind, "CONSUMER", getattr(SpanKind, "INTERNAL", None))
     with start_span(
         span_name,
-        kind=SpanKind.CONSUMER,
+        kind=span_kind,
         carrier=trace_context,
         attributes=attributes,
     ):

@@ -275,6 +275,8 @@ def dashboard() -> str:
         recent_applications=sorted(
             STATE["applications"], key=lambda item: item["submitted_at"], reverse=True
         )[:10],
+        tracing_summary={"enabled": False, "exporter": "disabled"},
+        slo_summary=[],
     )
 
 
@@ -293,6 +295,21 @@ def settings_page() -> str:
         smtp_configured=False,
         smtp_host="",
         supported_locales=SUPPORTED_LOCALES,
+        queue_monitoring={
+            "flower": {"url": "http://127.0.0.1:5555"},
+            "queue": {
+                "status": "disabled",
+                "queue_name": "funding-bot",
+                "worker_count": 0,
+                "queue_depth": 0,
+                "active_tasks": 0,
+            },
+            "task_metrics": {
+                "retries_scheduled": 0,
+                "duration_seconds_average": 0.0,
+                "duration_seconds_max": 0.0,
+            },
+        },
     )
 
 
@@ -507,6 +524,28 @@ def export_tasks_route() -> Response:
         getattr(g, "current_role", None),
     )
     return jsonify({"tasks": tasks, "count": len(tasks)})
+
+
+@app.get("/monitoring/queue")
+@require_role("admin", "staff", "auditor")
+def queue_monitoring_route() -> Response:
+    return jsonify(
+        {
+            "flower": {"url": "http://127.0.0.1:5555"},
+            "queue": {
+                "status": "disabled",
+                "queue_name": "funding-bot",
+                "worker_count": 0,
+                "queue_depth": 0,
+                "active_tasks": 0,
+            },
+            "task_metrics": {
+                "retries_scheduled": 0,
+                "duration_seconds_average": 0.0,
+                "duration_seconds_max": 0.0,
+            },
+        }
+    )
 
 
 @app.post("/tasks")

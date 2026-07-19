@@ -21,8 +21,5 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements-dev.txt
 
-      - name: Run regression suite
-        run: python -m pytest tests/test_regression.py -q
-
-      - name: Validate committed snapshots
+      - name: Run regression suite and validate committed snapshots
         run: python scripts/snapshot_tool.py validate

@@ -17,10 +17,10 @@ test("admin can navigate dashboard and settings", async ({ browser, baseURL }) =
 
   await page.goto(`${baseURL}/dashboard`);
   await expect(page.getByRole("heading", { name: "Operations Dashboard" })).toBeAttached();
-  await expect(page.getByText("Education Innovation Grant")).toBeVisible();
+  await expect(page.getByRole("cell", { name: "Education Innovation Grant" })).toBeVisible();
 
   await page.getByRole("link", { name: "Open settings page" }).click();
-  await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Settings", exact: true })).toBeVisible();
 
   await page.getByRole("link", { name: "Open my tasks dashboard" }).click();
   await expect(page.getByRole("heading", { name: "Task Board" })).toBeVisible();

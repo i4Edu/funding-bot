@@ -10,6 +10,7 @@ This project uses targeted SQLite indexes for read-heavy donor, task, and connec
 | `donors` | `idx_donors_name_email` | Covers donor directory ordering and name-first lookups. |
 | `tasks` | `idx_tasks_status` | Existing status filter used by task counts and filtered lists. |
 | `tasks` | `idx_tasks_created_at_status` | Covers created-at sorting plus status filtering. |
+| `tasks` | `idx_tasks_status_created_at` | Optimizes the common `WHERE status = ? ORDER BY created_at DESC` task view. |
 | `tasks` | `idx_tasks_assigned_to_status` | Optimizes task lists filtered by assignee and status. |
 | `connector_result_cache` | `idx_connector_result_cache_lookup` | Existing lookup path for connector/cache-key fetches. |
 | `connector_result_cache` | `idx_connector_result_cache_status_fetched_at` | Optimizes recent connector-response monitoring grouped by cache status. |

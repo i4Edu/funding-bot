@@ -12,7 +12,7 @@ DEFAULT_TARGETS = ("tests/test_regression.py",)
 
 
 def _build_pytest_command(command: str, targets: list[str]) -> list[str]:
-    pytest_command = [sys.executable, "-m", "pytest", *targets]
+    pytest_command = [sys.executable, "-m", "pytest", "-n", "0", *targets]
     if command == "update":
         pytest_command.append("--snapshot-update")
     return pytest_command

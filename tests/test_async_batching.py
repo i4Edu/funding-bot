@@ -165,8 +165,7 @@ class AsyncBatchingTests(unittest.TestCase):
         )
         with mock.patch.object(FundingBot, "_apply_migrations", lambda self: None):
             bot = FundingBot(trusted_sources={"Async Grants", "Async CSR"})
-        bot.connection.execute(
-            """
+        bot.connection.execute("""
             CREATE TABLE IF NOT EXISTS funnel_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 stage TEXT NOT NULL,
@@ -180,10 +179,8 @@ class AsyncBatchingTests(unittest.TestCase):
                 happened_at TEXT NOT NULL,
                 metadata_json TEXT NOT NULL DEFAULT '{}'
             )
-            """
-        )
-        bot.connection.execute(
-            """
+            """)
+        bot.connection.execute("""
             CREATE TABLE IF NOT EXISTS connector_call_metrics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 connector_name TEXT NOT NULL,
@@ -197,8 +194,7 @@ class AsyncBatchingTests(unittest.TestCase):
                 happened_at TEXT NOT NULL,
                 metadata_json TEXT NOT NULL DEFAULT '{}'
             )
-            """
-        )
+            """)
         bot.connection.commit()
         try:
             found = asyncio.run(

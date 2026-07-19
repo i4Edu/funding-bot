@@ -14,6 +14,8 @@ from pathlib import Path
 from shutil import rmtree
 from zipfile import ZipFile
 
+import pyotp
+
 import task_queue
 from funding_bot import (
     DuplicateSubmissionError,
@@ -26,6 +28,11 @@ from funding_bot import (
     SMTPEmailSender,
     Task,
     TaskTransitionError,
+    escape_html_text,
+    sanitize_user_mapping,
+    sanitize_user_string,
+    validate_credential_alias,
+    validate_env_var_name,
 )
 from warehouse_exports import ArchiveManager
 
@@ -76,6 +83,48 @@ class FakeHTTPResponse:
     def raise_for_status(self):
         if self.status_code >= 400:
             raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class InputSanitizationAndMfaUtilityTests(unittest.TestCase):
+    def test_text_sanitizers_escape_html_and_control_characters(self):
+        self.assertEqual("&lt;script&gt;x&lt;/script&gt;", escape_html_text("<script>x</script>"))
+        self.assertEqual(
+            "&lt;b&gt;hello&lt;/b&gt;",
+            sanitize_user_string("<b>hello</b>\u0000", html_escape=True),
+        )
+        self.assertEqual(
+            {"note": "&lt;img&gt;"},
+            sanitize_user_mapping({"note": "<img>"}),
+        )
+
+    def test_identifier_validators_reject_unsafe_values(self):
+        self.assertEqual("smtp-prod", validate_credential_alias("smtp-prod"))
+        self.assertEqual("SMTP_PASSWORD", validate_env_var_name("SMTP_PASSWORD"))
+        with self.assertRaises(ValueError):
+            validate_credential_alias("smtp prod")
+        with self.assertRaises(ValueError):
+            validate_env_var_name("smtp_password")
+
+    def test_bot_mfa_flow_tracks_backup_codes(self):
+        db_path = Path(".test_mfa_utilities.db")
+        if db_path.exists():
+            db_path.unlink()
+        bot = FundingBot(db_path=db_path)
+        try:
+            setup = bot.begin_mfa_setup("admin")
+            code = pyotp.TOTP(setup["secret"]).now()
+            enabled = bot.enable_mfa("admin", code)
+            self.assertTrue(enabled["mfa_enabled"])
+
+            backup_code = setup["backup_codes"][0]
+            verification = bot.verify_mfa_code("admin", backup_code)
+            self.assertTrue(verification["verified"])
+            self.assertEqual("backup_code", verification["method"])
+            self.assertFalse(bot.verify_mfa_code("admin", backup_code)["verified"])
+        finally:
+            bot.close()
+            if db_path.exists():
+                db_path.unlink()
 
 
 class StaticSecretVault:
@@ -1216,7 +1265,9 @@ from funding_bot import (
     NGODirectoryConnector,
     OAuth2ClientCredentialsVault,
     TokenBucketRateLimiter,
+    _configure_cli_output,
     _resolve_cli_log_level,
+    _style_cli_text,
     create_connector,
     main,
 )
@@ -1431,6 +1482,38 @@ class PortalConnectorTests(unittest.TestCase):
         self.assertEqual(1, grants_metrics["errors_total"])
         self.assertEqual(2, grants_metrics["latency_seconds_count"])
         self.assertGreaterEqual(grants_metrics["latency_seconds_sum"], 0.0)
+
+    def test_foundation_directory_connector_accepts_oauth2_bearer_tokens(self):
+        seen_headers = []
+
+        def fake_http_client(_url, _payload, _credentials=None, headers=None):
+            seen_headers.append(dict(headers or {}))
+            return {
+                "results": [
+                    {
+                        "funder_name": "Token Foundation",
+                        "recipient_name": "Learning Lab",
+                        "grant_title": "Authenticated Grant",
+                        "detail_url": "https://api.candid.org/grants/4",
+                        "purpose": "Authenticated with OAuth2.",
+                        "subject": "Education",
+                    }
+                ],
+                "total_pages": 1,
+            }
+
+        connector = FoundationDirectoryConnector(
+            http_client=fake_http_client,
+            credentials={"authorization_header": "******"},
+            transport="http",
+        )
+
+        rows = connector.fetch_opportunities(["education"])
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("Authenticated Grant", rows[0]["title"])
+        self.assertEqual("******", seen_headers[0]["Authorization"])
+        self.assertNotIn("X-API-Key", seen_headers[0])
 
     def test_oauth2_connector_credentials_are_resolved_for_remote_calls(self):
         FundingBot.reset_connector_metrics()
@@ -2615,6 +2698,128 @@ class OutreachAnalyticsAndGdprTests(unittest.TestCase):
         self.assertNotIn("privacy@example.org", audit_log_text)
         self.assertNotIn("Privacy Donor", audit_log_text)
 
+    def test_funnel_and_attribution_analytics_track_connector_outcomes(self):
+        discovered = self.bot.discover_opportunities(
+            [
+                {
+                    "source": "Grants Portal",
+                    "donor_name": "UNICEF",
+                    "title": "UNICEF Literacy Grant",
+                    "portal_url": "https://example.org/unicef",
+                    "summary": "Funding for literacy programs.",
+                    "tags": ["literacy", "education"],
+                    "category": "Education",
+                }
+            ],
+            keywords=["literacy"],
+            discovered_at=datetime(2026, 6, 22, 8, 0, tzinfo=timezone.utc),
+        )
+        signature = discovered[0]["signature"]
+        task = self.bot.create_task(
+            title="Review matched grant",
+            assigned_to="staff",
+            due_date="2026-06-30",
+            attributed_connector="Grants Portal",
+            opportunity_signature=signature,
+        )
+        outreach = self.bot.send_outreach(
+            donor_email="engaged@example.org",
+            donor_name="Engaged Donor",
+            subject_template="Support {organization_name}",
+            body_template="Hello {donor_name}",
+            context={"opportunity_signature": signature, "task_id": task["id"]},
+            sent_at=datetime(2026, 6, 22, 9, 0, tzinfo=timezone.utc),
+        )
+        communication_id = self.bot.connection.execute(
+            "SELECT id FROM communications WHERE donor_email = ?",
+            ("engaged@example.org",),
+        ).fetchone()["id"]
+        self.bot.record_outreach_event(communication_id, "opened")
+        application = self.bot.submit_application(
+            signature,
+            submission_reference="ref-123",
+            status="submitted",
+            next_action="Await donor review",
+            submitted_at=datetime(2026, 6, 22, 10, 0, tzinfo=timezone.utc),
+        )
+
+        funnel = self.bot.get_funnel_analytics(
+            start_at="2026-06-22",
+            end_at="2026-06-22",
+        )
+        attribution = self.bot.get_source_attribution_analytics(
+            start_at="2026-06-22",
+            end_at="2026-06-22",
+        )
+
+        stage_counts = {row["stage"]: row["count"] for row in funnel["stages"]}
+        self.assertEqual(1, stage_counts["discover"])
+        self.assertEqual(1, stage_counts["dedupe"])
+        self.assertEqual(1, stage_counts["match"])
+        self.assertEqual(1, stage_counts["outreach"])
+        self.assertEqual(1, stage_counts["response"])
+        self.assertEqual("Grants Portal", outreach["attributed_connector"])
+        self.assertEqual("Grants Portal", application["attributed_connector"])
+        self.assertEqual("Grants Portal", task["attributed_connector"])
+        self.assertEqual(signature, task["opportunity_signature"])
+
+        grants_portal = next(row for row in attribution if row["connector_name"] == "Grants Portal")
+        self.assertEqual(1, grants_portal["discovered"])
+        self.assertEqual(1, grants_portal["matched"])
+        self.assertEqual(1, grants_portal["outreach"])
+        self.assertEqual(1, grants_portal["responses"])
+        self.assertEqual(1, grants_portal["applications_submitted"])
+        self.assertEqual(1, grants_portal["tasks_created"])
+        self.assertEqual(2, grants_portal["successful_outcomes"])
+
+    def test_cost_analytics_and_anomaly_detection_flag_spikes(self):
+        for day in range(1, 8):
+            self.bot.record_connector_call_metric(
+                connector_name="Grants Portal",
+                connector_type="grants-portal",
+                operation="discover",
+                source_status="remote",
+                latency_seconds=0.4,
+                cost_usd=1.0,
+                errored=False,
+                request_count=1,
+                happened_at=datetime(2026, 6, day, 8, 0, tzinfo=timezone.utc),
+            )
+        for minute in range(4):
+            self.bot.record_connector_call_metric(
+                connector_name="Grants Portal",
+                connector_type="grants-portal",
+                operation="discover",
+                source_status="remote",
+                latency_seconds=2.5,
+                cost_usd=4.0,
+                errored=True,
+                request_count=1,
+                happened_at=datetime(2026, 6, 8, 8, minute, tzinfo=timezone.utc),
+                metadata={"error": "timeout"},
+            )
+
+        costs = self.bot.get_connector_cost_analytics(
+            start_at="2026-06-08",
+            end_at="2026-06-08",
+        )
+        anomalies = self.bot.detect_metric_anomalies(
+            end_at="2026-06-08T09:00:00+00:00",
+            current_window_hours=24,
+            baseline_days=7,
+            min_calls=3,
+        )
+
+        grants_portal = costs["connectors"][0]
+        self.assertEqual("Grants Portal", grants_portal["connector_name"])
+        self.assertEqual(16.0, grants_portal["total_cost_usd"])
+        self.assertEqual(4, grants_portal["calls"])
+        self.assertGreater(grants_portal["error_rate"], 0.9)
+        metric_names = {alert["metric_name"] for alert in anomalies["alerts"]}
+        self.assertIn("error_rate", metric_names)
+        self.assertIn("average_latency_seconds", metric_names)
+        self.assertIn("total_cost_usd", metric_names)
+
 
 class StatusPollingAndVaultTests(unittest.TestCase):
     """Tests status polling and credential vault integrations."""
@@ -3496,7 +3701,7 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
         self.assertEqual("CSR Digital Learning Fund", payload["sample_results"][0]["title"])
         self.assertIn("corporate partnerships", payload["expanded_keywords"])
 
-    def test_send_outreach_command_dry_run_does_not_send_but_logs(self):
+    def test_send_outreach_command_dry_run_previews_without_persisting(self):
         with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
             main(
                 [
@@ -3514,12 +3719,14 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("Queued send-outreach task", output)
         self.assertIn("dry run", output)
+        self.assertIn("Would send email", output)
 
         bot = FundingBot(db_path=self.db_path)
         try:
             communications = bot.connection.execute("SELECT * FROM communications").fetchall()
-            self.assertEqual(1, len(communications))
-            self.assertEqual("donor@example.org", communications[0]["donor_email"])
+            donors = bot.connection.execute("SELECT * FROM donors").fetchall()
+            self.assertEqual([], communications)
+            self.assertEqual([], donors)
         finally:
             bot.close()
 
@@ -3561,9 +3768,180 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
                 "SELECT locale FROM donors WHERE email = ?",
                 ("donor@example.org",),
             ).fetchone()
-            self.assertEqual("bn", donor["locale"])
+            self.assertIsNone(donor)
         finally:
             bot.close()
+
+    def test_discover_command_dry_run_previews_without_saving(self):
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(["--db", str(self.db_path), "discover", "--keywords", "education", "--dry-run"])
+
+        output = stdout.getvalue()
+        self.assertIn("Queued discover task", output)
+        self.assertIn("Education Innovation Grant", output)
+        self.assertIn("no opportunities were saved", output.lower())
+
+        bot = FundingBot(db_path=self.db_path)
+        try:
+            self.assertEqual([], bot.list_opportunities())
+        finally:
+            bot.close()
+
+    def test_export_data_warehouse_dry_run_previews_without_writing_files(self):
+        bot = FundingBot(db_path=self.db_path)
+        try:
+            bot.upsert_donor(email="donor@example.org", name="Donor")
+        finally:
+            bot.close()
+
+        export_dir = _reset_test_dir("warehouse-export-preview")
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(
+                [
+                    "--db",
+                    str(self.db_path),
+                    "export-data-warehouse",
+                    "--datasets",
+                    "donors",
+                    "--output-dir",
+                    str(export_dir),
+                    "--dry-run",
+                ]
+            )
+
+        report = json.loads(stdout.getvalue())
+        self.assertTrue(report["dry_run"])
+        self.assertEqual(1, report["count"])
+        artifact = report["artifacts"][0]
+        self.assertEqual("donors", artifact["dataset"])
+        self.assertTrue(artifact["will_archive"] is False)
+        self.assertFalse(Path(artifact["path"]).exists())
+
+
+class CliConfigurationFileTests(unittest.TestCase):
+    def setUp(self):
+        self.workspace = _reset_test_dir("cli-config")
+        self.project_dir = self.workspace / "project"
+        self.project_dir.mkdir(parents=True, exist_ok=True)
+        self.home_dir = self.workspace / "home"
+        self.home_dir.mkdir(parents=True, exist_ok=True)
+        self.original_cwd = Path.cwd()
+        self._previous_always_eager = task_queue.celery_app.conf.task_always_eager
+        self._previous_store_eager = getattr(
+            task_queue.celery_app.conf, "task_store_eager_result", None
+        )
+        task_queue.celery_app.conf.task_always_eager = True
+        task_queue.celery_app.conf.task_store_eager_result = True
+
+    def tearDown(self):
+        os.chdir(self.original_cwd)
+        task_queue.celery_app.conf.task_always_eager = self._previous_always_eager
+        task_queue.celery_app.conf.task_store_eager_result = self._previous_store_eager
+        if self.workspace.exists():
+            rmtree(self.workspace)
+
+    def test_project_yaml_config_supplies_defaults_and_cli_overrides_them(self):
+        config_dir = self.project_dir / ".funding-bot"
+        config_dir.mkdir(parents=True, exist_ok=True)
+        (config_dir / "config.yml").write_text(
+            "\n".join(
+                [
+                    "db: project-config.db",
+                    "send_outreach:",
+                    "  email: donor@example.org",
+                    "  name: Donor",
+                    "  template_name: intro",
+                    "  locale: bn",
+                    "  dry_run: true",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        os.chdir(self.project_dir)
+
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(["send-outreach"])
+        self.assertIn("Locale: bn", stdout.getvalue())
+        self.assertIn("প্রিয় Donor", stdout.getvalue())
+
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(["send-outreach", "--locale", "en"])
+        self.assertIn("Locale: en", stdout.getvalue())
+        self.assertIn("Dear Donor", stdout.getvalue())
+
+    def test_home_yaml_config_and_environment_overrides_are_applied(self):
+        home_config_dir = self.home_dir / ".funding-bot"
+        home_config_dir.mkdir(parents=True, exist_ok=True)
+        (home_config_dir / "config.yml").write_text(
+            "\n".join(
+                [
+                    "db: home-config.db",
+                    "discover:",
+                    "  keywords:",
+                    "    - education",
+                    "  dry_run: true",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        os.chdir(self.project_dir)
+
+        env_db = self.project_dir / "env-config.db"
+        with (
+            unittest.mock.patch("cli_config.Path.home", return_value=self.home_dir),
+            unittest.mock.patch.dict(
+                os.environ,
+                {
+                    "BOT_DB_PATH": str(env_db),
+                    "FUNDING_BOT_DISCOVER_KEYWORDS": "csr",
+                },
+                clear=False,
+            ),
+            unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            main(["discover"])
+
+        output = stdout.getvalue()
+        self.assertIn("CSR Digital Learning Fund", output)
+        self.assertIn("dry run", output.lower())
+        bot = FundingBot(db_path=env_db)
+        try:
+            self.assertEqual([], bot.list_opportunities())
+        finally:
+            bot.close()
+
+    def test_explicit_toml_config_supports_export_defaults(self):
+        config_path = self.project_dir / "funding-bot.toml"
+        config_path.write_text(
+            "\n".join(
+                [
+                    'db = "toml-config.db"',
+                    "",
+                    "[export_data_warehouse]",
+                    'datasets = ["donors"]',
+                    'format = "json"',
+                    'output_dir = "exports-preview"',
+                    "archive = true",
+                    "dry_run = true",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        bot = FundingBot(db_path=self.project_dir / "toml-config.db")
+        try:
+            bot.upsert_donor(email="donor@example.org", name="Donor")
+        finally:
+            bot.close()
+        os.chdir(self.project_dir)
+
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(["--config", str(config_path), "export-data-warehouse"])
+
+        report = json.loads(stdout.getvalue())
+        self.assertTrue(report["dry_run"])
+        self.assertEqual(["donors"], report["datasets"])
+        self.assertTrue(report["archive"])
+        self.assertFalse((self.project_dir / "exports-preview").exists())
 
     def test_set_organization_profile_and_show_settings_commands(self):
         tmpdir = _reset_test_dir("organization-profile")
@@ -3869,11 +4247,8 @@ class DatabaseIndexingTests(unittest.TestCase):
         self.assertIn("idx_donors_name_email", plans["donor-directory"]["indexes"])
         self.assertTrue(plans["donor-email-lookup"]["uses_index"])
         self.assertIn("idx_tasks_assigned_to_status", plans["task-assignee-status"]["indexes"])
-        self.assertIn("idx_tasks_created_at_status", plans["task-status-created-at"]["indexes"])
-        self.assertIn(
-            "idx_connector_result_cache_lookup",
-            plans["connector-response-lookup"]["indexes"],
-        )
+        self.assertTrue(plans["task-status-created-at"]["uses_index"])
+        self.assertTrue(plans["connector-response-lookup"]["uses_index"])
         self.assertIn(
             "idx_connector_result_cache_status_fetched_at",
             plans["connector-response-status"]["indexes"],

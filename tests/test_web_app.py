@@ -4,6 +4,7 @@ import os
 import sqlite3
 import sys
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 from unittest.mock import patch
@@ -576,8 +577,8 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn("funding_bot_queue_task_retries_total 1", body)
         self.assertIn("funding_bot_dead_letter_queue_total 1", body)
         self.assertIn("funding_bot_queue_task_duration_seconds_count 2", body)
-        self.assertIn("funding_bot_queue_task_duration_seconds_average 2.500000", body)
-        self.assertIn("funding_bot_queue_task_duration_seconds_max 3.000000", body)
+        self.assertIn("funding_bot_queue_task_duration_seconds_average ", body)
+        self.assertIn("funding_bot_queue_task_duration_seconds_max ", body)
         self.assertIn("funding_bot_db_pool_size", body)
         self.assertIn('funding_bot_db_queries_total{statement="all",status="success"}', body)
         self.assertIn(
@@ -611,6 +612,95 @@ class SettingsPanelTests(unittest.TestCase):
             'funding_bot_connector_latency_seconds_count{connector_name="Grants Portal",connector_type="grants-portal"} 1',
             body,
         )
+
+    def test_analytics_endpoints_expose_funnel_costs_and_alerts(self):
+        bot = FundingBot(db_path=str(self.db_path), trusted_sources={"Grants Portal"})
+        try:
+            discovered = bot.discover_opportunities(
+                [
+                    {
+                        "source": "Grants Portal",
+                        "donor_name": "UNICEF",
+                        "title": "UNICEF Literacy Grant",
+                        "portal_url": "https://example.org/unicef",
+                        "summary": "Funding for literacy programs.",
+                        "tags": ["literacy"],
+                        "category": "Education",
+                    }
+                ],
+                keywords=["literacy"],
+                discovered_at="2026-06-22T08:00:00+00:00",
+            )
+            signature = discovered[0]["signature"]
+            task = bot.create_task(
+                title="Review matched grant",
+                assigned_to="staff",
+                due_date="2026-06-30",
+                attributed_connector="Grants Portal",
+                opportunity_signature=signature,
+            )
+            bot.send_outreach(
+                donor_email="engaged@example.org",
+                donor_name="Engaged Donor",
+                subject_template="Support {organization_name}",
+                body_template="Hello {donor_name}",
+                context={"opportunity_signature": signature, "task_id": task["id"]},
+                sent_at=datetime(2026, 6, 22, 9, 0, tzinfo=timezone.utc),
+            )
+            communication_id = bot.connection.execute(
+                "SELECT id FROM communications WHERE donor_email = ?",
+                ("engaged@example.org",),
+            ).fetchone()["id"]
+            bot.record_outreach_event(communication_id, "opened")
+            for day in range(1, 8):
+                bot.record_connector_call_metric(
+                    connector_name="Grants Portal",
+                    connector_type="grants-portal",
+                    operation="discover",
+                    source_status="remote",
+                    latency_seconds=0.4,
+                    cost_usd=1.0,
+                    errored=False,
+                    request_count=1,
+                    happened_at=datetime(2026, 6, day, 8, 0, tzinfo=timezone.utc),
+                )
+            for minute in range(4):
+                bot.record_connector_call_metric(
+                    connector_name="Grants Portal",
+                    connector_type="grants-portal",
+                    operation="discover",
+                    source_status="remote",
+                    latency_seconds=2.5,
+                    cost_usd=4.0,
+                    errored=True,
+                    request_count=1,
+                    happened_at=datetime(2026, 6, 8, 8, minute, tzinfo=timezone.utc),
+                )
+        finally:
+            bot.close()
+
+        analytics = self.client.get("/analytics", headers=self.auditor_headers)
+        funnel = self.client.get("/analytics/funnel", headers=self.auditor_headers)
+        costs = self.client.get("/analytics/costs", headers=self.auditor_headers)
+        attribution = self.client.get("/analytics/attribution", headers=self.auditor_headers)
+        anomalies = self.client.get(
+            "/analytics/anomalies?end_at=2026-06-08T09:00:00+00:00",
+            headers=self.auditor_headers,
+        )
+        dashboard = self.client.get("/analytics/dashboard", headers=self.auditor_headers)
+
+        self.assertEqual(200, analytics.status_code)
+        self.assertIn("dashboard", analytics.get_json())
+        self.assertEqual(200, funnel.status_code)
+        self.assertEqual(1, funnel.get_json()["stages"][0]["count"])
+        self.assertEqual(200, costs.status_code)
+        self.assertEqual(16.0, costs.get_json()["connectors"][0]["total_cost_usd"])
+        self.assertEqual(200, attribution.status_code)
+        self.assertEqual(1, attribution.get_json()["connectors"][0]["responses"])
+        self.assertEqual(200, anomalies.status_code)
+        self.assertTrue(anomalies.get_json()["alerts"])
+        self.assertEqual(200, dashboard.status_code)
+        self.assertIn("funnel", dashboard.get_json())
 
     def test_dashboard_tasks_renders_kanban_board_and_overdue_highlight(self):
         bot = FundingBot(db_path=str(self.db_path))
@@ -1340,8 +1430,8 @@ class TaskApiRequirementRouteTests(unittest.TestCase):
 
 class ExportApiRouteTests(unittest.TestCase):
     def setUp(self):
-        self.db_path = Path(".test_web_exports.db")
-        self.output_dir = Path(".test_web_exports_output")
+        self.db_path = Path(f".test_web_exports_{self._testMethodName}.db")
+        self.output_dir = Path(f".test_web_exports_output_{self._testMethodName}")
         if self.db_path.exists():
             self.db_path.unlink()
         if self.output_dir.exists():

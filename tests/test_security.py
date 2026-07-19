@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+import pyotp
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -15,6 +17,7 @@ os.environ.setdefault("AUDITOR_PASSWORD", "auditor-secret")
 
 from funding_bot import (  # noqa: E402
     ConnectionSecurityError,
+    FundingBot,
     _default_http_json_client,
     _require_https_url,
     create_connector,
@@ -377,3 +380,133 @@ class DashboardRateLimitAndCsrfTests(unittest.TestCase):
             app.config["RATE_LIMIT_API"] = original
 
         self.assertEqual(429, limited.status_code)
+
+
+class DashboardLockoutAndMfaTests(unittest.TestCase):
+    def setUp(self):
+        self.db_path = Path(f".test_security_mfa_{self._testMethodName}.db")
+        if self.db_path.exists():
+            self.db_path.unlink()
+        os.environ["BOT_DB_PATH"] = str(self.db_path)
+        os.environ["WEB_LOGIN_LOCKOUT_ATTEMPTS"] = "3"
+        os.environ["WEB_LOGIN_LOCKOUT_MINUTES"] = "10"
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.admin_headers = {"Authorization": "Basic YWRtaW46YWRtaW4tc2VjcmV0"}
+
+    def tearDown(self):
+        if self.db_path.exists():
+            self.db_path.unlink()
+        os.environ.pop("BOT_DB_PATH", None)
+        os.environ.pop("WEB_LOGIN_LOCKOUT_ATTEMPTS", None)
+        os.environ.pop("WEB_LOGIN_LOCKOUT_MINUTES", None)
+
+    def test_failed_password_attempts_lock_account(self):
+        invalid_headers = {"Authorization": "Basic YWRtaW46d3Jvbmc="}
+
+        first = self.client.get("/dashboard", headers=invalid_headers, base_url="https://localhost")
+        second = self.client.get(
+            "/dashboard", headers=invalid_headers, base_url="https://localhost"
+        )
+        third = self.client.get("/dashboard", headers=invalid_headers, base_url="https://localhost")
+
+        self.assertEqual(401, first.status_code)
+        self.assertEqual(401, second.status_code)
+        self.assertEqual(423, third.status_code)
+        self.assertIn("lockout_until", third.get_json())
+
+    def test_mfa_setup_verify_and_backup_code_authentication(self):
+        setup = self.client.post(
+            "/settings/security/mfa/setup",
+            headers=self.admin_headers,
+            json={},
+            base_url="https://localhost",
+        )
+        self.assertEqual(201, setup.status_code)
+        setup_payload = setup.get_json()["mfa_setup"]
+        totp = pyotp.TOTP(setup_payload["secret"])
+
+        verify = self.client.post(
+            "/settings/security/mfa/verify",
+            headers=self.admin_headers,
+            json={"code": totp.now()},
+            base_url="https://localhost",
+        )
+        self.assertEqual(200, verify.status_code)
+        self.assertTrue(verify.get_json()["mfa"]["mfa_enabled"])
+
+        fresh_client = app.test_client()
+        missing_mfa = fresh_client.get(
+            "/dashboard",
+            headers=self.admin_headers,
+            base_url="https://localhost",
+        )
+        self.assertEqual(401, missing_mfa.status_code)
+        self.assertTrue(missing_mfa.get_json()["mfa_required"])
+
+        valid_mfa = fresh_client.get(
+            "/dashboard",
+            headers={**self.admin_headers, "X-MFA-Code": totp.now()},
+            base_url="https://localhost",
+        )
+        self.assertEqual(200, valid_mfa.status_code)
+
+        backup_code = setup_payload["backup_codes"][0]
+        backup_client = app.test_client()
+        backup_login = backup_client.get(
+            "/dashboard",
+            headers={**self.admin_headers, "X-MFA-Code": backup_code},
+            base_url="https://localhost",
+        )
+        self.assertEqual(200, backup_login.status_code)
+
+        reused_code = app.test_client().get(
+            "/dashboard",
+            headers={**self.admin_headers, "X-MFA-Code": backup_code},
+            base_url="https://localhost",
+        )
+        self.assertEqual(401, reused_code.status_code)
+
+    def test_input_sanitization_escapes_task_and_profile_content(self):
+        organization_response = self.client.post(
+            "/settings/organization",
+            headers=self.admin_headers,
+            json={"name": "<script>alert(1)</script> Org"},
+            base_url="https://localhost",
+        )
+        self.assertEqual(200, organization_response.status_code)
+        self.assertEqual(
+            "&lt;script&gt;alert(1)&lt;/script&gt; Org",
+            organization_response.get_json()["organization_profile"]["name"],
+        )
+
+        donor_response = self.client.post(
+            "/donors",
+            headers=self.admin_headers,
+            json={
+                "email": "donor@example.org",
+                "name": "<b>Donor</b>",
+                "preferences": {"note": "<img>"},
+            },
+            base_url="https://localhost",
+        )
+        self.assertEqual(201, donor_response.status_code)
+        self.assertEqual("&lt;b&gt;Donor&lt;/b&gt;", donor_response.get_json()["name"])
+        self.assertEqual("&lt;img&gt;", donor_response.get_json()["preferences"]["note"])
+
+        task_response = self.client.post(
+            "/tasks",
+            headers=self.admin_headers,
+            json={
+                "title": "<script>Plan</script>",
+                "assigned_to": "staff",
+                "due_date": "2026-07-21",
+                "description": "hello\u0000world",
+            },
+            base_url="https://localhost",
+        )
+        self.assertEqual(201, task_response.status_code)
+        self.assertEqual(
+            "&lt;script&gt;Plan&lt;/script&gt;", task_response.get_json()["task"]["title"]
+        )
+        self.assertEqual("helloworld", task_response.get_json()["task"]["description"])

@@ -66,21 +66,28 @@ class CeleryTaskDefinitionTests(unittest.TestCase):
 
 class CeleryTaskExecutionTests(unittest.TestCase):
     def setUp(self):
-        self.db_path = Path(".test_queue.db")
+        self.db_path = Path(f".test_queue_{self._testMethodName}.db")
+        self.export_dir = Path(f".test_queue_exports_{self._testMethodName}")
         if self.db_path.exists():
             self.db_path.unlink()
-
-    def tearDown(self):
-        if self.db_path.exists():
-            self.db_path.unlink()
-        export_dir = Path(".test_queue_exports")
-        if export_dir.exists():
-            for path in sorted(export_dir.rglob("*"), reverse=True):
+        if self.export_dir.exists():
+            for path in sorted(self.export_dir.rglob("*"), reverse=True):
                 if path.is_file():
                     path.unlink()
                 elif path.is_dir():
                     path.rmdir()
-            export_dir.rmdir()
+            self.export_dir.rmdir()
+
+    def tearDown(self):
+        if self.db_path.exists():
+            self.db_path.unlink()
+        if self.export_dir.exists():
+            for path in sorted(self.export_dir.rglob("*"), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            self.export_dir.rmdir()
 
     def test_discover_task_records_progress_and_success_callback(self):
         result = task_queue.discover_opportunities_task(
@@ -103,7 +110,7 @@ class CeleryTaskExecutionTests(unittest.TestCase):
         finally:
             bot.close()
 
-    def test_send_outreach_task_dry_run_persists_task_run_and_communication(self):
+    def test_send_outreach_task_dry_run_persists_task_run_without_sending(self):
         bot = FundingBot(db_path=self.db_path)
         try:
             bot.store_organization_profile(
@@ -126,8 +133,8 @@ class CeleryTaskExecutionTests(unittest.TestCase):
         try:
             communications = bot.connection.execute("SELECT * FROM communications").fetchall()
             task_run = bot.get_task_run("outreach-1")
-            self.assertEqual(1, len(communications))
-            self.assertEqual("donor@example.org", communications[0]["donor_email"])
+            self.assertEqual(0, len(communications))
+            self.assertTrue(task_run["result"]["preview"]["would_log_communication"])
             self.assertEqual("on_success", task_run["callback_name"])
         finally:
             bot.close()
@@ -190,20 +197,20 @@ class CeleryTaskExecutionTests(unittest.TestCase):
         result = task_queue.export_data_warehouse_task(
             datasets=["donors"],
             export_format="json",
-            output_dir=".test_queue_exports",
+            output_dir=str(self.export_dir),
             db_path=str(self.db_path),
             idempotency_key="export-1",
         )
 
-        self.assertEqual(1, result["count"])
-        self.assertTrue(Path(result["artifacts"][0]["path"]).exists())
+        self.assertEqual(1, result["task_run"]["result"]["count"])
+        self.assertTrue(Path(result["task_run"]["result"]["artifacts"][0]["path"]).exists())
 
     def test_enforce_data_retention_task_returns_report(self):
         bot = FundingBot(db_path=self.db_path)
         try:
             bot.connection.execute(
                 "INSERT INTO audit_logs (happened_at, action, details_json) VALUES (?, ?, ?)",
-                ("2026-05-01T00:00:00+00:00", "expired_audit", "{}"),
+                ("2020-05-01T00:00:00+00:00", "expired_audit", "{}"),
             )
             bot.connection.commit()
         finally:

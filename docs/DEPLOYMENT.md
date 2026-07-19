@@ -143,7 +143,9 @@ Flower should be protected behind authentication or a private network boundary. 
 - watch queue depth during traffic bursts
 
 When running via Docker Compose, set `FLOWER_BASIC_AUTH=user:password` in `.env`
-to require login for the Flower UI.
+to require login for the Flower UI. Set `FLOWER_DASHBOARD_URL` when the
+settings queue-monitoring card should point to a reverse-proxied or non-default
+Flower hostname.
 
 ### Graceful shutdown and idempotency
 
@@ -166,6 +168,7 @@ The `/metrics` endpoint exports queue metrics alongside app metrics, SQLAlchemy 
 - worker count dropping below the expected replica count
 - queue depth growing continuously over multiple scrape intervals
 - active tasks staying high with no drop in pending depth
+- queue task duration averages or maxima trending upward
 - database pool checked-out connections remaining near the configured size
 - database query error rate exceeding your SLO
 - database query timeouts or lock timeouts appearing at all

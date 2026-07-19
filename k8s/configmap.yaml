@@ -29,4 +29,8 @@ data:
   CELERY_RESULT_BACKEND: "redis://funding-bot-redis:6379/1"
   CELERY_QUEUE_NAME: "funding-bot"
   CELERY_TASK_ALWAYS_EAGER: "0"
+  FUNDING_BOT_TRACE_EXPORTER: "otlp"
+  OTEL_SERVICE_NAME: "funding-bot"
+  OTEL_SERVICE_NAMESPACE: "funding-bot"
+  OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: "http://funding-bot-jaeger-collector:4318/v1/traces"
   FUNDING_BOT_DB_SLOW_QUERY_THRESHOLD_SECONDS: "0.25"
