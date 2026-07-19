@@ -85,7 +85,9 @@ def verify_backup(backup_dir: Path) -> VerificationResult:
         else:
             db_candidates = sorted(backup_dir.glob("*.db")) + sorted(backup_dir.glob("*.sqlite3"))
             if not db_candidates:
-                raise BackupVerificationError("Unable to locate a SQLite database file in the backup.")
+                raise BackupVerificationError(
+                    "Unable to locate a SQLite database file in the backup."
+                )
             _run_integrity_check(db_candidates[0], use_uri=True)
     finally:
         if workspace_dir and workspace_dir.exists():
@@ -98,16 +100,45 @@ def verify_backup(backup_dir: Path) -> VerificationResult:
     )
 
 
+def _find_latest_backup(backup_root: Path) -> Path:
+    candidates = sorted(
+        (
+            candidate
+            for candidate in backup_root.iterdir()
+            if candidate.is_dir() and (candidate / "manifest.json").exists()
+        ),
+        key=lambda candidate: candidate.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise BackupVerificationError(f"No backup directories were found in {backup_root}")
+    return candidates[0]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Verify SQLite backup snapshots.")
-    parser.add_argument("backup_dir", help="Backup directory created by scripts/backup_sqlite.py")
+    parser.add_argument(
+        "backup_dir", nargs="?", help="Backup directory created by scripts/backup_sqlite.py"
+    )
+    parser.add_argument(
+        "--latest-in",
+        dest="latest_in",
+        help="Resolve and verify the most recent backup directory under this path.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    result = verify_backup(Path(args.backup_dir).resolve())
+    if not args.backup_dir and not args.latest_in:
+        parser.error("Provide either backup_dir or --latest-in")
+    backup_dir = (
+        Path(args.backup_dir).resolve()
+        if args.backup_dir
+        else _find_latest_backup(Path(args.latest_in).resolve())
+    )
+    result = verify_backup(backup_dir)
     print(
         f"Verified {result.backup_type} backup at {result.backup_dir} "
         f"({result.verified_files} file(s) checked)"

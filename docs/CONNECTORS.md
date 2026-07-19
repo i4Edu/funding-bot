@@ -9,7 +9,8 @@ keyword/category mappings, and validate the connector from the CLI.
 | --- | --- | --- | --- |
 | `grants-portal` | `GrantsPortalConnector` | Grants.gov | Demo by default; live mode uses `transport="http"` plus optional OAuth2/API-key credentials from `GRANTS_GOV_API_CREDENTIALS` |
 | `csr-network` | `CSRNetworkConnector` | Candid Open RFP Opportunities | Demo by default; live mode uses `transport="http"` plus `CSR_NETWORK_API_CREDENTIALS` |
-| `ngo-directory` | `NGODirectoryConnector` | NGO Directory | Demo data unless an `http_client` is supplied |
+| `ngo-directory` | `NGODirectoryConnector` | NGO Directory / ProPublica Nonprofit Explorer | Demo by default; live mode uses `transport="http"` and optionally `NGO_DIRECTORY_API_CREDENTIALS` when an authenticated proxy is required |
+| `foundation-directory` | `FoundationDirectoryConnector` | Candid Grants API | Demo by default; live mode uses `transport="http"` plus `FOUNDATION_DIRECTORY_API_CREDENTIALS` (API key or OAuth2 bearer token) |
 
 ## Available keyword mappings
 
@@ -36,6 +37,13 @@ and category names. Matching is case-insensitive.
 | --- | --- | --- |
 | `literacy` | `reading`, `community engagement`, `library support` | `Literacy` |
 | `institutional` | `foundation grant`, `capacity building` | `Literacy` |
+
+### `foundation-directory`
+
+| Canonical keyword | Synonyms | Categories |
+| --- | --- | --- |
+| `foundation` | `grantmaker`, `private foundation`, `philanthropy` | `Private Foundation` |
+| `education` | `learning`, `student success`, `school` | `Education` |
 
 ## How keyword mapping works
 
@@ -133,6 +141,12 @@ Redis checks so operators can quickly spot connector-specific outages.
   `OAuth2ClientCredentialsVault`.
 - `CSR_NETWORK_API_CREDENTIALS` should contain a Candid
   `subscription_key`/`api_key`.
+- `NGO_DIRECTORY_API_CREDENTIALS` is optional and can contain OAuth2
+  client-credentials when NGO Directory requests must traverse an authenticated
+  proxy or gateway.
+- `FOUNDATION_DIRECTORY_API_CREDENTIALS` can contain either a Candid
+  `api_key`/`secret` or an OAuth2 client-credentials document that resolves to
+  a bearer token.
 
 ## Fallback and result schema migrations
 

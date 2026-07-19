@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sqlite3
 from dataclasses import dataclass
@@ -89,7 +90,11 @@ def _backup_wal(source_db: Path, backup_dir: Path) -> None:
         connection.execute("PRAGMA wal_checkpoint(PASSIVE)")
         connection.execute("BEGIN IMMEDIATE")
         try:
-            for candidate in (source_db, source_db.with_name(f"{source_db.name}-wal"), source_db.with_name(f"{source_db.name}-shm")):
+            for candidate in (
+                source_db,
+                source_db.with_name(f"{source_db.name}-wal"),
+                source_db.with_name(f"{source_db.name}-shm"),
+            ):
                 if candidate.exists():
                     shutil.copy2(candidate, backup_dir / candidate.name)
         finally:
@@ -161,8 +166,16 @@ def create_backup(
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Create consistent SQLite backup snapshots.")
-    parser.add_argument("--db", default="funding_bot.db", help="Path to the SQLite database file.")
-    parser.add_argument("--output-dir", default="backups", help="Directory that stores backup snapshots.")
+    parser.add_argument(
+        "--db",
+        default=os.environ.get("BOT_DB_PATH", "funding_bot.db"),
+        help="Path to the SQLite database file.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        default=os.environ.get("BACKUP_DIRECTORY", "backups"),
+        help="Directory that stores backup snapshots.",
+    )
     parser.add_argument(
         "--mode",
         default=FULL_MODE,
@@ -172,7 +185,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--retention-days",
         type=int,
-        default=DEFAULT_RETENTION_DAYS,
+        default=int(os.environ.get("BACKUP_RETENTION_DAYS", DEFAULT_RETENTION_DAYS)),
         help="Delete backup snapshot directories older than this many days.",
     )
     return parser

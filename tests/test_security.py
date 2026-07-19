@@ -82,15 +82,15 @@ class DashboardSessionSecurityTests(unittest.TestCase):
             self.db_path.unlink()
         os.environ["BOT_DB_PATH"] = str(self.db_path)
         app.config["TESTING"] = True
+        self.original_cors_origins = app.config.get("API_CORS_ALLOWED_ORIGINS")
         self.client = app.test_client()
-        self.auth_headers = {
-            "Authorization": "Basic YXVkaXRvcjphdWRpdG9yLXNlY3JldA=="
-        }
+        self.auth_headers = {"Authorization": "Basic YXVkaXRvcjphdWRpdG9yLXNlY3JldA=="}
 
     def tearDown(self):
         if self.db_path.exists():
             self.db_path.unlink()
         os.environ.pop("BOT_DB_PATH", None)
+        app.config["API_CORS_ALLOWED_ORIGINS"] = self.original_cors_origins
 
     def test_dashboard_sets_secure_httponly_cookie(self):
         response = self.client.get(
@@ -136,6 +136,81 @@ class DashboardSessionSecurityTests(unittest.TestCase):
             self.assertEqual(401, expired_response.status_code)
         finally:
             app.config["PERMANENT_SESSION_LIFETIME"] = original_lifetime
+
+    def test_dashboard_sets_security_headers(self):
+        response = self.client.get(
+            "/dashboard",
+            headers=self.auth_headers,
+            base_url="https://localhost",
+        )
+
+        self.assertEqual(200, response.status_code)
+        csp = response.headers.get("Content-Security-Policy", "")
+        self.assertIn("default-src 'self'", csp)
+        self.assertIn("script-src 'self' 'unsafe-inline'", csp)
+        self.assertIn("style-src 'self' 'unsafe-inline'", csp)
+        self.assertIn("frame-ancestors 'none'", csp)
+        self.assertEqual("DENY", response.headers.get("X-Frame-Options"))
+        self.assertEqual("nosniff", response.headers.get("X-Content-Type-Options"))
+        self.assertEqual(
+            "max-age=63072000; includeSubDomains",
+            response.headers.get("Strict-Transport-Security"),
+        )
+
+    def test_api_cors_allows_configured_origin(self):
+        app.config["API_CORS_ALLOWED_ORIGINS"] = ("https://portal.example.org",)
+
+        response = self.client.get(
+            "/api/tasks/export",
+            headers={**self.auth_headers, "Origin": "https://portal.example.org"},
+        )
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(
+            "https://portal.example.org",
+            response.headers.get("Access-Control-Allow-Origin"),
+        )
+        self.assertEqual("true", response.headers.get("Access-Control-Allow-Credentials"))
+        self.assertIn("Origin", response.headers.get("Vary", ""))
+
+    def test_api_cors_preflight_allows_configured_origin(self):
+        app.config["API_CORS_ALLOWED_ORIGINS"] = ("https://portal.example.org",)
+
+        response = self.client.options(
+            "/api/tasks/sync",
+            headers={
+                "Origin": "https://portal.example.org",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Authorization, Content-Type",
+            },
+        )
+
+        self.assertEqual(204, response.status_code)
+        self.assertEqual(
+            "https://portal.example.org",
+            response.headers.get("Access-Control-Allow-Origin"),
+        )
+        self.assertIn("POST", response.headers.get("Access-Control-Allow-Methods", ""))
+        self.assertIn("Authorization", response.headers.get("Access-Control-Allow-Headers", ""))
+        self.assertEqual("86400", response.headers.get("Access-Control-Max-Age"))
+
+    def test_api_cors_preflight_rejects_disallowed_origin(self):
+        app.config["API_CORS_ALLOWED_ORIGINS"] = ("https://portal.example.org",)
+
+        response = self.client.options(
+            "/api/tasks/export",
+            headers={
+                "Origin": "https://untrusted.example.org",
+                "Access-Control-Request-Method": "GET",
+            },
+        )
+
+        self.assertEqual(403, response.status_code)
+        self.assertEqual(
+            {"error": "Origin not allowed for this API."},
+            response.get_json(),
+        )
+        self.assertIsNone(response.headers.get("Access-Control-Allow-Origin"))
 
 
 class DashboardRateLimitAndCsrfTests(unittest.TestCase):

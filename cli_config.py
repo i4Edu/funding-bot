@@ -12,11 +12,7 @@ except ModuleNotFoundError:  # pragma: no cover
     tomllib = None
 
 
-HOME_CONFIG_CANDIDATES = (
-    Path("~/.funding-bot/config.yml"),
-    Path("~/.funding-bot/config.yaml"),
-    Path("~/.funding-bot/config.toml"),
-)
+HOME_CONFIG_CANDIDATES = ("config.yml", "config.yaml", "config.toml")
 PROJECT_CONFIG_CANDIDATES = (
     Path(".funding-bot/config.yml"),
     Path(".funding-bot/config.yaml"),
@@ -88,7 +84,9 @@ def _prepare_yaml_lines(text: str) -> list[tuple[int, str]]:
     return prepared
 
 
-def _parse_yaml_list(lines: list[tuple[int, str]], index: int, indent: int) -> tuple[list[Any], int]:
+def _parse_yaml_list(
+    lines: list[tuple[int, str]], index: int, indent: int
+) -> tuple[list[Any], int]:
     items: list[Any] = []
     while index < len(lines):
         current_indent, stripped = lines[index]
@@ -114,7 +112,9 @@ def _parse_yaml_list(lines: list[tuple[int, str]], index: int, indent: int) -> t
     return items, index
 
 
-def _parse_yaml_dict(lines: list[tuple[int, str]], index: int, indent: int) -> tuple[dict[str, Any], int]:
+def _parse_yaml_dict(
+    lines: list[tuple[int, str]], index: int, indent: int
+) -> tuple[dict[str, Any], int]:
     data: dict[str, Any] = {}
     while index < len(lines):
         current_indent, stripped = lines[index]
@@ -192,7 +192,7 @@ def discover_config_paths(
     base_home = home or Path.home()
     paths: list[Path] = []
     for candidate in HOME_CONFIG_CANDIDATES:
-        resolved = (base_home / candidate.expanduser().relative_to(Path.home())).resolve()
+        resolved = (base_home / ".funding-bot" / candidate).resolve()
         if resolved.exists():
             paths.append(resolved)
     for candidate in PROJECT_CONFIG_CANDIDATES:

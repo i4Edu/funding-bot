@@ -212,7 +212,9 @@ class IntegrationWorkflowTests(unittest.TestCase):
         self.assertIn("application_recorded", audit_actions)
 
     def test_pipeline_failure_records_pending_application_and_prevents_duplicates(self):
-        connector = GrantsPortalConnector(http_client=lambda *_args, **_kwargs: self._grants_payload())
+        connector = GrantsPortalConnector(
+            http_client=lambda *_args, **_kwargs: self._grants_payload()
+        )
         found = self.bot.run_discovery([connector], discovered_at=self.report_date)
 
         with unittest.mock.patch.object(self.bot, "_utcnow", return_value=self.report_date):
@@ -250,7 +252,9 @@ class IntegrationWorkflowTests(unittest.TestCase):
 
     def test_discovery_uses_cached_connector_results_when_remote_fetch_fails(self):
         seed_connector = GrantsPortalConnector(
-            http_client=lambda *_args, **_kwargs: self._grants_payload(title="Cached Education Grant"),
+            http_client=lambda *_args, **_kwargs: self._grants_payload(
+                title="Cached Education Grant"
+            ),
             page_size=5,
         )
         seeded = self.bot.run_discovery([seed_connector], discovered_at=self.report_date)
@@ -261,7 +265,9 @@ class IntegrationWorkflowTests(unittest.TestCase):
 
         fallback_connector = GrantsPortalConnector(http_client=failing_http_client, page_size=5)
         started_at = time.perf_counter()
-        with unittest.mock.patch.dict(os.environ, {"PORTAL_FALLBACK_MODE": "cache-first"}, clear=False):
+        with unittest.mock.patch.dict(
+            os.environ, {"PORTAL_FALLBACK_MODE": "cache-first"}, clear=False
+        ):
             fallback_found = self.bot.run_discovery(
                 [fallback_connector],
                 discovered_at=self.report_date,
@@ -312,14 +318,18 @@ class ConnectorContractTests(unittest.TestCase):
             (
                 "grants-portal",
                 GrantsPortalConnector(
-                    http_client=lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("down")),
+                    http_client=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                        TimeoutError("down")
+                    ),
                     max_retries=0,
                 ),
             ),
             (
                 "csr-network",
                 CSRNetworkConnector(
-                    http_client=lambda *_args, **_kwargs: (_ for _ in ()).throw(ConnectionError("down")),
+                    http_client=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                        ConnectionError("down")
+                    ),
                     max_retries=0,
                 ),
             ),
@@ -333,7 +343,9 @@ class ConnectorContractTests(unittest.TestCase):
             (
                 "foundation-directory",
                 FoundationDirectoryConnector(
-                    http_client=lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("down")),
+                    http_client=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                        TimeoutError("down")
+                    ),
                     credentials={"api_key": "test-key"},
                     max_retries=0,
                 ),
@@ -341,14 +353,18 @@ class ConnectorContractTests(unittest.TestCase):
             (
                 "globalgiving",
                 GlobalGivingConnector(
-                    http_client=lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("down")),
+                    http_client=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                        TimeoutError("down")
+                    ),
                     max_retries=0,
                 ),
             ),
             (
                 "kickstarter-for-good",
                 KickstarterForGoodConnector(
-                    http_client=lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("down")),
+                    http_client=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                        TimeoutError("down")
+                    ),
                     max_retries=0,
                 ),
             ),

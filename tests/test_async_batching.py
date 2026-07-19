@@ -1,5 +1,57 @@
 import asyncio
+import sys
+import types
 import unittest
+from unittest import mock
+
+if "pyotp" not in sys.modules:
+    sys.modules["pyotp"] = types.SimpleNamespace(TOTP=object)
+
+if "observability" not in sys.modules:
+
+    class _Span:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def set_attribute(self, *args, **kwargs):
+            return None
+
+    sys.modules["observability"] = types.SimpleNamespace(
+        capture_current_context=lambda: {},
+        configure_tracing=lambda *args, **kwargs: None,
+        current_trace_id=lambda: None,
+        ensure_slo_schema=lambda *args, **kwargs: None,
+        inject_context=lambda *args, **kwargs: None,
+        record_slo_event=lambda *args, **kwargs: None,
+        render_slo_prometheus=lambda *args, **kwargs: [],
+        set_span_error=lambda *args, **kwargs: None,
+        start_span=lambda *args, **kwargs: _Span(),
+        summarize_slos=lambda *args, **kwargs: {},
+    )
+
+if "opentelemetry.trace" not in sys.modules:
+    trace_module = types.SimpleNamespace(
+        SpanKind=types.SimpleNamespace(CLIENT="client", INTERNAL="internal")
+    )
+    sys.modules["opentelemetry.trace"] = trace_module
+    sys.modules.setdefault("opentelemetry", types.SimpleNamespace(trace=trace_module))
+
+if "warehouse_exports" not in sys.modules:
+
+    class _ArchiveManager:
+        @classmethod
+        def from_env(cls):
+            return cls()
+
+    sys.modules["warehouse_exports"] = types.SimpleNamespace(
+        ArchiveManager=_ArchiveManager,
+        WarehouseExportService=lambda *_args, **_kwargs: types.SimpleNamespace(
+            export=lambda *_a, **_k: {}
+        ),
+    )
 
 from funding_bot import (
     ConnectorBatchRequest,
@@ -111,7 +163,43 @@ class AsyncBatchingTests(unittest.TestCase):
             source_name="Async CSR",
             base_url="https://async.example.org/csr-api",
         )
-        bot = FundingBot(trusted_sources={"Async Grants", "Async CSR"})
+        with mock.patch.object(FundingBot, "_apply_migrations", lambda self: None):
+            bot = FundingBot(trusted_sources={"Async Grants", "Async CSR"})
+        bot.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS funnel_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                stage TEXT NOT NULL,
+                entity_key TEXT NOT NULL,
+                connector_name TEXT,
+                opportunity_signature TEXT,
+                task_id INTEGER,
+                communication_id INTEGER,
+                event_type TEXT,
+                success INTEGER NOT NULL DEFAULT 1,
+                happened_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            )
+            """
+        )
+        bot.connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS connector_call_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                connector_name TEXT NOT NULL,
+                connector_type TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                source_status TEXT NOT NULL,
+                latency_seconds REAL NOT NULL,
+                cost_usd REAL NOT NULL DEFAULT 0,
+                errored INTEGER NOT NULL DEFAULT 0,
+                request_count INTEGER NOT NULL DEFAULT 1,
+                happened_at TEXT NOT NULL,
+                metadata_json TEXT NOT NULL DEFAULT '{}'
+            )
+            """
+        )
+        bot.connection.commit()
         try:
             found = asyncio.run(
                 bot.run_discovery_async(

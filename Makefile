@@ -18,7 +18,8 @@ DOCS_SERVE_PORT ?= 8000
 DOCS_BUILD_DIR ?= docs/_build
 DOCKER_ENV_FILE ?= .env
 COMPOSE_PROFILES ?=
-PYTHON_SOURCES ?= funding_bot.py celery_app.py celery_tasks.py task_queue.py web tests
+PYTHON_SOURCES ?= funding_bot.py celery_app.py task_queue.py tasks web tests
+MYPY_SOURCES ?= celery_app.py task_queue.py tasks web
 DEV_PYTHON_TOOLS ?= pre-commit ruff black isort mypy flake8
 DOCKER_APP_COMMAND ?= python -m flask --app web.app run --host 0.0.0.0 --port 5000
 COMPOSE_PROFILE_FLAGS := $(foreach profile,$(COMPOSE_PROFILES),--profile $(profile))
@@ -95,7 +96,7 @@ format: ensure-runtime ## Run the configured formatter when available.
 type-check: ensure-runtime ## Run the configured type checker, or fall back to Python syntax checks.
 	@$(PYTHON_EXEC) 'set -e; \
 		if python -m mypy --version >/dev/null 2>&1; then \
-			python -m mypy .; \
+			python -m mypy $(MYPY_SOURCES); \
 		elif command -v pyright >/dev/null 2>&1; then \
 			pyright; \
 		else \

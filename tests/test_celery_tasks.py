@@ -26,7 +26,11 @@ class QueueConfigTests(unittest.TestCase):
     def test_load_queue_config_supports_hybrid_mode(self):
         with patch.dict(
             os.environ,
-            {"ENABLE_TASK_QUEUE": "1", "ENABLE_LEGACY_CRON": "1", "CELERY_QUEUE_NAME": "funding-bot"},
+            {
+                "ENABLE_TASK_QUEUE": "1",
+                "ENABLE_LEGACY_CRON": "1",
+                "CELERY_QUEUE_NAME": "funding-bot",
+            },
             clear=False,
         ):
             config = task_queue.load_queue_config()
@@ -39,9 +43,24 @@ class QueueConfigTests(unittest.TestCase):
 
 class CeleryTaskDefinitionTests(unittest.TestCase):
     def test_task_definitions_are_registered(self):
-        self.assertEqual("funding_bot.discover", task_queue.TASK_DEFINITIONS["discover"]["task_name"])
-        self.assertEqual("funding_bot.send_outreach", task_queue.TASK_DEFINITIONS["outreach"]["task_name"])
-        self.assertEqual("funding_bot.send_daily_summary", task_queue.TASK_DEFINITIONS["daily-summary"]["task_name"])
+        self.assertEqual(
+            "funding_bot.discover", task_queue.TASK_DEFINITIONS["discover"]["task_name"]
+        )
+        self.assertEqual(
+            "funding_bot.send_outreach", task_queue.TASK_DEFINITIONS["outreach"]["task_name"]
+        )
+        self.assertEqual(
+            "funding_bot.send_daily_summary",
+            task_queue.TASK_DEFINITIONS["daily-summary"]["task_name"],
+        )
+        self.assertEqual(
+            "funding_bot.export_data_warehouse",
+            task_queue.TASK_DEFINITIONS["warehouse-export"]["task_name"],
+        )
+        self.assertEqual(
+            "funding_bot.enforce_data_retention",
+            task_queue.TASK_DEFINITIONS["retention-cleanup"]["task_name"],
+        )
         self.assertEqual("funding-bot", task_queue.TASK_DEFINITIONS["discover"]["queue"])
 
 
@@ -54,6 +73,14 @@ class CeleryTaskExecutionTests(unittest.TestCase):
     def tearDown(self):
         if self.db_path.exists():
             self.db_path.unlink()
+        export_dir = Path(".test_queue_exports")
+        if export_dir.exists():
+            for path in sorted(export_dir.rglob("*"), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            export_dir.rmdir()
 
     def test_discover_task_records_progress_and_success_callback(self):
         result = task_queue.discover_opportunities_task(
@@ -79,7 +106,9 @@ class CeleryTaskExecutionTests(unittest.TestCase):
     def test_send_outreach_task_dry_run_persists_task_run_and_communication(self):
         bot = FundingBot(db_path=self.db_path)
         try:
-            bot.store_organization_profile({"name": "i4Edu", "mission": "Expand access to education."})
+            bot.store_organization_profile(
+                {"name": "i4Edu", "mission": "Expand access to education."}
+            )
         finally:
             bot.close()
 
@@ -106,7 +135,9 @@ class CeleryTaskExecutionTests(unittest.TestCase):
     def test_send_outreach_task_renders_requested_locale_template(self):
         bot = FundingBot(db_path=self.db_path)
         try:
-            bot.store_organization_profile({"name": "i4Edu", "mission": "Expand access to education."})
+            bot.store_organization_profile(
+                {"name": "i4Edu", "mission": "Expand access to education."}
+            )
         finally:
             bot.close()
 
@@ -149,13 +180,61 @@ class CeleryTaskExecutionTests(unittest.TestCase):
         finally:
             bot.close()
 
+    def test_export_data_warehouse_task_generates_artifacts(self):
+        bot = FundingBot(db_path=self.db_path)
+        try:
+            bot.upsert_donor(email="donor@example.org", name="Donor Example")
+        finally:
+            bot.close()
+
+        result = task_queue.export_data_warehouse_task(
+            datasets=["donors"],
+            export_format="json",
+            output_dir=".test_queue_exports",
+            db_path=str(self.db_path),
+            idempotency_key="export-1",
+        )
+
+        self.assertEqual(1, result["count"])
+        self.assertTrue(Path(result["artifacts"][0]["path"]).exists())
+
+    def test_enforce_data_retention_task_returns_report(self):
+        bot = FundingBot(db_path=self.db_path)
+        try:
+            bot.connection.execute(
+                "INSERT INTO audit_logs (happened_at, action, details_json) VALUES (?, ?, ?)",
+                ("2026-05-01T00:00:00+00:00", "expired_audit", "{}"),
+            )
+            bot.connection.commit()
+        finally:
+            bot.close()
+
+        result = task_queue.enforce_data_retention_task(
+            dry_run=True,
+            archive=False,
+            db_path=str(self.db_path),
+            idempotency_key="retention-1",
+        )
+
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(1, result["deleted"]["audit_logs"])
+
 
 class DispatchDiscoveryTests(unittest.TestCase):
     def test_dispatch_discovery_runs_inline_in_cron_mode(self):
-        with patch.dict(os.environ, {"ENABLE_TASK_QUEUE": "0", "ENABLE_LEGACY_CRON": "1"}, clear=False), patch(
-            "task_queue._run_discovery_inline",
-            return_value={"mode": "queue", "count": 2, "new_opportunities": [{"title": "One"}, {"title": "Two"}]},
-        ) as run_task:
+        with (
+            patch.dict(
+                os.environ, {"ENABLE_TASK_QUEUE": "0", "ENABLE_LEGACY_CRON": "1"}, clear=False
+            ),
+            patch(
+                "task_queue._run_discovery_inline",
+                return_value={
+                    "mode": "queue",
+                    "count": 2,
+                    "new_opportunities": [{"title": "One"}, {"title": "Two"}],
+                },
+            ) as run_task,
+        ):
             status_code, payload = task_queue.dispatch_discovery(keywords=["education"])
 
         self.assertEqual(200, status_code)
@@ -164,11 +243,16 @@ class DispatchDiscoveryTests(unittest.TestCase):
         run_task.assert_called_once()
 
     def test_dispatch_discovery_enqueues_when_task_queue_enabled(self):
-        with patch.dict(os.environ, {"ENABLE_TASK_QUEUE": "1", "ENABLE_LEGACY_CRON": "1"}, clear=False), patch.object(
-            task_queue.discover_opportunities_task,
-            "delay",
-            return_value=SimpleNamespace(id="job-123"),
-        ) as delayed:
+        with (
+            patch.dict(
+                os.environ, {"ENABLE_TASK_QUEUE": "1", "ENABLE_LEGACY_CRON": "1"}, clear=False
+            ),
+            patch.object(
+                task_queue.discover_opportunities_task,
+                "delay",
+                return_value=SimpleNamespace(id="job-123"),
+            ) as delayed,
+        ):
             status_code, payload = task_queue.dispatch_discovery(keywords=["education"])
 
         self.assertEqual(202, status_code)

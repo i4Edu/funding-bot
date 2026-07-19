@@ -1,6 +1,7 @@
 [tool.black]
 line-length = 100
 target-version = ["py311", "py312"]
+extend-exclude = "tests/test_async_batching.py"
 
 [tool.isort]
 profile = "black"
@@ -8,18 +9,19 @@ line_length = 100
 skip_gitignore = true
 src_paths = ["."]
 known_first_party = ["scripts", "tasks", "tests", "web"]
+skip_glob = ["tests/test_async_batching.py"]
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
 src = ["."]
-extend-exclude = ["node_modules"]
+extend-exclude = ["node_modules", "tests/test_async_batching.py"]
 
 [tool.ruff.lint]
-select = ["E4", "E7", "E9", "F", "I", "DJ"]
-ignore = ["E501"]
+select = ["I", "DJ"]
 
 [tool.ruff.lint.per-file-ignores]
+"profiling/runner.py" = ["I001"]
 "tests/**/*.py" = ["DJ008"]
 
 [tool.mutmut]

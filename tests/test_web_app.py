@@ -81,29 +81,41 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertIn(b"Settings", response.data)
         self.assertIn(b"Translations", response.data)
+        self.assertIn(b"Queue Monitoring", response.data)
+        self.assertIn(b"Open Flower", response.data)
 
     def test_dashboard_page_exposes_keyboard_shortcuts_and_focus_regions(self):
         html = (PROJECT_ROOT / "web" / "templates" / "dashboard.html").read_text(encoding="utf-8")
         self.assertIn('aria-label="Open settings page"', html)
         self.assertIn('id="main-content" class="container py-4" tabindex="-1"', html)
         self.assertIn('id="recent-opps-region"', html)
-        self.assertIn('Alt</kbd> + <kbd>Shift</kbd> + <kbd>O</kbd> — Focus recent opportunities', html)
-        self.assertIn('KeyO: () => focusAndScroll(document.getElementById("recent-opps-region"))', html)
+        self.assertIn(
+            "Alt</kbd> + <kbd>Shift</kbd> + <kbd>O</kbd> — Focus recent opportunities", html
+        )
+        self.assertIn(
+            'KeyO: () => focusAndScroll(document.getElementById("recent-opps-region"))', html
+        )
 
     def test_settings_page_includes_aria_labels_live_regions_and_shortcuts(self):
         html = (PROJECT_ROOT / "web" / "templates" / "settings.html").read_text(encoding="utf-8")
         self.assertIn('aria-label="Save organization profile"', html)
         self.assertIn('aria-label="Run donation discovery now"', html)
         self.assertIn('aria-keyshortcuts="Alt+Shift+R"', html)
-        self.assertIn('role="status" aria-live="polite" aria-atomic="true" aria-label="Discovery results"', html)
-        self.assertIn('role="status" aria-live="polite" aria-atomic="true" aria-label="Outreach results"', html)
-        self.assertIn('Alt</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> — Focus donor outreach', html)
+        self.assertIn(
+            'role="status" aria-live="polite" aria-atomic="true" aria-label="Discovery results"',
+            html,
+        )
+        self.assertIn(
+            'role="status" aria-live="polite" aria-atomic="true" aria-label="Outreach results"',
+            html,
+        )
+        self.assertIn("Alt</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> — Focus donor outreach", html)
 
     def test_task_dashboard_page_includes_shortcut_help(self):
         html = (PROJECT_ROOT / "web" / "templates" / "tasks.html").read_text(encoding="utf-8")
         self.assertIn('aria-label="Open dashboard page"', html)
         self.assertIn('id="task-board-region"', html)
-        self.assertIn('Alt</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> — Focus the task board', html)
+        self.assertIn("Alt</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> — Focus the task board", html)
         self.assertIn('aria-keyshortcuts="Enter Space ArrowLeft ArrowRight"', html)
         self.assertIn('id="task-export-link"', html)
         self.assertIn('id="task-create-form"', html)
@@ -111,7 +123,10 @@ class SettingsPanelTests(unittest.TestCase):
 
     def test_settings_page_binds_keyboard_activation_for_action_buttons(self):
         html = (PROJECT_ROOT / "web" / "templates" / "settings.html").read_text(encoding="utf-8")
-        self.assertIn('document.querySelectorAll("[data-keyboard-click]").forEach(bindKeyboardActivation);', html)
+        self.assertIn(
+            'document.querySelectorAll("[data-keyboard-click]").forEach(bindKeyboardActivation);',
+            html,
+        )
         self.assertIn('event.key === "Enter" || event.key === " "', html)
         self.assertIn('KeyR: () => document.getElementById("run-discovery").click()', html)
 
@@ -287,8 +302,16 @@ class SettingsPanelTests(unittest.TestCase):
 
     def test_ready_endpoint_reports_dependency_checks(self):
         with (
-            mock.patch.object(web_app_module, "_check_database_health", return_value={"status": "ok", "checked": True}),
-            mock.patch.object(web_app_module, "_check_redis_health", return_value={"status": "disabled", "checked": False}),
+            mock.patch.object(
+                web_app_module,
+                "_check_database_health",
+                return_value={"status": "ok", "checked": True},
+            ),
+            mock.patch.object(
+                web_app_module,
+                "_check_redis_health",
+                return_value={"status": "disabled", "checked": False},
+            ),
             mock.patch.object(
                 web_app_module,
                 "_check_celery_health",
@@ -297,7 +320,13 @@ class SettingsPanelTests(unittest.TestCase):
             mock.patch.object(
                 web_app_module,
                 "_check_connector_health",
-                return_value={"status": "ok", "checked": True, "count": 2, "healthy_count": 2, "connectors": []},
+                return_value={
+                    "status": "ok",
+                    "checked": True,
+                    "count": 2,
+                    "healthy_count": 2,
+                    "connectors": [],
+                },
             ),
         ):
             response = self.client.get("/ready")
@@ -313,8 +342,16 @@ class SettingsPanelTests(unittest.TestCase):
 
     def test_ready_endpoint_returns_503_when_dependency_fails(self):
         with (
-            mock.patch.object(web_app_module, "_check_database_health", return_value={"status": "error", "checked": True}),
-            mock.patch.object(web_app_module, "_check_redis_health", return_value={"status": "ok", "checked": True}),
+            mock.patch.object(
+                web_app_module,
+                "_check_database_health",
+                return_value={"status": "error", "checked": True},
+            ),
+            mock.patch.object(
+                web_app_module,
+                "_check_redis_health",
+                return_value={"status": "ok", "checked": True},
+            ),
             mock.patch.object(
                 web_app_module,
                 "_check_celery_health",
@@ -323,7 +360,13 @@ class SettingsPanelTests(unittest.TestCase):
             mock.patch.object(
                 web_app_module,
                 "_check_connector_health",
-                return_value={"status": "ok", "checked": True, "count": 1, "healthy_count": 1, "connectors": []},
+                return_value={
+                    "status": "ok",
+                    "checked": True,
+                    "count": 1,
+                    "healthy_count": 1,
+                    "connectors": [],
+                },
             ),
         ):
             response = self.client.get("/ready")
@@ -333,9 +376,8 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertFalse(payload["ready"])
         self.assertEqual(["database"], payload["failing_checks"])
         self.assertIn("database", payload)
-        self.assertIn("cache", payload)
-        self.assertIn("backend", payload["database"])
-        self.assertIn("reachable", payload["cache"])
+        self.assertIn("redis", payload)
+        self.assertEqual("ok", payload["redis"]["status"])
 
     def test_database_and_cache_health_endpoints_return_monitoring_payloads(self):
         database_response = self.client.get("/health/database")
@@ -343,7 +385,10 @@ class SettingsPanelTests(unittest.TestCase):
 
         self.assertEqual(200, database_response.status_code)
         self.assertEqual(200, cache_response.status_code)
-        self.assertIn("pool_class", database_response.get_json())
+        database_payload = database_response.get_json()
+        self.assertIn("pool_class", database_payload)
+        self.assertIn("queries", database_payload)
+        self.assertIn("summary", database_payload["queries"])
         self.assertIn("backend", cache_response.get_json())
 
     def test_queue_health_endpoint_reports_disabled_queue_mode(self):
@@ -354,6 +399,43 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertEqual("disabled", payload["status"])
         self.assertEqual("cron", payload["mode"])
         self.assertEqual(0, payload["queue_depth"])
+
+    def test_queue_monitoring_endpoint_returns_health_and_runtime_metrics(self):
+        monitoring_payload = {
+            "queue": {
+                "status": "ok",
+                "queue_name": "funding-bot",
+                "broker_reachable": True,
+                "timeout_seconds": 2.0,
+                "active_tasks": 1,
+                "pending_tasks": 3,
+                "queue_depth": 3,
+                "worker_count": 2,
+                "workers": ["worker-a", "worker-b"],
+            },
+            "task_metrics": {
+                "running": 1,
+                "completed": 4,
+                "failed": 1,
+                "cancelled": 0,
+                "retries_scheduled": 2,
+                "dead_lettered": 1,
+                "duplicate_preventions": 0,
+                "duration_seconds_sum": 18.0,
+                "duration_seconds_count": 4,
+                "duration_seconds_average": 4.5,
+                "duration_seconds_max": 7.0,
+            },
+            "flower": {"url": "http://127.0.0.1:5555", "enabled": True},
+        }
+
+        with mock.patch.object(
+            web_app_module, "_queue_monitoring_payload", return_value=monitoring_payload
+        ):
+            response = self.client.get("/monitoring/queue", headers=self.auditor_headers)
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(monitoring_payload, response.get_json())
 
     def test_test_outreach_dry_run_composes_email_and_logs_it(self):
         response = self.client.post(
@@ -493,7 +575,15 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn("funding_bot_queue_task_runs_failed 1", body)
         self.assertIn("funding_bot_queue_task_retries_total 1", body)
         self.assertIn("funding_bot_dead_letter_queue_total 1", body)
+        self.assertIn("funding_bot_queue_task_duration_seconds_count 2", body)
+        self.assertIn("funding_bot_queue_task_duration_seconds_average 2.500000", body)
+        self.assertIn("funding_bot_queue_task_duration_seconds_max 3.000000", body)
         self.assertIn("funding_bot_db_pool_size", body)
+        self.assertIn('funding_bot_db_queries_total{statement="all",status="success"}', body)
+        self.assertIn(
+            'funding_bot_db_query_duration_seconds_bucket{statement="all",le="+Inf"}', body
+        )
+        self.assertIn("funding_bot_db_query_slow_threshold_seconds", body)
         self.assertIn('funding_bot_cache_hits_total{cache="donor-records"', body)
 
     def test_metrics_include_connector_request_error_and_latency_series(self):
@@ -558,16 +648,36 @@ class SettingsPanelTests(unittest.TestCase):
 
     def _seed_task_filter_data(self):
         payloads = [
-            {"title": "Staff todo soon", "assigned_to": "staff", "status": "todo", "due_date": "2026-07-20"},
+            {
+                "title": "Staff todo soon",
+                "assigned_to": "staff",
+                "status": "todo",
+                "due_date": "2026-07-20",
+            },
             {
                 "title": "Staff in progress late",
                 "assigned_to": "staff",
                 "status": "in-progress",
                 "due_date": "2026-07-25",
             },
-            {"title": "Admin todo mid", "assigned_to": "admin", "status": "todo", "due_date": "2026-07-22"},
-            {"title": "Auditor done early", "assigned_to": "auditor", "status": "done", "due_date": "2026-07-18"},
-            {"title": "Admin blocked latest", "assigned_to": "admin", "status": "blocked", "due_date": "2026-08-01"},
+            {
+                "title": "Admin todo mid",
+                "assigned_to": "admin",
+                "status": "todo",
+                "due_date": "2026-07-22",
+            },
+            {
+                "title": "Auditor done early",
+                "assigned_to": "auditor",
+                "status": "done",
+                "due_date": "2026-07-18",
+            },
+            {
+                "title": "Admin blocked latest",
+                "assigned_to": "admin",
+                "status": "blocked",
+                "due_date": "2026-08-01",
+            },
         ]
         tasks = []
         for payload in payloads:
@@ -591,23 +701,27 @@ class SettingsPanelTests(unittest.TestCase):
                 (
                     task["assigned_to"] == filter_values["assignee"]
                     if name == "assignee"
-                    else task["status"] == filter_values["status"]
-                    if name == "status"
-                    else due_date is not None and due_date >= filter_values["due_date_after"]
-                    if name == "due_date_after"
-                    else due_date is not None and due_date <= filter_values["due_date_before"]
+                    else (
+                        task["status"] == filter_values["status"]
+                        if name == "status"
+                        else (
+                            due_date is not None and due_date >= filter_values["due_date_after"]
+                            if name == "due_date_after"
+                            else due_date is not None
+                            and due_date <= filter_values["due_date_before"]
+                        )
+                    )
                 )
                 for name in active_filters
             )
 
         for size in range(1, len(filter_values) + 1):
             for active_filters in itertools.combinations(filter_values, size):
-                query_string = {
-                    name: filter_values[name]
-                    for name in active_filters
-                }
+                query_string = {name: filter_values[name] for name in active_filters}
                 query_string["sort"] = "due_date"
-                response = self.client.get("/tasks", query_string=query_string, headers=self.admin_headers)
+                response = self.client.get(
+                    "/tasks", query_string=query_string, headers=self.admin_headers
+                )
                 self.assertEqual(200, response.status_code)
                 expected_titles = [
                     task["title"]
@@ -648,7 +762,9 @@ class SettingsPanelTests(unittest.TestCase):
             ],
         }
         for sort_name, expected_titles in expected_orders.items():
-            response = self.client.get("/tasks", query_string={"sort": sort_name}, headers=self.admin_headers)
+            response = self.client.get(
+                "/tasks", query_string={"sort": sort_name}, headers=self.admin_headers
+            )
             self.assertEqual(200, response.status_code)
             self.assertEqual(expected_titles, [task["title"] for task in response.get_json()])
 
@@ -786,10 +902,13 @@ class SettingsPanelTests(unittest.TestCase):
         def fake_sender(to_addr, subject, body):
             notifications.append({"to": to_addr, "subject": subject, "body": body})
 
-        with patch.object(web_app_module, "_task_assignment_sender", return_value=fake_sender), patch.dict(
-            os.environ,
-            {"TASK_ASSIGNMENT_NOTIFICATION_RATE_LIMIT_SECONDS": "3600"},
-            clear=False,
+        with (
+            patch.object(web_app_module, "_task_assignment_sender", return_value=fake_sender),
+            patch.dict(
+                os.environ,
+                {"TASK_ASSIGNMENT_NOTIFICATION_RATE_LIMIT_SECONDS": "3600"},
+                clear=False,
+            ),
         ):
             first = self.client.post(
                 f"/tasks/{task['id']}/assignment",
@@ -876,7 +995,9 @@ class SettingsPanelTests(unittest.TestCase):
             ],
         }
 
-        with mock.patch.object(web_app_module, "_get_queue_health_snapshot", return_value=queue_snapshot):
+        with mock.patch.object(
+            web_app_module, "_get_queue_health_snapshot", return_value=queue_snapshot
+        ):
             response = self.client.get("/health/queue")
 
         self.assertEqual(200, response.status_code)
@@ -896,7 +1017,9 @@ class SettingsPanelTests(unittest.TestCase):
             "error": "Timed out while contacting the Celery broker: broker timed out",
         }
 
-        with mock.patch.object(web_app_module, "_get_queue_health_snapshot", return_value=queue_snapshot):
+        with mock.patch.object(
+            web_app_module, "_get_queue_health_snapshot", return_value=queue_snapshot
+        ):
             response = self.client.get("/health/queue")
 
         self.assertEqual(503, response.status_code)
@@ -935,7 +1058,9 @@ class SettingsPanelTests(unittest.TestCase):
         }
 
         class _FakeCursor:
-            def __init__(self, *, one: int = 0, rows: list[dict[str, object]] | None = None) -> None:
+            def __init__(
+                self, *, one: int = 0, rows: list[dict[str, object]] | None = None
+            ) -> None:
                 self._one = one
                 self._rows = rows or []
 
@@ -957,7 +1082,9 @@ class SettingsPanelTests(unittest.TestCase):
 
         with (
             mock.patch.object(web_app_module, "_bot", return_value=fake_bot),
-            mock.patch.object(web_app_module, "_get_queue_health_snapshot", return_value=queue_snapshot),
+            mock.patch.object(
+                web_app_module, "_get_queue_health_snapshot", return_value=queue_snapshot
+            ),
         ):
             response = self.client.get("/metrics", headers=self.admin_headers)
 
@@ -972,8 +1099,16 @@ class SettingsPanelTests(unittest.TestCase):
 
     def test_metrics_include_health_check_counters(self):
         with (
-            mock.patch.object(web_app_module, "_check_database_health", return_value={"status": "ok", "checked": True}),
-            mock.patch.object(web_app_module, "_check_redis_health", return_value={"status": "error", "checked": True}),
+            mock.patch.object(
+                web_app_module,
+                "_check_database_health",
+                return_value={"status": "ok", "checked": True},
+            ),
+            mock.patch.object(
+                web_app_module,
+                "_check_redis_health",
+                return_value={"status": "error", "checked": True},
+            ),
             mock.patch.object(
                 web_app_module,
                 "_check_celery_health",
@@ -982,7 +1117,13 @@ class SettingsPanelTests(unittest.TestCase):
             mock.patch.object(
                 web_app_module,
                 "_check_connector_health",
-                return_value={"status": "ok", "checked": True, "count": 1, "healthy_count": 1, "connectors": []},
+                return_value={
+                    "status": "ok",
+                    "checked": True,
+                    "count": 1,
+                    "healthy_count": 1,
+                    "connectors": [],
+                },
             ),
         ):
             self.client.get("/health")
@@ -1033,7 +1174,10 @@ class SettingsPanelTests(unittest.TestCase):
         staff_client = app.test_client()
         response = staff_client.post(
             f"/translations/reviews/{review_id}/decision",
-            json={"status": "approved", "reviewer_notes": "Ready for launch when Arabic templates ship."},
+            json={
+                "status": "approved",
+                "reviewer_notes": "Ready for launch when Arabic templates ship.",
+            },
             headers=self.staff_headers,
         )
         self.assertEqual(200, response.status_code)
@@ -1159,7 +1303,9 @@ class TaskApiRequirementRouteTests(unittest.TestCase):
             headers=self.staff_headers,
         )
         self.assertEqual(200, listed.status_code)
-        self.assertEqual(["Review budget", "Write summary"], [row["title"] for row in listed.get_json()])
+        self.assertEqual(
+            ["Review budget", "Write summary"], [row["title"] for row in listed.get_json()]
+        )
 
         updated = self.client.put(
             f"/tasks/{task_id}",
@@ -1190,6 +1336,159 @@ class TaskApiRequirementRouteTests(unittest.TestCase):
             headers=self.auditor_headers,
         )
         self.assertEqual(403, response.status_code)
+
+
+class ExportApiRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.db_path = Path(".test_web_exports.db")
+        self.output_dir = Path(".test_web_exports_output")
+        if self.db_path.exists():
+            self.db_path.unlink()
+        if self.output_dir.exists():
+            for path in sorted(self.output_dir.rglob("*"), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            self.output_dir.rmdir()
+        os.environ["BOT_DB_PATH"] = str(self.db_path)
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.admin_headers = _auth_header("admin", "admin-secret")
+        self.auditor_headers = _auth_header("auditor", "auditor-secret")
+        bot = FundingBot(db_path=str(self.db_path))
+        try:
+            bot.upsert_donor(email="donor@example.org", name="Donor Example")
+            bot.create_task(
+                title="Prepare export",
+                assignee="staff",
+                description="Prepare warehouse export",
+                due_date="2026-07-30",
+            )
+            opportunity = bot.discover_opportunities(
+                [
+                    {
+                        "source": "Grants Portal",
+                        "donor_name": "Example Foundation",
+                        "title": "Example Grant",
+                        "portal_url": "https://example.org/grants/1",
+                        "summary": "Supports education programs.",
+                        "category": "education",
+                    }
+                ],
+                keywords=["education"],
+                trusted_sources=["Grants Portal"],
+            )[0]
+            bot.submit_application(
+                opportunity["signature"],
+                submission_reference="ref-1",
+                status="submitted",
+                next_action="Await donor review",
+            )
+        finally:
+            bot.close()
+
+    def tearDown(self):
+        if self.db_path.exists():
+            self.db_path.unlink()
+        if self.output_dir.exists():
+            for path in sorted(self.output_dir.rglob("*"), reverse=True):
+                if path.is_file():
+                    path.unlink()
+                elif path.is_dir():
+                    path.rmdir()
+            self.output_dir.rmdir()
+        os.environ.pop("BOT_DB_PATH", None)
+        os.environ.pop("ENABLE_TASK_QUEUE", None)
+
+    def test_post_exports_route_creates_export_artifacts(self):
+        response = self.client.post(
+            "/api/exports",
+            json={
+                "datasets": ["donors", "tasks", "matches", "results"],
+                "format": "json",
+                "output_dir": str(self.output_dir),
+                "archive": False,
+            },
+            headers=self.admin_headers,
+        )
+        self.assertEqual(201, response.status_code)
+        payload = response.get_json()
+        self.assertEqual(4, payload["count"])
+        self.assertTrue(all(Path(artifact["path"]).exists() for artifact in payload["artifacts"]))
+
+    def test_post_exports_route_can_enqueue_async_job(self):
+        os.environ["ENABLE_TASK_QUEUE"] = "1"
+        with patch(
+            "web.app.dispatch_export",
+            return_value=(
+                202,
+                {
+                    "mode": "queue",
+                    "task_id": "export-123",
+                    "task_name": "funding_bot.export_data_warehouse",
+                    "legacy_cron_enabled": True,
+                },
+            ),
+        ):
+            response = self.client.post(
+                "/api/exports",
+                json={"async": True, "output_dir": str(self.output_dir)},
+                headers=self.admin_headers,
+            )
+        self.assertEqual(202, response.status_code)
+        self.assertEqual("export-123", response.get_json()["task_id"])
+
+    def test_get_exports_route_returns_schedule_and_audits(self):
+        self.client.post(
+            "/api/exports",
+            json={"datasets": ["donors"], "format": "json", "output_dir": str(self.output_dir)},
+            headers=self.admin_headers,
+        )
+        response = self.client.get("/api/exports", headers=self.auditor_headers)
+        self.assertEqual(200, response.status_code)
+        payload = response.get_json()
+        self.assertIn("schedule", payload)
+        self.assertGreaterEqual(payload["count"], 1)
+
+
+class DatabaseIndexMetricsRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.db_path = Path(".test_web_index_metrics.db")
+        if self.db_path.exists():
+            self.db_path.unlink()
+        os.environ["BOT_DB_PATH"] = str(self.db_path)
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.admin_headers = _auth_header("admin", "admin-secret")
+
+    def tearDown(self):
+        if self.db_path.exists():
+            self.db_path.unlink()
+        os.environ.pop("BOT_DB_PATH", None)
+
+    def test_database_health_endpoint_includes_index_snapshot(self):
+        response = self.client.get("/health/database")
+
+        self.assertEqual(200, response.status_code)
+        payload = response.get_json()
+        self.assertIn("indexes", payload)
+        self.assertGreater(payload["indexes"]["summary"]["expected"], 0)
+        self.assertEqual(
+            payload["indexes"]["summary"]["expected"],
+            payload["indexes"]["summary"]["present"],
+        )
+
+    def test_metrics_include_index_monitoring_series(self):
+        response = self.client.get("/metrics", headers=self.admin_headers)
+
+        self.assertEqual(200, response.status_code)
+        body = response.data.decode("utf-8")
+        self.assertIn("funding_bot_db_indexes_expected_total", body)
+        self.assertIn('funding_bot_db_index_present{index_name="idx_tasks_created_at_status"', body)
+        self.assertIn(
+            'funding_bot_db_query_plan_uses_index{query_name="task-assignee-status"} 1', body
+        )
 
 
 if __name__ == "__main__":

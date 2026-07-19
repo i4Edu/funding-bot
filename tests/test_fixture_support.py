@@ -9,7 +9,9 @@ def test_bot_factory_shares_a_single_in_memory_database(bot_factory) -> None:
     assert second.load_organization_profile()["name"] == "Shared Memory Org"
 
 
-def test_seeded_database_populates_expected_records(bot_factory, seeded_database: dict[str, object]) -> None:
+def test_seeded_database_populates_expected_records(
+    bot_factory, seeded_database: dict[str, object]
+) -> None:
     bot = bot_factory()
 
     opportunities = bot.list_opportunities()

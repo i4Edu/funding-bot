@@ -38,6 +38,7 @@ Session-backed browser requests that use that cookie must also include the CSRF 
 - Successful API responses are JSON except `GET /metrics`, which returns Prometheus text.
 - Timestamps use ISO 8601 strings.
 - Authenticated responses include rate-limit headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`). When a limit is exceeded, the API returns `429` plus `Retry-After` and a JSON recovery payload.
+- Every response includes `Content-Security-Policy`, `X-Frame-Options`, and `X-Content-Type-Options`. HTTPS responses also include `Strict-Transport-Security`.
 - Validation, permission, and domain errors use the shared format:
 
 ```json
@@ -60,7 +61,36 @@ Session-backed browser requests that use that cookie must also include the CSRF 
 | `404` | Resource not found |
 | `429` | Rate limit exceeded; retry after the time in `Retry-After` |
 | `500` | Unexpected server error |
-| `503` | Queue health degraded/unavailable (`GET /health/queue`) |
+| `503` | Health/readiness dependency degraded (`GET /health`, `GET /ready`, `GET /health/queue`) |
+
+## Browser security headers
+
+The Flask middleware applies these defaults:
+
+- `Content-Security-Policy`: `default-src 'self'; base-uri 'self'; form-action 'self'; object-src 'none'; frame-ancestors 'none'; frame-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'`
+- `X-Frame-Options`: `DENY` by default (`WEB_X_FRAME_OPTIONS=SAMEORIGIN` is also supported)
+- `X-Content-Type-Options`: `nosniff`
+- `Strict-Transport-Security`: `max-age=63072000; includeSubDomains` on HTTPS responses
+
+Override the CSP string with `WEB_CONTENT_SECURITY_POLICY` only when you need to permit additional trusted assets.
+
+## CORS for `/api/*`
+
+Cross-origin browser access is enabled only for exact origins listed in `WEB_API_CORS_ALLOWED_ORIGINS`.
+
+- default allowlist: `http://localhost:3000`, `http://127.0.0.1:3000`, `https://localhost:3000`, `https://127.0.0.1:3000`
+- allowed methods: `GET, POST, PUT, PATCH, DELETE, OPTIONS`
+- allowed request headers: `Authorization, Content-Type, X-CSRF-Token, X-CSRFToken`
+- exposed response headers: `Retry-After, WWW-Authenticate, X-CSRF-Token, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset`
+- preflight (`OPTIONS`) requests to `/api/*` return `204` for allowed origins and `403` for origins outside the allowlist
+
+Example:
+
+```bash
+curl -i -X OPTIONS http://127.0.0.1:5000/api/tasks/export \
+  -H 'Origin: https://dashboard.example.org' \
+  -H 'Access-Control-Request-Method: GET'
+```
 
 ## Rate limiting
 
@@ -119,7 +149,8 @@ AUDITOR_AUTH = HTTPBasicAuth("auditor", "auditor-secret")
 | DELETE | `/tasks/{task_id}/comments/{comment_id}` | staff, admin | Delete a task comment |
 | POST | `/tasks/{task_id}/comments/read` | staff, admin, auditor | Mark comments as read |
 | POST | `/tasks/{task_id}/status` | staff, admin, auditor | Move a task through the workflow |
-| GET | `/health` | none | Basic service health |
+| GET | `/health` | none | Basic service health / liveness |
+| GET | `/ready` | none | Dependency-aware readiness |
 | GET | `/health/queue` | none | Queue-specific health |
 | GET | `/metrics` | admin, auditor | Prometheus metrics |
 | POST | `/feedback` | staff, admin | Store partner feedback in the audit log |
@@ -1752,29 +1783,29 @@ print(response.json()["notification"])
 
 ### GET `/health`
 
-- **Purpose:** return general service status plus queue snapshot.
+- **Purpose:** return lightweight liveness status for the web process and database.
 - **Auth:** none
+- **Response codes:** `200` when healthy; `503` when the process cannot reach the database
 
 **Example response**
 
 ```json
 {
   "status": "ok",
+  "healthy": true,
+  "checks": {
+    "application": {
+      "status": "ok"
+    },
+    "database": {
+      "status": "ok"
+    }
+  },
   "queue": {
-    "status": "disabled",
     "mode": "cron",
-    "active_modes": ["cron"],
     "queue_enabled": false,
     "legacy_cron_enabled": true,
-    "queue_name": "funding-bot",
-    "broker_reachable": false,
-    "timeout_seconds": 2.0,
-    "active_tasks": 0,
-    "pending_tasks": 0,
-    "queue_depth": 0,
-    "worker_count": 0,
-    "workers": [],
-    "error": "Queue monitoring is disabled because ENABLE_TASK_QUEUE is not enabled."
+    "queue_name": "funding-bot"
   }
 }
 ```
@@ -1790,6 +1821,28 @@ curl http://127.0.0.1:5000/health
 ```python
 response = requests.get(f"{BASE_URL}/health", timeout=30)
 print(response.json()["status"])
+```
+
+### GET `/ready`
+
+- **Purpose:** return readiness status for database, Redis, Celery, and connectors.
+- **Auth:** none
+- **Response codes:** `200` when all required dependencies are healthy or intentionally disabled; `503` otherwise
+
+**Example response**
+
+```json
+{
+  "status": "ok",
+  "ready": true,
+  "failing_checks": [],
+  "checks": {
+    "database": { "status": "ok" },
+    "redis": { "status": "disabled" },
+    "celery": { "status": "disabled" },
+    "connectors": { "status": "ok", "count": 6, "healthy_count": 6 }
+  }
+}
 ```
 
 ### GET `/health/queue`

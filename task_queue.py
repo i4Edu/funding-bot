@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
+from opentelemetry.trace import SpanKind
+
 from funding_bot import (
     CSRNetworkConnector,
     FundingBot,
@@ -16,6 +18,7 @@ from funding_bot import (
     QueueTaskContext,
     SMTPEmailSender,
 )
+from observability import capture_current_context, configure_tracing, start_span
 
 DEFAULT_QUEUE_NAME = "funding-bot"
 DEFAULT_BROKER_URL = "redis://redis:6379/0"
@@ -33,6 +36,8 @@ BROKER_PROCESSED_DIR = BROKER_ROOT / "processed"
 BROKER_CONTROL_DIR = BROKER_ROOT / "control"
 for _directory in (BROKER_QUEUE_DIR, BROKER_PROCESSED_DIR, BROKER_CONTROL_DIR):
     _directory.mkdir(parents=True, exist_ok=True)
+
+configure_tracing()
 
 
 def _coerce_bool(value: Any, *, default: bool = False) -> bool:
@@ -351,23 +356,59 @@ def _current_worker_hostname() -> str | None:
     return getattr(request, "hostname", None)
 
 
+def _run_task_with_trace(
+    span_name: str,
+    *,
+    trace_context: dict[str, str] | None,
+    attributes: dict[str, Any] | None = None,
+    callback: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    with start_span(
+        span_name,
+        kind=SpanKind.CONSUMER,
+        carrier=trace_context,
+        attributes=attributes,
+    ):
+        return callback()
+
+
 @celery_app.task(name="funding_bot.discover", queue=load_queue_config().queue_name)
 def discover_opportunities_task(
     *,
     keywords: list[str] | None = None,
     trusted_sources: list[str] | None = None,
+    dry_run: bool = False,
     db_path: str | None = None,
     idempotency_key: str | None = None,
+    trace_context: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     def _run(bot: FundingBot) -> dict[str, Any]:
         payload = {
             "keywords": keywords or [],
             "trusted_sources": trusted_sources or [],
+            "dry_run": dry_run,
         }
 
         def _task(context: QueueTaskContext, task_payload: dict[str, Any]) -> dict[str, Any]:
             context.update_progress(20, "Loading discovery configuration.")
             context.checkpoint("Shutdown requested before discovery started.")
+
+            def _discovery_progress(detail: dict[str, Any]) -> None:
+                stage = str(detail.get("stage") or "connector-discovery")
+                total = max(int(detail.get("total", 1) or 1), 1)
+                completed = min(max(int(detail.get("completed", 0) or 0), 0), total)
+                if stage == "connector-discovery":
+                    progress = 5 + int((completed / total) * 55)
+                elif stage == "bulk-persist":
+                    progress = 60 + int((completed / total) * 35)
+                else:
+                    progress = 5 + int((completed / total) * 85)
+                context.update_progress(
+                    progress,
+                    str(detail.get("description") or "Running discovery."),
+                    callback_payload=detail,
+                )
+
             found = context.bot.run_discovery(
                 connectors=[
                     GrantsPortalConnector(),
@@ -376,6 +417,8 @@ def discover_opportunities_task(
                 ],
                 keywords=task_payload.get("keywords") or None,
                 trusted_sources=task_payload.get("trusted_sources") or None,
+                dry_run=bool(task_payload.get("dry_run", False)),
+                progress_callback=_discovery_progress,
             )
             context.update_progress(
                 90, "Persisted discovery results.", callback_payload={"count": len(found)}
@@ -384,6 +427,7 @@ def discover_opportunities_task(
             return {
                 "count": len(found),
                 "new_opportunities": found,
+                "dry_run": bool(task_payload.get("dry_run", False)),
             }
 
         task_run = bot.execute_queue_task(
@@ -395,7 +439,12 @@ def discover_opportunities_task(
         )
         return _queue_result_payload(task_run)
 
-    return _with_bot(db_path, _run)
+    return _run_task_with_trace(
+        "task_queue.discover",
+        trace_context=trace_context,
+        attributes={"messaging.destination.name": "funding_bot.discover"},
+        callback=lambda: _with_bot(db_path, _run),
+    )
 
 
 @celery_app.task(name="funding_bot.send_outreach", queue=load_queue_config().queue_name)
@@ -410,6 +459,7 @@ def send_outreach_task(
     dry_run: bool = True,
     db_path: str | None = None,
     idempotency_key: str | None = None,
+    trace_context: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     def _run(bot: FundingBot) -> dict[str, Any]:
         payload = {
@@ -443,6 +493,7 @@ def send_outreach_task(
                     str(task_payload["donor_name"]),
                     sender=sender,
                     locale=str(resolved_locale) if resolved_locale is not None else None,
+                    dry_run=bool(task_payload.get("dry_run", True)),
                 )
             else:
                 fallback = context.bot._resolve_catalog_template(
@@ -460,6 +511,7 @@ def send_outreach_task(
                     body_template=str(task_payload.get("body_template") or fallback[1]),
                     sender=sender,
                     locale=str(resolved_locale) if resolved_locale is not None else None,
+                    dry_run=bool(task_payload.get("dry_run", True)),
                 )
             context.update_progress(90, "Outreach workflow completed.")
             context.checkpoint("Shutdown requested after donor outreach completed.")
@@ -474,7 +526,12 @@ def send_outreach_task(
         )
         return _queue_result_payload(task_run, dry_run=dry_run)
 
-    return _with_bot(db_path, _run)
+    return _run_task_with_trace(
+        "task_queue.send_outreach",
+        trace_context=trace_context,
+        attributes={"messaging.destination.name": "funding_bot.send_outreach"},
+        callback=lambda: _with_bot(db_path, _run),
+    )
 
 
 @celery_app.task(name="funding_bot.send_daily_summary", queue=load_queue_config().queue_name)
@@ -484,6 +541,7 @@ def send_daily_summary_task(
     dry_run: bool = False,
     db_path: str | None = None,
     idempotency_key: str | None = None,
+    trace_context: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     def _run(bot: FundingBot) -> dict[str, Any]:
         payload = {"recipient": recipient, "dry_run": dry_run}
@@ -515,7 +573,12 @@ def send_daily_summary_task(
         )
         return _queue_result_payload(task_run, recipient=recipient, dry_run=dry_run)
 
-    return _with_bot(db_path, _run)
+    return _run_task_with_trace(
+        "task_queue.send_daily_summary",
+        trace_context=trace_context,
+        attributes={"messaging.destination.name": "funding_bot.send_daily_summary"},
+        callback=lambda: _with_bot(db_path, _run),
+    )
 
 
 @celery_app.task(name="funding_bot.export_data_warehouse", queue=load_queue_config().queue_name)
@@ -525,8 +588,10 @@ def export_data_warehouse_task(
     export_format: str = "json",
     output_dir: str | None = None,
     archive: bool = False,
+    dry_run: bool = False,
     db_path: str | None = None,
     idempotency_key: str | None = None,
+    trace_context: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     def _run(bot: FundingBot) -> dict[str, Any]:
         payload = {
@@ -534,6 +599,7 @@ def export_data_warehouse_task(
             "export_format": export_format,
             "output_dir": output_dir or "generated/exports",
             "archive": archive,
+            "dry_run": dry_run,
         }
 
         def _task(context: QueueTaskContext, task_payload: dict[str, Any]) -> dict[str, Any]:
@@ -544,6 +610,7 @@ def export_data_warehouse_task(
                 export_format=str(task_payload.get("export_format") or "json"),
                 output_dir=str(task_payload.get("output_dir") or "generated/exports"),
                 archive=bool(task_payload.get("archive")),
+                dry_run=bool(task_payload.get("dry_run", False)),
             )
             context.update_progress(
                 90,
@@ -560,9 +627,19 @@ def export_data_warehouse_task(
             idempotency_key=idempotency_key,
             worker_id=_current_worker_hostname(),
         )
-        return _queue_result_payload(task_run, export_format=export_format, archive=archive)
+        return _queue_result_payload(
+            task_run,
+            export_format=export_format,
+            archive=archive,
+            dry_run=dry_run,
+        )
 
-    return _with_bot(db_path, _run)
+    return _run_task_with_trace(
+        "task_queue.export_data_warehouse",
+        trace_context=trace_context,
+        attributes={"messaging.destination.name": "funding_bot.export_data_warehouse"},
+        callback=lambda: _with_bot(db_path, _run),
+    )
 
 
 @celery_app.task(name="funding_bot.enforce_data_retention", queue=load_queue_config().queue_name)
@@ -572,6 +649,7 @@ def enforce_data_retention_task(
     archive: bool = True,
     db_path: str | None = None,
     idempotency_key: str | None = None,
+    trace_context: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     def _run(bot: FundingBot) -> dict[str, Any]:
         payload = {"dry_run": dry_run, "archive": archive}
@@ -596,7 +674,12 @@ def enforce_data_retention_task(
         )
         return _queue_result_payload(task_run, dry_run=dry_run, archive=archive)
 
-    return _with_bot(db_path, _run)
+    return _run_task_with_trace(
+        "task_queue.enforce_data_retention",
+        trace_context=trace_context,
+        attributes={"messaging.destination.name": "funding_bot.enforce_data_retention"},
+        callback=lambda: _with_bot(db_path, _run),
+    )
 
 
 TASK_DEFINITIONS = {
@@ -645,12 +728,14 @@ def dispatch_discovery(
         "trusted_sources": trusted_sources or [],
     }
     idempotency_key = _generate_idempotency_key("discover_opportunities", request_payload)
+    trace_context = capture_current_context()
     if config.enable_task_queue:
         result = discover_opportunities_task.delay(
             keywords=keywords,
             trusted_sources=trusted_sources,
             db_path=db_path,
             idempotency_key=idempotency_key,
+            trace_context=trace_context,
         )
         return 202, {
             "mode": config.mode,
@@ -683,6 +768,7 @@ def _run_discovery_inline(
         trusted_sources=trusted_sources,
         db_path=db_path,
         idempotency_key=idempotency_key,
+        trace_context=capture_current_context(),
     )
 
 

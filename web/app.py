@@ -8,6 +8,7 @@ import json
 import os
 import secrets
 import socket
+import sqlite3
 import ssl
 import sys
 import threading
@@ -21,6 +22,7 @@ from urllib.parse import urlparse, urlunparse
 from flask import Flask, Response, g, jsonify, redirect, render_template, request, session, url_for
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from opentelemetry.trace import SpanKind
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -28,9 +30,11 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from funding_bot import (  # noqa: E402
     DEFAULT_LOCALE_CODE,
+    AccountLockedError,
     DuplicateSubmissionError,
     FundingBot,
     FundingBotError,
+    MFARequiredError,
     OpportunityNotFoundError,
     SMTPEmailSender,
     TaskCommentNotFoundError,
@@ -38,6 +42,20 @@ from funding_bot import (  # noqa: E402
     TaskTransitionError,
     _validate_email,
     default_connectors,
+    sanitize_user_mapping,
+    sanitize_user_string,
+    validate_credential_alias,
+    validate_env_var_name,
+)
+from observability import (  # noqa: E402
+    configure_tracing,
+    current_trace_id,
+    extract_context,
+    inject_context,
+    record_slo_event,
+    set_span_error,
+    start_span,
+    tracing_configuration_summary,
 )
 from task_queue import (  # noqa: E402
     dispatch_discovery,
@@ -48,6 +66,7 @@ from task_queue import (  # noqa: E402
 
 app = Flask(__name__, template_folder=str(Path(__file__).resolve().parent / "templates"))
 app.config["JSON_SORT_KEYS"] = False
+configure_tracing()
 MAX_FEEDBACK_MESSAGE_LENGTH = 2000
 DEFAULT_CELERY_HEALTH_TIMEOUT_SECONDS = 2.0
 DEFAULT_HEALTH_CHECK_TIMEOUT_SECONDS = 1.0
@@ -75,6 +94,8 @@ ROLE_PASSWORD_ENV_VARS = {
     "auditor": "AUDITOR_PASSWORD",
 }
 DEFAULT_SESSION_TIMEOUT_MINUTES = 30
+DEFAULT_LOGIN_LOCKOUT_ATTEMPTS = 5
+DEFAULT_LOGIN_LOCKOUT_MINUTES = 15
 SESSION_ROLE_KEY = "authenticated_role"
 SESSION_AUTHENTICATED_AT_KEY = "authenticated_at"
 SESSION_LAST_SEEN_AT_KEY = "last_seen_at"
@@ -114,6 +135,64 @@ def _read_session_timeout_minutes() -> int:
     except ValueError:
         return DEFAULT_SESSION_TIMEOUT_MINUTES
     return max(1, parsed)
+
+
+def _read_positive_int_env(name: str, default: int) -> int:
+    raw_value = os.environ.get(name, str(default))
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return default
+    return max(1, parsed)
+
+
+def _login_lockout_attempts() -> int:
+    return _read_positive_int_env(
+        "WEB_LOGIN_LOCKOUT_ATTEMPTS",
+        DEFAULT_LOGIN_LOCKOUT_ATTEMPTS,
+    )
+
+
+def _login_lockout_minutes() -> int:
+    return _read_positive_int_env(
+        "WEB_LOGIN_LOCKOUT_MINUTES",
+        DEFAULT_LOGIN_LOCKOUT_MINUTES,
+    )
+
+
+class AuthenticationChallengeError(PermissionError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int = 401,
+        headers: dict[str, str] | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.payload = payload or {}
+
+
+def _read_positive_int_env(name: str, *, default: int) -> int:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _csv_env_values(name: str, *, default: tuple[str, ...] = ()) -> tuple[str, ...]:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        values = default
+    else:
+        values = tuple(item.strip() for item in raw_value.split(","))
+    return tuple(value.rstrip("/") for value in values if value.rstrip("/"))
 
 
 def _configure_session_security(flask_app: Flask) -> None:
@@ -159,6 +238,78 @@ def _configure_request_protection(flask_app: Flask) -> None:
 
 
 _configure_request_protection(app)
+
+
+def _default_content_security_policy() -> str:
+    directives = {
+        "default-src": "'self'",
+        "base-uri": "'self'",
+        "form-action": "'self'",
+        "object-src": "'none'",
+        "frame-ancestors": "'none'",
+        "frame-src": "'self'",
+        "script-src": "'self' 'unsafe-inline'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data:",
+        "font-src": "'self' data:",
+        "connect-src": "'self'",
+    }
+    return "; ".join(f"{directive} {value}" for directive, value in directives.items())
+
+
+def _configure_http_security(flask_app: Flask) -> None:
+    x_frame_options = os.environ.get("WEB_X_FRAME_OPTIONS", "DENY").strip().upper()
+    if x_frame_options not in {"DENY", "SAMEORIGIN"}:
+        x_frame_options = "DENY"
+
+    hsts_max_age = _read_positive_int_env("WEB_HSTS_MAX_AGE_SECONDS", default=63072000)
+
+    flask_app.config["SECURITY_CONTENT_SECURITY_POLICY"] = os.environ.get(
+        "WEB_CONTENT_SECURITY_POLICY",
+        _default_content_security_policy(),
+    )
+    flask_app.config["SECURITY_X_FRAME_OPTIONS"] = x_frame_options
+    flask_app.config["SECURITY_X_CONTENT_TYPE_OPTIONS"] = "nosniff"
+    flask_app.config["SECURITY_HSTS_POLICY"] = f"max-age={hsts_max_age}; includeSubDomains"
+    flask_app.config["API_CORS_ALLOWED_ORIGINS"] = _csv_env_values(
+        "WEB_API_CORS_ALLOWED_ORIGINS",
+        default=(
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "https://localhost:3000",
+            "https://127.0.0.1:3000",
+        ),
+    )
+    flask_app.config["API_CORS_ALLOW_METHODS"] = (
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS",
+    )
+    flask_app.config["API_CORS_ALLOW_HEADERS"] = (
+        "Authorization",
+        "Content-Type",
+        "X-CSRF-Token",
+        "X-CSRFToken",
+    )
+    flask_app.config["API_CORS_EXPOSE_HEADERS"] = (
+        "Retry-After",
+        "WWW-Authenticate",
+        "X-CSRF-Token",
+        "X-RateLimit-Limit",
+        "X-RateLimit-Remaining",
+        "X-RateLimit-Reset",
+    )
+    flask_app.config["API_CORS_MAX_AGE_SECONDS"] = _read_positive_int_env(
+        "WEB_API_CORS_MAX_AGE_SECONDS",
+        default=86400,
+    )
+    flask_app.config["API_CORS_ALLOW_CREDENTIALS"] = True
+
+
+_configure_http_security(app)
 
 
 def _csrf_token_value() -> str:
@@ -333,11 +484,21 @@ def _json_error(
     return _build_json_response({"error": message}, status_code, headers=headers)
 
 
-def _auth_challenge(message: str = "Authentication required") -> Response:
+def _auth_challenge(
+    message: str = "Authentication required",
+    *,
+    status_code: int = 401,
+    headers: dict[str, str] | None = None,
+    payload: dict[str, Any] | None = None,
+) -> Response:
+    combined_headers = {"WWW-Authenticate": 'Basic realm="Funding Bot Dashboard"'}
+    if headers:
+        combined_headers.update(headers)
     return _json_error(
         message,
-        401,
-        headers={"WWW-Authenticate": 'Basic realm="Funding Bot Dashboard"'},
+        status_code,
+        headers=combined_headers,
+        payload=payload,
     )
 
 
@@ -435,6 +596,75 @@ def _csrf_error_response(message: str = "CSRF token missing or invalid.") -> Res
     )
 
 
+def _is_api_route(path: str) -> bool:
+    return path.startswith("/api/")
+
+
+def _origin_from_request() -> str | None:
+    origin = request.headers.get("Origin", "").strip()
+    if not origin:
+        return None
+    return origin.rstrip("/")
+
+
+def _is_allowed_cors_origin(origin: str | None) -> bool:
+    if not origin:
+        return False
+    return origin in set(app.config.get("API_CORS_ALLOWED_ORIGINS", ()))
+
+
+def _append_vary_header(response: Response, *values: str) -> None:
+    existing = [
+        item.strip() for item in response.headers.get("Vary", "").split(",") if item.strip()
+    ]
+    seen = set(existing)
+    for value in values:
+        if value not in seen:
+            existing.append(value)
+            seen.add(value)
+    if existing:
+        response.headers["Vary"] = ", ".join(existing)
+
+
+def _apply_cors_headers(response: Response, *, origin: str, preflight: bool = False) -> Response:
+    response.headers["Access-Control-Allow-Origin"] = origin
+    if app.config.get("API_CORS_ALLOW_CREDENTIALS", True):
+        response.headers["Access-Control-Allow-Credentials"] = "true"
+    response.headers["Access-Control-Expose-Headers"] = ", ".join(
+        app.config["API_CORS_EXPOSE_HEADERS"]
+    )
+    _append_vary_header(response, "Origin")
+    if preflight:
+        response.headers["Access-Control-Allow-Methods"] = ", ".join(
+            app.config["API_CORS_ALLOW_METHODS"]
+        )
+        response.headers["Access-Control-Allow-Headers"] = ", ".join(
+            app.config["API_CORS_ALLOW_HEADERS"]
+        )
+        response.headers["Access-Control-Max-Age"] = str(app.config["API_CORS_MAX_AGE_SECONDS"])
+        _append_vary_header(
+            response,
+            "Access-Control-Request-Method",
+            "Access-Control-Request-Headers",
+        )
+    return response
+
+
+def _request_is_secure() -> bool:
+    if request.is_secure:
+        return True
+    forwarded_proto = request.headers.get("X-Forwarded-Proto", "")
+    return forwarded_proto.split(",", 1)[0].strip().lower() == "https"
+
+
+def _build_cors_preflight_response() -> Response:
+    origin = _origin_from_request()
+    if not _is_allowed_cors_origin(origin):
+        return _json_error("Origin not allowed for this API.", 403)
+    response = app.response_class(status=204)
+    return _apply_cors_headers(response, origin=origin, preflight=True)
+
+
 @app.context_processor
 def inject_csrf_token() -> dict[str, Callable[[], str]]:
     return {"csrf_token": _csrf_token_value}
@@ -442,6 +672,8 @@ def inject_csrf_token() -> dict[str, Callable[[], str]]:
 
 @app.before_request
 def validate_csrf_token() -> Response | None:
+    if request.method == "OPTIONS" and _is_api_route(request.path):
+        return _build_cors_preflight_response()
     if request.method not in CSRF_UNSAFE_METHODS:
         return None
     if _has_explicit_basic_auth():
@@ -463,6 +695,30 @@ def validate_csrf_token() -> Response | None:
 
 @app.after_request
 def attach_security_headers(response: Response) -> Response:
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        app.config["SECURITY_CONTENT_SECURITY_POLICY"],
+    )
+    response.headers.setdefault("X-Frame-Options", app.config["SECURITY_X_FRAME_OPTIONS"])
+    response.headers.setdefault(
+        "X-Content-Type-Options",
+        app.config["SECURITY_X_CONTENT_TYPE_OPTIONS"],
+    )
+    if _request_is_secure():
+        response.headers.setdefault(
+            "Strict-Transport-Security",
+            app.config["SECURITY_HSTS_POLICY"],
+        )
+    if _is_api_route(request.path):
+        origin = _origin_from_request()
+        if _is_allowed_cors_origin(origin):
+            response = _apply_cors_headers(
+                response,
+                origin=origin,
+                preflight=request.method == "OPTIONS",
+            )
+        elif origin:
+            _append_vary_header(response, "Origin")
     if session.get(SESSION_ROLE_KEY):
         response.headers.setdefault("X-CSRF-Token", _csrf_token_value())
     return response
@@ -681,18 +937,12 @@ def _task_status_counts(tasks: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def _task_assignee_options() -> list[str]:
-    rows = (
-        _bot()
-        .connection.execute(
-            """
-        SELECT DISTINCT COALESCE(assignee, assigned_to) AS assignee
+    rows = _bot().connection.execute("""
+        SELECT DISTINCT assigned_to AS assignee
         FROM tasks
-        WHERE COALESCE(assignee, assigned_to) != ''
-        ORDER BY COALESCE(assignee, assigned_to) COLLATE NOCASE ASC
-        """
-        )
-        .fetchall()
-    )
+        WHERE assigned_to != ''
+        ORDER BY assigned_to COLLATE NOCASE ASC
+        """).fetchall()
     return [str(row["assignee"]) for row in rows]
 
 
@@ -759,11 +1009,7 @@ def _dashboard_context() -> dict[str, Any]:
         .connection.execute("SELECT * FROM opportunities ORDER BY discovered_at DESC LIMIT 10")
         .fetchall()
     ]
-    recent_applications = [
-        _serialize_application(row)
-        for row in _bot()
-        .connection.execute(
-            """
+    recent_applications = [_serialize_application(row) for row in _bot().connection.execute("""
             SELECT
                 applications.opportunity_signature,
                 opportunities.title,
@@ -777,10 +1023,7 @@ def _dashboard_context() -> dict[str, Any]:
                 ON opportunities.signature = applications.opportunity_signature
             ORDER BY applications.submitted_at DESC
             LIMIT 10
-            """
-        )
-        .fetchall()
-    ]
+            """).fetchall()]
     my_task_counts = _bot().get_task_status_counts(assigned_to=task_scope) if current_role else {}
     overdue_tasks = [
         _serialize_task(task)
@@ -973,12 +1216,11 @@ def _redis_ping(url: str, *, timeout: float) -> dict[str, Any]:
 
 
 def _check_database_health(bot: FundingBot) -> dict[str, Any]:
-    metrics = _mapping_or_default(
-        getattr(bot, "get_database_pool_metrics", lambda: {})(),
-        {},
-    )
+    metrics = _mapping_or_default(getattr(bot, "get_database_pool_metrics", lambda: {})(), {})
     try:
         row = bot.connection.execute("SELECT 1").fetchone()
+        reachable = bool(row and int(row[0]) == 1)
+        status = "ok" if reachable else "error"
     except Exception as exc:
         return {
             "status": "error",
@@ -988,19 +1230,56 @@ def _check_database_health(bot: FundingBot) -> dict[str, Any]:
             "metrics": metrics,
         }
     return {
-        "status": "ok" if row and int(row[0]) == 1 else "error",
+        "status": status,
         "checked": True,
-        "reachable": bool(row and int(row[0]) == 1),
+        "reachable": reachable,
         "metrics": metrics,
     }
 
 
-def _check_redis_health(bot: FundingBot, queue_config: Any) -> dict[str, Any]:
+def _check_database_health_from_path(
+    db_path: str, *, initialization_error: str | None = None
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "checked": True,
+        "db_path": db_path,
+        "reachable": False,
+        "metrics": {"db_path": db_path, "status": "unavailable"},
+    }
+    try:
+        connection = sqlite3.connect(db_path)
+        try:
+            row = connection.execute("SELECT 1").fetchone()
+        finally:
+            connection.close()
+    except Exception as exc:
+        payload["status"] = "error"
+        payload["error"] = initialization_error or str(exc)
+        return payload
+    reachable = bool(row and int(row[0]) == 1)
+    payload["reachable"] = reachable
+    payload["status"] = "ok" if reachable else "error"
+    if initialization_error:
+        payload["status"] = "degraded"
+        payload["initialization_error"] = initialization_error
+    return payload
+
+
+def _try_create_bot_for_health() -> tuple[FundingBot | None, str | None]:
+    try:
+        return FundingBot(db_path=os.environ.get("BOT_DB_PATH", "funding_bot.db")), None
+    except Exception as exc:
+        return None, str(exc)
+
+
+def _check_redis_health(queue_config: Any) -> dict[str, Any]:
     timeout_seconds = _health_check_timeout_seconds()
-    cache_health = _mapping_or_default(bot.get_cache_metrics().get("health"), {})
+    cache_backend = (
+        os.environ.get("FUNDING_BOT_CACHE_BACKEND", "memory").strip().lower() or "memory"
+    )
     targets: list[dict[str, Any]] = []
     cache_url = os.environ.get("FUNDING_BOT_CACHE_URL", "")
-    if cache_health.get("enabled") and cache_health.get("backend") == "redis" and cache_url:
+    if cache_backend == "redis" and cache_url:
         targets.append({"role": "cache", **_redis_ping(cache_url, timeout=timeout_seconds)})
     for role, url in (
         ("broker", getattr(queue_config, "broker_url", "")),
@@ -1013,14 +1292,14 @@ def _check_redis_health(bot: FundingBot, queue_config: Any) -> dict[str, Any]:
             "status": "disabled",
             "checked": False,
             "targets": [],
-            "cache_backend": cache_health.get("backend", "memory"),
+            "cache_backend": cache_backend,
             "message": "Redis is not configured for the current cache or queue settings.",
         }
     return {
         "status": "error" if any(target["status"] != "ok" for target in targets) else "ok",
         "checked": True,
         "targets": targets,
-        "cache_backend": cache_health.get("backend", "memory"),
+        "cache_backend": cache_backend,
     }
 
 
@@ -1042,7 +1321,18 @@ def _active_connectors(bot: FundingBot) -> list[Any]:
     return default_connectors(cache_manager=bot.cache_manager)
 
 
-def _check_connector_health(bot: FundingBot) -> dict[str, Any]:
+def _check_connector_health(
+    bot: FundingBot | None, *, initialization_error: str | None = None
+) -> dict[str, Any]:
+    if bot is None:
+        return {
+            "status": "error",
+            "checked": True,
+            "count": 0,
+            "healthy_count": 0,
+            "connectors": [],
+            "error": initialization_error or "Unable to initialize FundingBot.",
+        }
     try:
         active_connectors = _active_connectors(bot)
     except Exception as exc:
@@ -1122,7 +1412,8 @@ def _status_code_for_health(payload_status: str) -> int:
 
 
 def _build_health_payload(endpoint: str) -> dict[str, Any]:
-    bot = _bot()
+    db_path = os.environ.get("BOT_DB_PATH", "funding_bot.db")
+    bot, bot_initialization_error = _try_create_bot_for_health()
     queue_config = load_queue_config()
     checked_at = datetime.now(timezone.utc).isoformat()
     queue_mode = {
@@ -1134,18 +1425,39 @@ def _build_health_payload(endpoint: str) -> dict[str, Any]:
     if endpoint == "health":
         checks = {
             "application": {
-                "status": "ok",
+                "status": "ok" if bot_initialization_error is None else "error",
                 "checked": True,
                 "uptime_seconds": round(time.time() - _APP_START_TIME, 3),
+                **(
+                    {"error": bot_initialization_error}
+                    if bot_initialization_error is not None
+                    else {}
+                ),
             },
-            "database": _check_database_health(bot),
+            "database": (
+                _check_database_health(bot)
+                if bot is not None
+                else _check_database_health_from_path(
+                    db_path,
+                    initialization_error=bot_initialization_error,
+                )
+            ),
         }
     else:
         checks = {
-            "database": _check_database_health(bot),
-            "redis": _check_redis_health(bot, queue_config),
+            "database": (
+                _check_database_health(bot)
+                if bot is not None
+                else _check_database_health_from_path(
+                    db_path,
+                    initialization_error=bot_initialization_error,
+                )
+            ),
+            "redis": _check_redis_health(queue_config),
             "celery": _check_celery_health(),
-            "connectors": _check_connector_health(bot),
+            "connectors": _check_connector_health(
+                bot, initialization_error=bot_initialization_error
+            ),
         }
     overall_status = (
         "ok"
@@ -1180,6 +1492,8 @@ def _build_health_payload(endpoint: str) -> dict[str, Any]:
         payload["redis"] = checks["redis"]
         payload["celery"] = checks["celery"]
         payload["connectors"] = checks["connectors"]
+    if bot is not None:
+        bot.close()
     return payload
 
 
@@ -1318,6 +1632,25 @@ def _get_queue_health_snapshot() -> dict[str, Any]:
             "workers": fallback_status["workers"],
             "error": f"Unable to query Celery queue health: {exc}",
         }
+
+
+def _flower_dashboard_url() -> str:
+    configured = os.environ.get("FLOWER_DASHBOARD_URL", "").strip()
+    if configured:
+        return configured
+    return "http://127.0.0.1:5555"
+
+
+def _queue_monitoring_payload() -> dict[str, Any]:
+    bot = _bot()
+    return {
+        "queue": _get_queue_health_snapshot(),
+        "task_metrics": bot.get_queue_metrics(),
+        "flower": {
+            "url": _flower_dashboard_url(),
+            "enabled": bool(_flower_dashboard_url()),
+        },
+    }
 
 
 @app.errorhandler(400)
@@ -1568,19 +1901,12 @@ def get_analytics() -> Response:
 @api_rate_limit
 @require_role("admin", "auditor")
 def audit_log() -> Response:
-    logs = [
-        _serialize_audit_log(row)
-        for row in _bot()
-        .connection.execute(
-            """
+    logs = [_serialize_audit_log(row) for row in _bot().connection.execute("""
         SELECT id, happened_at, action, details_json
         FROM audit_logs
         ORDER BY happened_at DESC, id DESC
         LIMIT 100
-        """
-        )
-        .fetchall()
-    ]
+        """).fetchall()]
     return jsonify(logs)
 
 
@@ -1599,6 +1925,7 @@ def settings_page() -> str:
         "privacy_policy_versions": bot.list_privacy_policy_versions(limit=10),
         "smtp_configured": smtp_configured,
         "smtp_host": os.environ.get("SMTP_HOST", ""),
+        "queue_monitoring": _queue_monitoring_payload(),
         "ui_locale": _resolve_ui_locale(),
         "supported_locales": bot.list_locale_definitions(),
     }
@@ -2166,11 +2493,19 @@ def queue_health() -> Response:
     return jsonify(snapshot), status_code
 
 
+@app.get("/monitoring/queue")
+@api_rate_limit
+@require_role("staff", "admin", "auditor")
+def queue_monitoring() -> Response:
+    return jsonify(_queue_monitoring_payload())
+
+
 @app.get("/health/database")
 def database_health() -> Response:
     bot = _bot()
     payload = bot.get_database_pool_metrics()
     payload["queries"] = bot.get_database_query_metrics()
+    payload["indexes"] = bot.get_database_index_metrics()
     return jsonify(payload)
 
 
@@ -2230,6 +2565,15 @@ def metrics() -> Response:
         getattr(bot, "get_cache_metrics", lambda: {})(),
         {"namespaces": {}},
     )
+    index_metrics = _mapping_or_default(
+        getattr(bot, "get_database_index_metrics", lambda: {})(),
+        {
+            "summary": {"expected": 0, "present": 0},
+            "indexes": [],
+            "query_plans": [],
+            "connector_responses": [],
+        },
+    )
     queue_metrics = {
         "running": 0,
         "completed": 0,
@@ -2238,21 +2582,24 @@ def metrics() -> Response:
         "retries_scheduled": 0,
         "dead_lettered": 0,
         "duplicate_preventions": 0,
+        "duration_seconds_sum": 0.0,
+        "duration_seconds_count": 0,
+        "duration_seconds_average": 0.0,
+        "duration_seconds_max": 0.0,
     }
     if isinstance(raw_queue_metrics, dict):
         for key in queue_metrics:
-            queue_metrics[key] = int(raw_queue_metrics.get(key, 0) or 0)
+            caster: Callable[[Any], Any] = float if "seconds" in key else int
+            queue_metrics[key] = caster(raw_queue_metrics.get(key, 0) or 0)
     queue_health = _get_queue_health_snapshot()
     queue_status_value = 1 if queue_health["status"] == "ok" else 0
     health_metrics = _health_check_metrics_snapshot()
-    task_assignments = conn.execute(
-        """
-        SELECT COALESCE(assignee, assigned_to) AS assignee, COUNT(*) AS total
+    task_assignments = conn.execute("""
+        SELECT assigned_to AS assignee, COUNT(*) AS total
         FROM tasks
-        GROUP BY COALESCE(assignee, assigned_to)
-        ORDER BY COALESCE(assignee, assigned_to) ASC
-        """
-    ).fetchall()
+        GROUP BY assigned_to
+        ORDER BY assigned_to ASC
+        """).fetchall()
 
     lines = [
         "# HELP funding_bot_opportunities_total Total funding opportunities discovered",
@@ -2308,6 +2655,12 @@ def metrics() -> Response:
         "# HELP funding_bot_db_pool_invalidations_total SQLAlchemy pool invalidation events",
         "# TYPE funding_bot_db_pool_invalidations_total counter",
         f"funding_bot_db_pool_invalidations_total {database_metrics['invalidations']}",
+        "# HELP funding_bot_db_indexes_expected_total Database indexes expected by the application",
+        "# TYPE funding_bot_db_indexes_expected_total gauge",
+        f"funding_bot_db_indexes_expected_total {int(index_metrics['summary'].get('expected', 0) or 0)}",
+        "# HELP funding_bot_db_indexes_present_total Database indexes currently present",
+        "# TYPE funding_bot_db_indexes_present_total gauge",
+        f"funding_bot_db_indexes_present_total {int(index_metrics['summary'].get('present', 0) or 0)}",
         *_render_query_metrics_prometheus(query_metrics),
         "# HELP funding_bot_queue_health_status Queue health status (1=ok, 0=disabled/degraded)",
         "# TYPE funding_bot_queue_health_status gauge",
@@ -2372,6 +2725,18 @@ def metrics() -> Response:
         "# HELP funding_bot_queue_duplicate_preventions_total Duplicate queue executions prevented by idempotency keys",
         "# TYPE funding_bot_queue_duplicate_preventions_total counter",
         f"funding_bot_queue_duplicate_preventions_total {queue_metrics['duplicate_preventions']}",
+        "# HELP funding_bot_queue_task_duration_seconds_sum Total completed queue task runtime in seconds",
+        "# TYPE funding_bot_queue_task_duration_seconds_sum counter",
+        f"funding_bot_queue_task_duration_seconds_sum {queue_metrics['duration_seconds_sum']:.6f}",
+        "# HELP funding_bot_queue_task_duration_seconds_count Completed queue tasks included in runtime metrics",
+        "# TYPE funding_bot_queue_task_duration_seconds_count counter",
+        f"funding_bot_queue_task_duration_seconds_count {int(queue_metrics['duration_seconds_count'])}",
+        "# HELP funding_bot_queue_task_duration_seconds_average Average completed queue task runtime in seconds",
+        "# TYPE funding_bot_queue_task_duration_seconds_average gauge",
+        f"funding_bot_queue_task_duration_seconds_average {queue_metrics['duration_seconds_average']:.6f}",
+        "# HELP funding_bot_queue_task_duration_seconds_max Longest completed queue task runtime in seconds",
+        "# TYPE funding_bot_queue_task_duration_seconds_max gauge",
+        f"funding_bot_queue_task_duration_seconds_max {queue_metrics['duration_seconds_max']:.6f}",
     ]
     lines.extend(
         [
@@ -2381,6 +2746,47 @@ def metrics() -> Response:
     )
     for status, total in task_counts.items():
         lines.append(f'funding_bot_tasks_status_total{{status="{status}"}} {total}')
+    lines.extend(
+        [
+            "# HELP funding_bot_db_index_present Whether an expected database index is present (1=yes, 0=no)",
+            "# TYPE funding_bot_db_index_present gauge",
+        ]
+    )
+    for index_row in index_metrics.get("indexes", []):
+        lines.append(
+            'funding_bot_db_index_present{index_name="'
+            + _prometheus_label_value(str(index_row.get("name", "")))
+            + '",table="'
+            + _prometheus_label_value(str(index_row.get("table", "")))
+            + '"} '
+            + str(1 if index_row.get("present") else 0)
+        )
+    lines.extend(
+        [
+            "# HELP funding_bot_db_query_plan_uses_index Whether the representative query plan uses an index (1=yes, 0=no)",
+            "# TYPE funding_bot_db_query_plan_uses_index gauge",
+        ]
+    )
+    for plan in index_metrics.get("query_plans", []):
+        lines.append(
+            'funding_bot_db_query_plan_uses_index{query_name="'
+            + _prometheus_label_value(str(plan.get("name", "")))
+            + '"} '
+            + str(1 if plan.get("uses_index") else 0)
+        )
+    lines.extend(
+        [
+            "# HELP funding_bot_connector_response_cache_total Connector cache entries grouped by source_status",
+            "# TYPE funding_bot_connector_response_cache_total gauge",
+        ]
+    )
+    for connector_response in index_metrics.get("connector_responses", []):
+        lines.append(
+            'funding_bot_connector_response_cache_total{source_status="'
+            + _prometheus_label_value(str(connector_response.get("source_status", "")))
+            + '"} '
+            + str(int(connector_response.get("total", 0) or 0))
+        )
     lines.extend(
         [
             "# HELP funding_bot_tasks_assigned_total Tasks assigned per dashboard role",

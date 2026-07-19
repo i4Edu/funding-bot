@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import signal
+import sqlite3
 import types
 import unittest
 import unittest.mock
@@ -26,6 +27,7 @@ from funding_bot import (
     Task,
     TaskTransitionError,
 )
+from warehouse_exports import ArchiveManager
 
 TEST_ARTIFACTS_DIR = Path(".test-artifacts")
 
@@ -338,9 +340,7 @@ class FundingBotTests(unittest.TestCase):
         self.assertGreaterEqual(report["data_retention"]["communications_past_retention_count"], 1)
         self.assertIn("consent_summary", report)
         self.assertIn("checks", report)
-        self.assertTrue(
-            any(check["name"] == "opt_out_records" for check in report["checks"])
-        )
+        self.assertTrue(any(check["name"] == "opt_out_records" for check in report["checks"]))
 
     def test_update_application_status_requires_existing_application(self):
         signature = self._discover_sample_opportunity()
@@ -604,30 +604,37 @@ class FundingBotTests(unittest.TestCase):
                 (
                     task["assigned_to"] == filter_values["assigned_to"]
                     if name == "assigned_to"
-                    else task["status"] == filter_values["status"]
-                    if name == "status"
-                    else due_date is not None and due_date >= filter_values["due_date_after"]
-                    if name == "due_date_after"
-                    else due_date is not None and due_date <= filter_values["due_date_before"]
+                    else (
+                        task["status"] == filter_values["status"]
+                        if name == "status"
+                        else (
+                            due_date is not None and due_date >= filter_values["due_date_after"]
+                            if name == "due_date_after"
+                            else due_date is not None
+                            and due_date <= filter_values["due_date_before"]
+                        )
+                    )
                 )
                 for name in active_filters
             )
 
         for size in range(1, len(filter_values) + 1):
             for active_filters in itertools.combinations(filter_values, size):
-                expected_titles = [
-                    task["title"]
-                    for task in tasks
-                    if matches(task, active_filters)
-                ]
+                expected_titles = [task["title"] for task in tasks if matches(task, active_filters)]
                 rows = self.bot.list_tasks(
-                    assigned_to=filter_values["assigned_to"] if "assigned_to" in active_filters else None,
+                    assigned_to=(
+                        filter_values["assigned_to"] if "assigned_to" in active_filters else None
+                    ),
                     status=filter_values["status"] if "status" in active_filters else None,
                     due_date_after=(
-                        filter_values["due_date_after"] if "due_date_after" in active_filters else None
+                        filter_values["due_date_after"]
+                        if "due_date_after" in active_filters
+                        else None
                     ),
                     due_date_before=(
-                        filter_values["due_date_before"] if "due_date_before" in active_filters else None
+                        filter_values["due_date_before"]
+                        if "due_date_before" in active_filters
+                        else None
                     ),
                     sort="due_date",
                 )
@@ -840,11 +847,16 @@ class TaskFilteringFundingBotTests(unittest.TestCase):
                 (
                     task["assigned_to"] == filter_values["assigned_to"]
                     if name == "assigned_to"
-                    else task["status"] == filter_values["status"]
-                    if name == "status"
-                    else due_date is not None and due_date >= filter_values["due_date_after"]
-                    if name == "due_date_after"
-                    else due_date is not None and due_date <= filter_values["due_date_before"]
+                    else (
+                        task["status"] == filter_values["status"]
+                        if name == "status"
+                        else (
+                            due_date is not None and due_date >= filter_values["due_date_after"]
+                            if name == "due_date_after"
+                            else due_date is not None
+                            and due_date <= filter_values["due_date_before"]
+                        )
+                    )
                 )
                 for name in active_filters
             )
@@ -859,13 +871,19 @@ class TaskFilteringFundingBotTests(unittest.TestCase):
                     )
                 ]
                 rows = self.bot.list_tasks(
-                    assigned_to=filter_values["assigned_to"] if "assigned_to" in active_filters else None,
+                    assigned_to=(
+                        filter_values["assigned_to"] if "assigned_to" in active_filters else None
+                    ),
                     status=filter_values["status"] if "status" in active_filters else None,
                     due_date_after=(
-                        filter_values["due_date_after"] if "due_date_after" in active_filters else None
+                        filter_values["due_date_after"]
+                        if "due_date_after" in active_filters
+                        else None
                     ),
                     due_date_before=(
-                        filter_values["due_date_before"] if "due_date_before" in active_filters else None
+                        filter_values["due_date_before"]
+                        if "due_date_before" in active_filters
+                        else None
                     ),
                     sort="due_date",
                 )
@@ -928,9 +946,17 @@ class SMTPEmailSenderTests(unittest.TestCase):
     def test_from_env_defaults(self):
         # Remove relevant vars so we test defaults
         clean_env = {
-            k: v for k, v in os.environ.items()
-            if k not in ("SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD",
-                         "SMTP_USE_TLS", "SMTP_FROM")
+            k: v
+            for k, v in os.environ.items()
+            if k
+            not in (
+                "SMTP_HOST",
+                "SMTP_PORT",
+                "SMTP_USERNAME",
+                "SMTP_PASSWORD",
+                "SMTP_USE_TLS",
+                "SMTP_FROM",
+            )
         }
         with unittest.mock.patch.dict(os.environ, clean_env, clear=True):
             sender = SMTPEmailSender.from_env()
@@ -1399,10 +1425,7 @@ class PortalConnectorTests(unittest.TestCase):
         result = degraded.fetch_result(["education"])
 
         self.assertEqual("degraded", result["metadata"]["source_status"])
-        metrics = {
-            row["connector_name"]: row
-            for row in FundingBot.connector_metrics_snapshot()
-        }
+        metrics = {row["connector_name"]: row for row in FundingBot.connector_metrics_snapshot()}
         grants_metrics = metrics["Grants Portal"]
         self.assertEqual(2, grants_metrics["requests_total"])
         self.assertEqual(1, grants_metrics["errors_total"])
@@ -1454,7 +1477,10 @@ class PortalConnectorTests(unittest.TestCase):
 
         self.assertEqual(1, len(calls))
         self.assertEqual("client_credentials", calls[0]["form_data"]["grant_type"])
-        self.assertEqual("Basic Y29ubmVjdG9yLWNsaWVudDpjb25uZWN0b3Itc2VjcmV0", calls[0]["headers"]["Authorization"])
+        self.assertEqual(
+            "Basic Y29ubmVjdG9yLWNsaWVudDpjb25uZWN0b3Itc2VjcmV0",
+            calls[0]["headers"]["Authorization"],
+        )
         self.assertEqual("token-123", seen_credentials[0]["access_token"])
         self.assertEqual("Bearer " + "token-123", seen_credentials[0]["authorization_header"])
         self.assertEqual("ngo-team", seen_credentials[0]["tenant"])
@@ -1578,10 +1604,13 @@ class PortalConnectorTests(unittest.TestCase):
             connector.fetch_opportunities(["education"])
 
         self.assertEqual(2, len(calls))
-        self.assertEqual({"hits": 1, "misses": 2}, {
-            "hits": connector.cache_metrics()["hits"],
-            "misses": connector.cache_metrics()["misses"],
-        })
+        self.assertEqual(
+            {"hits": 1, "misses": 2},
+            {
+                "hits": connector.cache_metrics()["hits"],
+                "misses": connector.cache_metrics()["misses"],
+            },
+        )
 
     def test_connector_uses_per_connector_page_size_environment_override(self):
         calls = []
@@ -1604,7 +1633,9 @@ class PortalConnectorTests(unittest.TestCase):
         )
         self.assertEqual(
             "CSR Digital Learning Fund",
-            CSRNetworkConnector().fetch_opportunities(["corporate social responsibility"])[0]["title"],
+            CSRNetworkConnector().fetch_opportunities(["corporate social responsibility"])[0][
+                "title"
+            ],
         )
         self.assertEqual(
             "Community Literacy Matching Grant",
@@ -1683,7 +1714,9 @@ class PortalConnectorTests(unittest.TestCase):
         result = connector.fetch_result(["education"])
 
         self.assertEqual(1, len(result["opportunities"]))
-        self.assertEqual("U.S. National Science Foundation", result["opportunities"][0]["donor_name"])
+        self.assertEqual(
+            "U.S. National Science Foundation", result["opportunities"][0]["donor_name"]
+        )
         self.assertIn("search-results-detail/334326", result["opportunities"][0]["portal_url"])
         self.assertTrue(result["metadata"]["auth_applied"])
         self.assertEqual(1, len(token_calls))
@@ -2072,14 +2105,15 @@ class ConnectorFallbackAndVersioningTests(unittest.TestCase):
             self.assertEqual(connector.result_schema_version, cache_row["schema_version"])
             self.assertEqual("default", cache_row["source_status"])
             self.assertEqual("default", metadata["fallback_mode"])
-            self.assertTrue(
-                any("fallback activated" in message.lower() for message in logs.output)
-            )
+            self.assertTrue(any("fallback activated" in message.lower() for message in logs.output))
         finally:
             bot.close()
 
     def test_run_discovery_migrates_cached_results_before_fallback(self):
-        connector = CSRNetworkConnector(http_client=lambda url, payload: (_ for _ in ()).throw(ConnectionError("unreachable")), max_retries=0)
+        connector = CSRNetworkConnector(
+            http_client=lambda url, payload: (_ for _ in ()).throw(ConnectionError("unreachable")),
+            max_retries=0,
+        )
         seeded_bot = FundingBot(db_path=self.db_path, trusted_sources={"CSR Network"})
         try:
             seeded_bot.connection.execute(
@@ -2267,7 +2301,9 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
         self.assertIn("CSR support", corporate_result["body"])
         self.assertEqual("Support i4Edu", fallback_result["subject"])
         self.assertIn("Expand access to equitable education.", fallback_result["body"])
-        self.assertEqual(["corp@example.org", "unknown@example.org"], [call["to"] for call in calls])
+        self.assertEqual(
+            ["corp@example.org", "unknown@example.org"], [call["to"] for call in calls]
+        )
 
     def test_send_outreach_from_template_selects_supported_locale_catalogs(self):
         self.bot.upsert_donor(
@@ -2347,7 +2383,9 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
         }
         localized_catalog["intro"]["bn"]["segments"] = {}
 
-        with unittest.mock.patch("funding_bot._load_localized_outreach_templates", return_value=localized_catalog):
+        with unittest.mock.patch(
+            "funding_bot._load_localized_outreach_templates", return_value=localized_catalog
+        ):
             with self.assertRaises(FundingBotError):
                 FundingBot.validate_outreach_template_catalogs()
 
@@ -2381,13 +2419,11 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
                 "tax_id": "SECRET-TAX-ID",
             }
         )
-        stored = self.bot.connection.execute(
-            """
+        stored = self.bot.connection.execute("""
             SELECT value_json, data_classification, field_classifications_json
             FROM organization_profile
             WHERE key = 'profile'
-            """
-        ).fetchone()
+            """).fetchone()
         self.assertNotIn("SECRET-TAX-ID", stored["value_json"])
         self.assertEqual("secret", stored["data_classification"])
         self.assertEqual(
@@ -2418,16 +2454,14 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
             },
             field_classifications={"mission": "internal"},
         )
-        latest_change = self.bot.connection.execute(
-            """
+        latest_change = self.bot.connection.execute("""
             SELECT details_json
             FROM audit_logs
             WHERE action = 'data_classification_changed'
               AND details_json LIKE '%organization_profile%'
             ORDER BY id DESC
             LIMIT 1
-            """
-        ).fetchone()
+            """).fetchone()
         self.assertEqual(
             "internal",
             json.loads(latest_change["details_json"])["field_classifications"]["mission"],
@@ -2833,7 +2867,9 @@ class CliExtensionTests(unittest.TestCase):
 
     def test_list_opportunities_command_prints_rows(self):
         with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
-            main(["--db", str(self.db_path), "list-opportunities", "--status", "new", "--limit", "1"])
+            main(
+                ["--db", str(self.db_path), "list-opportunities", "--status", "new", "--limit", "1"]
+            )
 
         output = stdout.getvalue()
         self.assertIn("signature\tsource\tdonor_name\ttitle\tstatus\tdiscovered_at", output)
@@ -2862,7 +2898,17 @@ class CliExtensionTests(unittest.TestCase):
 
     def test_audit_log_command_prints_filtered_rows(self):
         with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
-            main(["--db", str(self.db_path), "audit-log", "--action", "donor_upserted", "--limit", "5"])
+            main(
+                [
+                    "--db",
+                    str(self.db_path),
+                    "audit-log",
+                    "--action",
+                    "donor_upserted",
+                    "--limit",
+                    "5",
+                ]
+            )
 
         output = stdout.getvalue()
         self.assertIn("happened_at\taction\tdetails_json", output)
@@ -2879,7 +2925,17 @@ class CliExtensionTests(unittest.TestCase):
 
     def test_monthly_audit_report_command_prints_json_to_stdout(self):
         with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
-            main(["--db", str(self.db_path), "monthly-audit-report", "--year", "2026", "--month", "6"])
+            main(
+                [
+                    "--db",
+                    str(self.db_path),
+                    "monthly-audit-report",
+                    "--year",
+                    "2026",
+                    "--month",
+                    "6",
+                ]
+            )
 
         report = json.loads(stdout.getvalue())
         self.assertEqual("monthly_compliance_audit", report["report_type"])
@@ -3150,7 +3206,9 @@ class DataRetentionPolicyTests(unittest.TestCase):
         )
         self.assertEqual(
             1,
-            self.bot.connection.execute("SELECT COUNT(*) FROM tasks WHERE status = 'done'").fetchone()[0],
+            self.bot.connection.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'done'"
+            ).fetchone()[0],
         )
 
 
@@ -3167,15 +3225,17 @@ class CliDataRetentionCommandsTests(unittest.TestCase):
 
     def test_retention_cli_commands_store_policy_and_report_dry_run(self):
         with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
-            main([
-                "--db",
-                str(self.db_path),
-                "set-data-retention-policy",
-                "--audit-logs-days",
-                "45",
-                "--communications-days",
-                "60",
-            ])
+            main(
+                [
+                    "--db",
+                    str(self.db_path),
+                    "set-data-retention-policy",
+                    "--audit-logs-days",
+                    "45",
+                    "--communications-days",
+                    "60",
+                ]
+            )
         policy = json.loads(stdout.getvalue())
         self.assertEqual(45, policy["audit_logs_days"])
         self.assertEqual(60, policy["communications_days"])
@@ -3189,14 +3249,16 @@ class CliDataRetentionCommandsTests(unittest.TestCase):
         bot.close()
 
         with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
-            main([
-                "--db",
-                str(self.db_path),
-                "enforce-data-retention",
-                "--dry-run",
-                "--as-of",
-                "2026-07-19T12:00:00+00:00",
-            ])
+            main(
+                [
+                    "--db",
+                    str(self.db_path),
+                    "enforce-data-retention",
+                    "--dry-run",
+                    "--as-of",
+                    "2026-07-19T12:00:00+00:00",
+                ]
+            )
         report = json.loads(stdout.getvalue())
         self.assertTrue(report["dry_run"])
         self.assertEqual(1, report["deleted"]["audit_logs"])
@@ -3233,8 +3295,14 @@ class CliLoggingAndInteractiveTests(unittest.TestCase):
 
     def test_main_passes_verbosity_flags_to_logging_config(self):
         cases = (
-            (["--verbose", "--db", str(self.db_path), "list-opportunities"], {"verbose": True, "quiet": False}),
-            (["--quiet", "--db", str(self.db_path), "list-opportunities"], {"verbose": False, "quiet": True}),
+            (
+                ["--verbose", "--db", str(self.db_path), "list-opportunities"],
+                {"verbose": True, "quiet": False},
+            ),
+            (
+                ["--quiet", "--db", str(self.db_path), "list-opportunities"],
+                {"verbose": False, "quiet": True},
+            ),
             (["--db", str(self.db_path), "list-opportunities"], {"verbose": False, "quiet": False}),
         )
         for argv, expected in cases:
@@ -3252,7 +3320,9 @@ class CliLoggingAndInteractiveTests(unittest.TestCase):
                 "sys.modules",
                 {"celery_tasks": types.SimpleNamespace(send_outreach_task=object())},
             ),
-            unittest.mock.patch("builtins.input", side_effect=["donor@example.org", "Donor"]) as prompt,
+            unittest.mock.patch(
+                "builtins.input", side_effect=["donor@example.org", "Donor"]
+            ) as prompt,
             unittest.mock.patch("funding_bot._queue_async_task") as queue_task,
         ):
             main(["--db", str(self.db_path), "send-outreach", "--dry-run"])
@@ -3328,7 +3398,9 @@ class SearchSettingsAndDiscoveryTests(unittest.TestCase):
 
     def test_store_organization_profile_round_trips_through_generic_settings(self):
         self.bot.store_organization_profile({"name": "i4Edu", "mission": "Educate"})
-        self.assertEqual({"name": "i4Edu", "mission": "Educate"}, self.bot.load_organization_profile())
+        self.assertEqual(
+            {"name": "i4Edu", "mission": "Educate"}, self.bot.load_organization_profile()
+        )
         # It is addressable via the generic setting API too.
         self.assertEqual({"name": "i4Edu", "mission": "Educate"}, self.bot.load_setting("profile"))
 
@@ -3374,7 +3446,9 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
         if self.db_path.exists():
             self.db_path.unlink()
         self._previous_always_eager = task_queue.celery_app.conf.task_always_eager
-        self._previous_store_eager = getattr(task_queue.celery_app.conf, "task_store_eager_result", None)
+        self._previous_store_eager = getattr(
+            task_queue.celery_app.conf, "task_store_eager_result", None
+        )
         task_queue.celery_app.conf.task_always_eager = True
         task_queue.celery_app.conf.task_store_eager_result = True
 
@@ -3452,7 +3526,9 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
     def test_send_outreach_command_previews_requested_locale_template(self):
         bot = FundingBot(db_path=self.db_path)
         try:
-            bot.store_organization_profile({"name": "i4Edu", "mission": "Expand access to education."})
+            bot.store_organization_profile(
+                {"name": "i4Edu", "mission": "Expand access to education."}
+            )
         finally:
             bot.close()
 
@@ -3494,11 +3570,23 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
         try:
             profile_path = Path(tmpdir) / "profile.json"
             profile_path.write_text(json.dumps({"name": "i4Edu"}), encoding="utf-8")
-            main(["--db", str(self.db_path), "set-organization-profile", "--file", str(profile_path)])
+            main(
+                ["--db", str(self.db_path), "set-organization-profile", "--file", str(profile_path)]
+            )
         finally:
             rmtree(tmpdir)
 
-        main(["--db", str(self.db_path), "register-credential", "--alias", "smtp", "--env-var", "SMTP_PASSWORD"])
+        main(
+            [
+                "--db",
+                str(self.db_path),
+                "register-credential",
+                "--alias",
+                "smtp",
+                "--env-var",
+                "SMTP_PASSWORD",
+            ]
+        )
 
         with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
             main(["--db", str(self.db_path), "show-settings"])
@@ -3524,7 +3612,9 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual("show-settings", payload["command"])
         self.assertEqual({"name": "i4Edu"}, payload["organization_profile"])
-        self.assertEqual([{"alias": "smtp", "env_var_name": "SMTP_PASSWORD"}], payload["credentials"])
+        self.assertEqual(
+            [{"alias": "smtp", "env_var_name": "SMTP_PASSWORD"}], payload["credentials"]
+        )
 
 
 class CliEnhancementCommandTests(unittest.TestCase):
@@ -3581,7 +3671,11 @@ class CliEnhancementCommandTests(unittest.TestCase):
             unittest.mock.patch.dict("sys.modules", {"task_queue": fake_task_queue}),
             unittest.mock.patch(
                 "funding_bot._collect_redis_diagnostics",
-                return_value={"status": "ok", "checked": True, "targets": [{"role": "broker", "status": "ok"}]},
+                return_value={
+                    "status": "ok",
+                    "checked": True,
+                    "targets": [{"role": "broker", "status": "ok"}],
+                },
             ),
             unittest.mock.patch(
                 "funding_bot._collect_connector_diagnostics",
@@ -3626,7 +3720,9 @@ class TaskApiRequirementTests(unittest.TestCase):
         )
 
         model = Task.from_row(
-            self.bot.connection.execute("SELECT * FROM tasks WHERE id = ?", (task["id"],)).fetchone()
+            self.bot.connection.execute(
+                "SELECT * FROM tasks WHERE id = ?", (task["id"],)
+            ).fetchone()
         )
 
         self.assertIsNotNone(model)
@@ -3689,6 +3785,99 @@ class TaskApiRequirementTests(unittest.TestCase):
         self.assertEqual("auditor", updated["assignee"])
         self.assertEqual("blocked", updated["status"])
         self.assertEqual("2026-07-22", updated["due_date"])
+
+
+class DatabaseIndexingTests(unittest.TestCase):
+    def setUp(self):
+        self.workdir = _reset_test_dir("database-indexing")
+        self.db_path = self.workdir / "indexing.db"
+        self.bot = FundingBot(db_path=str(self.db_path))
+
+    def tearDown(self):
+        self.bot.close()
+
+    def _seed_index_data(self) -> None:
+        for index in range(60):
+            self.bot.upsert_donor(
+                email=f"donor-{index:03d}@example.org",
+                name=f"Donor {index % 15:02d}",
+                segment="institutional" if index % 2 == 0 else "corporate",
+            )
+        for index in range(120):
+            self.bot.create_task(
+                title=f"Task {index}",
+                assignee="staff" if index % 2 == 0 else "admin",
+                status="todo" if index % 3 == 0 else "blocked",
+                due_date=f"2026-07-{(index % 28) + 1:02d}",
+                created_at=datetime(2026, 7, 19, tzinfo=timezone.utc) - timedelta(minutes=index),
+                external_id=f"task-{index:03d}",
+                source="benchmark",
+            )
+        cache_rows = [
+            (
+                "Grants Portal" if index % 2 == 0 else "CSR Network",
+                f"cache-{index:03d}",
+                2,
+                (datetime(2026, 7, 19, tzinfo=timezone.utc) - timedelta(minutes=index)).isoformat(),
+                "remote" if index % 2 == 0 else "cached",
+                json.dumps({"seed": True, "index": index}, sort_keys=True),
+                json.dumps([{"title": f"Opportunity {index}"}], sort_keys=True),
+                "internal",
+            )
+            for index in range(80)
+        ]
+        self.bot.connection.executemany(
+            """
+            INSERT OR REPLACE INTO connector_result_cache (
+                connector_name, cache_key, schema_version, fetched_at,
+                source_status, metadata_json, result_json, data_classification
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            cache_rows,
+        )
+        self.bot.connection.commit()
+
+    def test_index_monitoring_reports_expected_indexes(self):
+        self._seed_index_data()
+
+        snapshot = self.bot.get_database_index_metrics()
+        migrations = {
+            row["name"]
+            for row in self.bot.connection.execute("SELECT name FROM schema_migrations").fetchall()
+        }
+
+        self.assertIn("002_add_query_indexes.sql", migrations)
+        self.assertEqual(snapshot["summary"]["expected"], snapshot["summary"]["present"])
+        index_names = {row["name"] for row in snapshot["indexes"] if row["present"]}
+        self.assertTrue(
+            {
+                "idx_donors_email",
+                "idx_donors_name_email",
+                "idx_tasks_status",
+                "idx_tasks_created_at_status",
+                "idx_tasks_assigned_to_status",
+                "idx_connector_result_cache_lookup",
+                "idx_connector_result_cache_status_fetched_at",
+            }.issubset(index_names)
+        )
+
+    def test_explain_plans_use_indexes_for_representative_queries(self):
+        self._seed_index_data()
+
+        plans = {plan["name"]: plan for plan in self.bot.explain_indexed_queries()}
+
+        self.assertIn("idx_donors_name_email", plans["donor-directory"]["indexes"])
+        self.assertTrue(plans["donor-email-lookup"]["uses_index"])
+        self.assertIn("idx_tasks_assigned_to_status", plans["task-assignee-status"]["indexes"])
+        self.assertIn("idx_tasks_created_at_status", plans["task-status-created-at"]["indexes"])
+        self.assertIn(
+            "idx_connector_result_cache_lookup",
+            plans["connector-response-lookup"]["indexes"],
+        )
+        self.assertIn(
+            "idx_connector_result_cache_status_fetched_at",
+            plans["connector-response-status"]["indexes"],
+        )
 
 
 if __name__ == "__main__":

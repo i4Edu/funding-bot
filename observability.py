@@ -81,7 +81,9 @@ def configure_tracing() -> None:
             elif exporter_kind == "otlp" and exporter_target and OTLPSpanExporter is not None:
                 exporter = OTLPSpanExporter(
                     endpoint=exporter_target,
-                    headers=dict(_parse_header_pairs(os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", ""))),
+                    headers=dict(
+                        _parse_header_pairs(os.environ.get("OTEL_EXPORTER_OTLP_HEADERS", ""))
+                    ),
                     timeout=float(os.environ.get("OTEL_EXPORTER_OTLP_TIMEOUT", "10")),
                 )
                 sdk_provider.add_span_processor(BatchSpanProcessor(exporter))
@@ -222,8 +224,7 @@ def _resolve_observability_db_path(db_path: str | None = None) -> str | None:
 
 
 def ensure_slo_schema(connection: sqlite3.Connection) -> None:
-    connection.execute(
-        """
+    connection.execute("""
         CREATE TABLE IF NOT EXISTS slo_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             slo_name TEXT NOT NULL,
@@ -234,14 +235,11 @@ def ensure_slo_schema(connection: sqlite3.Connection) -> None:
             metadata_json TEXT NOT NULL DEFAULT '{}',
             recorded_at TEXT NOT NULL
         )
-        """
-    )
-    connection.execute(
-        """
+        """)
+    connection.execute("""
         CREATE INDEX IF NOT EXISTS idx_slo_events_name_recorded_at
             ON slo_events(slo_name, recorded_at DESC)
-        """
-    )
+        """)
 
 
 def record_slo_event(
@@ -302,7 +300,9 @@ def record_slo_event(
         return
 
 
-def reset_slo_events(*, connection: sqlite3.Connection | None = None, db_path: str | None = None) -> None:
+def reset_slo_events(
+    *, connection: sqlite3.Connection | None = None, db_path: str | None = None
+) -> None:
     if connection is not None:
         ensure_slo_schema(connection)
         connection.execute("DELETE FROM slo_events")
@@ -336,9 +336,7 @@ def _summarize_rows(definition: SLODefinition, rows: list[sqlite3.Row]) -> dict[
     latencies = [float(row["latency_seconds"]) for row in rows]
     total = len(rows)
     failures = sum(1 for row in rows if not bool(row["success"]))
-    successful_units = sum(
-        float(row["throughput_units"]) for row in rows if bool(row["success"])
-    )
+    successful_units = sum(float(row["throughput_units"]) for row in rows if bool(row["success"]))
     error_rate = failures / total if total else 0.0
     throughput_per_hour = successful_units / float(definition.window_hours or 1)
     latency_p95 = _percentile(latencies, 0.95)
@@ -371,7 +369,9 @@ def _summarize_rows(definition: SLODefinition, rows: list[sqlite3.Row]) -> dict[
                 "component": bucket["component"],
                 "samples": samples,
                 "error_rate": failures / samples if samples else 0.0,
-                "average_latency_seconds": bucket["latency_seconds_sum"] / samples if samples else 0.0,
+                "average_latency_seconds": (
+                    bucket["latency_seconds_sum"] / samples if samples else 0.0
+                ),
             }
         )
     latency_met = latency_p95 <= definition.latency_target_seconds if total else False

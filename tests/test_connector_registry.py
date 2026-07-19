@@ -138,7 +138,9 @@ class ConnectorRegistryIntegrationTests(unittest.TestCase):
             }
         )
 
-        with unittest.mock.patch("funding_bot._require_https_url", side_effect=lambda url, **_: url):
+        with unittest.mock.patch(
+            "funding_bot._require_https_url", side_effect=lambda url, **_: url
+        ):
             with self.assertRaises(ConnectorConfigError) as exc:
                 FundingBot(connector_registry=self.registry)
 
@@ -149,11 +151,11 @@ class ConnectorRegistryIntegrationTests(unittest.TestCase):
         bootstrap = FundingBot(db_path=self.db_path)
         bootstrap.register_credential("sandbox", "SANDBOX_SECRET")
         bootstrap.close()
-        os.environ["SANDBOX_SECRET"] = json.dumps(
-            {"api_key": "sandbox-key", "tenant": "tenant-42"}
-        )
+        os.environ["SANDBOX_SECRET"] = json.dumps({"api_key": "sandbox-key", "tenant": "tenant-42"})
 
-        with unittest.mock.patch("funding_bot._require_https_url", side_effect=lambda url, **_: url):
+        with unittest.mock.patch(
+            "funding_bot._require_https_url", side_effect=lambda url, **_: url
+        ):
             bot = FundingBot(
                 db_path=self.db_path,
                 trusted_sources={"Sandbox Registry Connector"},
@@ -174,7 +176,9 @@ class ConnectorRegistryIntegrationTests(unittest.TestCase):
                 credential_resolver=bot.resolve_credential,
             )
         try:
-            with unittest.mock.patch("funding_bot._require_https_url", side_effect=lambda url, **_: url):
+            with unittest.mock.patch(
+                "funding_bot._require_https_url", side_effect=lambda url, **_: url
+            ):
                 found = bot.run_discovery(connectors=connectors, keywords=["education"])
         finally:
             bot.close()

@@ -84,9 +84,7 @@ class CollaborationModelTests(unittest.TestCase):
         resumed = self.bot.transition_task_status(
             task["id"], new_status="in-progress", changed_by="staff"
         )
-        done = self.bot.transition_task_status(
-            task["id"], new_status="done", changed_by="staff"
-        )
+        done = self.bot.transition_task_status(task["id"], new_status="done", changed_by="staff")
 
         self.assertEqual("in-progress", in_progress["status"])
         self.assertEqual("blocked", blocked["status"])
@@ -222,7 +220,9 @@ class CollaborationApiTests(unittest.TestCase):
 
         self.assertEqual(200, response.status_code)
         payload = response.get_json()
-        self.assertEqual(["Compliance review", "Collect attachments"], [task["title"] for task in payload])
+        self.assertEqual(
+            ["Compliance review", "Collect attachments"], [task["title"] for task in payload]
+        )
 
     def test_staff_tasks_route_is_scoped_to_current_role(self):
         self._seed_tasks()

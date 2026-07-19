@@ -1,0 +1,24 @@
+# serializer version: 1
+# name: test_monthly_audit_report_empty_month_regression
+  dict({
+    'application_outcomes': dict({
+    }),
+    'audit_log_entries': dict({
+    }),
+    'gdpr_operations': dict({
+    }),
+    'generated_at': '2026-07-19T04:46:06.049111+00:00',
+    'new_donors_registered': 0,
+    'opted_out_donors_total': 0,
+    'outreach_summary': dict({
+      'bounce_rate': 0.0,
+      'clicked': 0,
+      'opened': 0,
+      'top_engaged_donors': list([
+      ]),
+      'total_sent': 0,
+    }),
+    'period': '2026-01',
+    'report_type': 'monthly_compliance_audit',
+  })
+# ---

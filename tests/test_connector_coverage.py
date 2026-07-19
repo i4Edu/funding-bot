@@ -81,13 +81,15 @@ class ConnectorCoverageTests(unittest.TestCase):
     def test_demo_connectors_expand_keywords_and_return_expected_records(self):
         self.assertEqual(
             "Education Innovation Grant",
-            GrantsPortalConnector(cache_manager=CacheManager()).fetch_opportunities(["learning"])[0][
-                "title"
-            ],
+            GrantsPortalConnector(cache_manager=CacheManager()).fetch_opportunities(["learning"])[
+                0
+            ]["title"],
         )
         self.assertEqual(
             "CSR Digital Learning Fund",
-            CSRNetworkConnector(cache_manager=CacheManager()).fetch_opportunities(["edtech"])[0]["title"],
+            CSRNetworkConnector(cache_manager=CacheManager()).fetch_opportunities(["edtech"])[0][
+                "title"
+            ],
         )
         self.assertEqual(
             "Community Literacy Matching Grant",
@@ -97,7 +99,9 @@ class ConnectorCoverageTests(unittest.TestCase):
         )
         self.assertEqual(
             "Community STEM Lab Campaign",
-            GlobalGivingConnector(cache_manager=CacheManager()).fetch_opportunities(["stem"])[0]["title"],
+            GlobalGivingConnector(cache_manager=CacheManager()).fetch_opportunities(["stem"])[0][
+                "title"
+            ],
         )
         self.assertEqual(
             "Assistive Tech Makerspace Project",
@@ -263,7 +267,9 @@ class ConnectorCoverageTests(unittest.TestCase):
             {"results": [{"title": "D"}], "has_more": False},
             current_page=2,
         )
-        list_payload = connector._parse_remote_page([{"title": "E"}, {"title": "F"}], current_page=1)
+        list_payload = connector._parse_remote_page(
+            [{"title": "E"}, {"title": "F"}], current_page=1
+        )
 
         self.assertEqual(4, opportunities_payload[3])
         self.assertEqual(2, items_payload[3])
@@ -330,11 +336,12 @@ class ConnectorCoverageTests(unittest.TestCase):
             {"keywords": ["education"]},
             headers={"X-Test": "1"},
         )
-        self.assertEqual({"X-Test": "1"}, payload["ok"])
+        self.assertEqual("1", payload["ok"]["X-Test"])
+        self.assertEqual("application/json", payload["ok"]["Accept"])
 
         connector = GrantsPortalConnector(
             credential_name="",
-            http_client=lambda url, params, credentials: {"credentials": credentials}
+            http_client=lambda url, params, credentials: {"credentials": credentials},
         )
         payload = connector._invoke_http_get_client(
             "https://example.org/search",
@@ -455,7 +462,9 @@ class ConnectorCoverageTests(unittest.TestCase):
         self.assertEqual("******", request.call_args.kwargs["headers"]["Authorization"])
         self.assertEqual("demo-key", request.call_args.kwargs["headers"]["X-API-Key"])
         self.assertEqual("DOE|USAID", request.call_args.kwargs["json_payload"]["agencies"])
-        self.assertEqual("Education|Youth", request.call_args.kwargs["json_payload"]["fundingCategories"])
+        self.assertEqual(
+            "Education|Youth", request.call_args.kwargs["json_payload"]["fundingCategories"]
+        )
         self.assertEqual("Student Success Grant", result["opportunities"][0]["title"])
         self.assertEqual("grants.gov", result["metadata"]["provider"])
         self.assertTrue(result["metadata"]["auth_applied"])
@@ -536,7 +545,9 @@ class ConnectorCoverageTests(unittest.TestCase):
             },
         }
 
-        connector._fetch_remote_json = lambda _url, params: responses[(params["q"], params["page"])]
+        connector._fetch_remote_json = lambda _url, params, headers=None: responses[
+            (params["q"], params["page"])
+        ]
         result = connector._fetch_remote_result(["literacy", "community engagement"])
 
         self.assertEqual(2, len(result["opportunities"]))
@@ -579,7 +590,9 @@ class ConnectorCoverageTests(unittest.TestCase):
 
         self.assertEqual("Heritage Foundation", result["opportunities"][0]["donor_name"])
         self.assertEqual("Education Access", result["opportunities"][0]["title"])
-        self.assertEqual("https://foundation.example.org/grant/1", result["opportunities"][0]["portal_url"])
+        self.assertEqual(
+            "https://foundation.example.org/grant/1", result["opportunities"][0]["portal_url"]
+        )
         self.assertEqual("Education", result["opportunities"][0]["category"])
 
     def test_call_with_retry_tracks_backoff_and_failure_metrics(self):
@@ -648,6 +661,7 @@ class ConnectorCoverageTests(unittest.TestCase):
         self.assertEqual("open", health["state"])
 
         rate_clock = FakeClock()
+
         class AlwaysLimitedRateLimiter:
             def consume(self, tokens=1.0):
                 return False, 1.5
@@ -659,9 +673,7 @@ class ConnectorCoverageTests(unittest.TestCase):
         limited = CrowdfundingConnector(
             platform="globalgiving",
             transport="http",
-            http_client=lambda _url, _payload, _credentials=None: {
-                "projects": {"project": []}
-            },
+            http_client=lambda _url, _payload, _credentials=None: {"projects": {"project": []}},
             time_func=rate_clock.monotonic,
             rate_limit_config={"capacity": 1.0, "refill_rate": 0.0},
             rate_limiter=AlwaysLimitedRateLimiter(),
@@ -814,9 +826,14 @@ class ConnectorCoverageTests(unittest.TestCase):
         )
 
         with self.assertRaises(ConnectorConfigError):
-            registry.validate_config({"type": "sandbox", "base_url": "http://sandbox.example.org"}, credential_resolver=resolver)
+            registry.validate_config(
+                {"type": "sandbox", "base_url": "http://sandbox.example.org"},
+                credential_resolver=resolver,
+            )
         with self.assertRaises(ConnectorConfigError):
-            registry.validate_config({"type": "sandbox", "credentials": {}}, credential_resolver=resolver)
+            registry.validate_config(
+                {"type": "sandbox", "credentials": {}}, credential_resolver=resolver
+            )
 
         connectors = registry.build_connectors(
             [
@@ -851,7 +868,9 @@ class ConnectorCoverageTests(unittest.TestCase):
         self.assertEqual("grants-portal", create_connector("grants-portal").connector_slug)
         self.assertEqual(
             "foundation-directory",
-            create_connector("foundation-directory", credentials={"api_key": "demo"}).connector_slug,
+            create_connector(
+                "foundation-directory", credentials={"api_key": "demo"}
+            ).connector_slug,
         )
 
         with self.assertRaises(ConnectionSecurityError):

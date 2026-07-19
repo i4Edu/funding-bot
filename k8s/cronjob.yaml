@@ -210,3 +210,168 @@ spec:
             - name: bot-data
               persistentVolumeClaim:
                 claimName: funding-bot-data
+
+---
+# Nightly full SQLite backup for operational restores.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: funding-bot-nightly-backup
+  namespace: funding-bot
+  labels:
+    app: funding-bot
+spec:
+  schedule: "0 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: funding-bot
+            component: backup
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: funding-bot-backup
+              image: funding-bot:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - >-
+                  python scripts/backup_sqlite.py
+                  --db "$BOT_DB_PATH"
+                  --output-dir "$BACKUP_DIRECTORY"
+                  --mode full
+                  --retention-days "$BACKUP_RETENTION_DAYS"
+              envFrom:
+                - configMapRef:
+                    name: funding-bot-config
+                - secretRef:
+                    name: funding-bot-secrets
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+              volumeMounts:
+                - name: bot-data
+                  mountPath: /app/data
+          volumes:
+            - name: bot-data
+              persistentVolumeClaim:
+                claimName: funding-bot-data
+
+---
+# Frequent WAL snapshots to reduce the recovery point objective.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: funding-bot-wal-backup
+  namespace: funding-bot
+  labels:
+    app: funding-bot
+spec:
+  schedule: "*/15 * * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: funding-bot
+            component: backup
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: funding-bot-wal-backup
+              image: funding-bot:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - >-
+                  python scripts/backup_sqlite.py
+                  --db "$BOT_DB_PATH"
+                  --output-dir "$BACKUP_DIRECTORY"
+                  --mode wal
+                  --retention-days "$BACKUP_WAL_RETENTION_DAYS"
+              envFrom:
+                - configMapRef:
+                    name: funding-bot-config
+                - secretRef:
+                    name: funding-bot-secrets
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+              volumeMounts:
+                - name: bot-data
+                  mountPath: /app/data
+          volumes:
+            - name: bot-data
+              persistentVolumeClaim:
+                claimName: funding-bot-data
+
+---
+# Daily verification of the newest backup snapshot.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: funding-bot-backup-verification
+  namespace: funding-bot
+  labels:
+    app: funding-bot
+spec:
+  schedule: "20 2 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: funding-bot
+            component: backup
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: funding-bot-backup-verification
+              image: funding-bot:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - sh
+                - -c
+                - >-
+                  python scripts/verify_backup.py
+                  --latest-in "$BACKUP_DIRECTORY"
+              envFrom:
+                - configMapRef:
+                    name: funding-bot-config
+                - secretRef:
+                    name: funding-bot-secrets
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+              volumeMounts:
+                - name: bot-data
+                  mountPath: /app/data
+          volumes:
+            - name: bot-data
+              persistentVolumeClaim:
+                claimName: funding-bot-data

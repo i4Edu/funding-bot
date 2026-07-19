@@ -6,7 +6,6 @@ import pytest
 
 from funding_bot import FileVault, FundingBot
 
-
 REGRESSION_VAULT_DIR = Path(".test_regression_vault")
 DISCOVERED_AT = datetime(2026, 6, 22, 8, 30, tzinfo=timezone.utc)
 SUMMARY_SENT_AT = datetime(2026, 6, 22, 9, 0, tzinfo=timezone.utc)

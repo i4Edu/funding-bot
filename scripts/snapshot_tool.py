@@ -8,7 +8,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 DEFAULT_TARGETS = ("tests/test_regression.py",)
 
 

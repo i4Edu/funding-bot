@@ -18,13 +18,17 @@ def _request_json(method: str, url: str, payload: dict | None = None) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
-def test_health_endpoint_reports_available_connectors(mock_connector_server: dict[str, str]) -> None:
+def test_health_endpoint_reports_available_connectors(
+    mock_connector_server: dict[str, str],
+) -> None:
     payload = _request_json("GET", mock_connector_server["health_url"])
     assert payload["status"] == "ok"
     assert "grants-portal" in payload["connectors"]
 
 
-def test_grants_portal_endpoint_returns_expected_shape(mock_connector_server: dict[str, str]) -> None:
+def test_grants_portal_endpoint_returns_expected_shape(
+    mock_connector_server: dict[str, str],
+) -> None:
     payload = _request_json(
         "POST",
         mock_connector_server["grants_portal_url"],

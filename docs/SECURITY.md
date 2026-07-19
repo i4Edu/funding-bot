@@ -123,9 +123,12 @@ Operators and contributors should:
 - keep dependencies updated and promptly apply security patches
 - store secrets in environment variables or a secrets manager, never in source control
 - rotate SMTP, API, and dashboard credentials regularly
+- keep the default security headers enabled; if you override `WEB_CONTENT_SECURITY_POLICY`, review every directive for least privilege
+- restrict `WEB_API_CORS_ALLOWED_ORIGINS` to exact trusted dashboard/browser origins and avoid wildcard patterns
 - enforce strong unique passwords for `admin`, `staff`, and `auditor` roles
 - run the dashboard and Flower behind authentication and trusted network boundaries
 - use HTTPS/TLS in every non-local deployment
+- keep `WEB_HSTS_MAX_AGE_SECONDS` at one year or longer for public HTTPS deployments unless you have a deliberate rollback plan
 - keep CSRF protection enabled for all session-backed dashboard forms and AJAX actions
 - tune `WEB_AUTH_RATE_LIMIT`, `WEB_API_RATE_LIMIT`, and `WEB_EXPORT_RATE_LIMIT` to match expected traffic
 - limit broker, database, and worker network access to required services only

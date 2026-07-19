@@ -182,15 +182,20 @@ class CacheConfig:
             backend=backend,
             url=os.environ.get("FUNDING_BOT_CACHE_URL"),
             enabled=_read_bool_env("FUNDING_BOT_CACHE_ENABLED", True),
-            prefix=os.environ.get("FUNDING_BOT_CACHE_PREFIX", "funding-bot").strip() or "funding-bot",
+            prefix=os.environ.get("FUNDING_BOT_CACHE_PREFIX", "funding-bot").strip()
+            or "funding-bot",
             donor_ttl_seconds=_read_float_env("FUNDING_BOT_DONOR_CACHE_TTL_SECONDS", 300.0),
             connector_ttl_seconds=_read_float_env("FUNDING_BOT_CONNECTOR_CACHE_TTL_SECONDS", 60.0),
-            deduped_profile_ttl_seconds=_read_float_env("FUNDING_BOT_DEDUPED_PROFILE_CACHE_TTL_SECONDS", 600.0),
+            deduped_profile_ttl_seconds=_read_float_env(
+                "FUNDING_BOT_DEDUPED_PROFILE_CACHE_TTL_SECONDS", 600.0
+            ),
         )
 
 
 class CacheManager:
-    def __init__(self, config: CacheConfig | None = None, *, backend: _CacheBackend | None = None) -> None:
+    def __init__(
+        self, config: CacheConfig | None = None, *, backend: _CacheBackend | None = None
+    ) -> None:
         self.config = config or CacheConfig.from_env()
         self._backend = backend or self._build_backend(self.config)
         self._lock = threading.Lock()
@@ -220,7 +225,9 @@ class CacheManager:
     def backend_name(self) -> str:
         return self._backend.name if self.config.enabled else "disabled"
 
-    def make_region(self, namespace: str, *, scope: str = "default", ttl_seconds: float | None = None) -> "CacheRegion":
+    def make_region(
+        self, namespace: str, *, scope: str = "default", ttl_seconds: float | None = None
+    ) -> "CacheRegion":
         return CacheRegion(self, namespace=namespace, scope=scope, ttl_seconds=ttl_seconds)
 
     def _metrics_bucket(self, namespace: str, scope: str) -> dict[str, Any]:
@@ -326,7 +333,9 @@ class CacheManager:
         except Exception as exc:
             self._last_error = str(exc)
 
-    def invalidate_tags(self, namespace: str, tags: list[str] | tuple[str, ...], *, scope: str = "default") -> None:
+    def invalidate_tags(
+        self, namespace: str, tags: list[str] | tuple[str, ...], *, scope: str = "default"
+    ) -> None:
         if not self.config.enabled:
             return
         members: set[str] = set()
@@ -363,7 +372,9 @@ class CacheManager:
             self._backend.srem(index_key, *stale)
         return len(members) - len(stale)
 
-    def stats(self, namespace: str, *, scope: str = "default", ttl_seconds: float | None = None) -> dict[str, Any]:
+    def stats(
+        self, namespace: str, *, scope: str = "default", ttl_seconds: float | None = None
+    ) -> dict[str, Any]:
         bucket = self._metrics_bucket(namespace, scope)
         size = 0
         if self.config.enabled:

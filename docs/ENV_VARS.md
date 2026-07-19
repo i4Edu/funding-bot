@@ -5,6 +5,9 @@ This table documents the runtime environment variables used by the funding bot, 
 | Area | Variable | Required? | Default | Example | Notes |
 | --- | --- | --- | --- | --- | --- |
 | Core | `BOT_DB_PATH` | Yes | `funding_bot.db` | `funding_bot.db` | SQLite database path. Use `/app/data/funding_bot.db` in containers. |
+| Backup | `BACKUP_DIRECTORY` | Optional | `backups` | `/app/data/backups` | Directory used by `scripts/backup_sqlite.py` and `scripts/verify_backup.py`. |
+| Backup | `BACKUP_RETENTION_DAYS` | Optional | `35` | `35` | Default retention window for full backups. |
+| Backup | `BACKUP_WAL_RETENTION_DAYS` | Optional | `7` | `7` | Recommended retention window for WAL snapshots when scheduled separately. |
 | Web | `FLASK_HOST` | No | `127.0.0.1` | `127.0.0.1` | Host used by `web.app.main()`. |
 | Web | `FLASK_PORT` | No | `5000` | `5000` | Port used by `web.app.main()`. |
 | Web | `ADMIN_PASSWORD` | Yes | *(none)* | `changeme-admin` | Required for the `admin` dashboard role. |
@@ -15,10 +18,15 @@ This table documents the runtime environment variables used by the funding bot, 
 | Web | `DASHBOARD_SESSION_TIMEOUT_MINUTES` | No | `30` | `45` | Idle session timeout. |
 | Web | `SESSION_COOKIE_SECURE` | No | `true` | `0` | Set to `0` for local HTTP development; keep enabled in HTTPS deployments. |
 | Web | `SESSION_COOKIE_SAMESITE` | No | `Lax` | `Lax` | Flask session cookie SameSite value. |
+| Web | `WEB_X_FRAME_OPTIONS` | No | `DENY` | `SAMEORIGIN` | Clickjacking protection value. Only `DENY` and `SAMEORIGIN` are accepted. |
+| Web | `WEB_HSTS_MAX_AGE_SECONDS` | No | `63072000` | `31536000` | HSTS `max-age` used on HTTPS responses; `includeSubDomains` is always added. |
+| Web | `WEB_CONTENT_SECURITY_POLICY` | No | built-in restrictive policy | `default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'; frame-src 'self'` | Optional full CSP override for the Flask app. |
 | Web | `WEB_AUTH_RATE_LIMIT` | No | `30 per minute` | `60 per minute` | Rate limit applied to authenticated dashboard HTML routes. |
 | Web | `WEB_API_RATE_LIMIT` | No | `120 per minute` | `300 per minute` | Rate limit applied to authenticated JSON/API routes. |
 | Web | `WEB_EXPORT_RATE_LIMIT` | No | `10 per minute` | `30 per minute` | Stricter rate limit for export endpoints such as `/api/tasks/export`. |
 | Web | `WEB_RATE_LIMIT_STORAGE_URI` | No | `memory://` | `redis://redis:6379/2` | Backend storage for Flask-Limiter counters in multi-process deployments. |
+| Web | `WEB_API_CORS_ALLOWED_ORIGINS` | No | `http://localhost:3000,http://127.0.0.1:3000,https://localhost:3000,https://127.0.0.1:3000` | `https://dashboard.example.org,https://ops.example.org` | Comma-separated exact origins allowed to call `/api/*` endpoints cross-origin. |
+| Web | `WEB_API_CORS_MAX_AGE_SECONDS` | No | `86400` | `3600` | Browser preflight cache duration for `/api/*` CORS responses. |
 | SMTP | `SMTP_HOST` | Optional | `localhost` | `smtp.example.org` | Mail server hostname. |
 | SMTP | `SMTP_PORT` | Optional | `587` | `587` | Mail server port. |
 | SMTP | `SMTP_USERNAME` | Optional | *(empty)* | `funding-bot@example.org` | SMTP username. |
@@ -46,6 +54,7 @@ This table documents the runtime environment variables used by the funding bot, 
 | Queue | `DAILY_SUMMARY_SCHEDULE_HOUR` | Optional | `9` | `9` | UTC hour for the scheduled daily summary. |
 | Queue | `DAILY_SUMMARY_SCHEDULE_MINUTE` | Optional | `0` | `0` | UTC minute for the scheduled daily summary. |
 | Queue | `FLOWER_BASIC_AUTH` | Optional | *(empty)* | `admin:secret` | Basic auth credentials for Flower in Docker Compose. |
+| Queue | `FLOWER_DASHBOARD_URL` | Optional | `http://127.0.0.1:5555` | `https://ops.example.org/flower` | URL surfaced in the settings queue-monitoring card for operators. |
 | Connectors | `FUNDING_BOT_CONNECTORS` | Optional | *(empty)* | `{"connectors":[{"type":"globalgiving","transport":"http"}]}` | JSON override for connector definitions. |
 | Connectors | `PORTAL_PAGE_SIZE` | Optional | connector default | `100` | Global default page size for paginated connectors. |
 | Connectors | `PORTAL_CACHE_TTL` | Optional | `300` | `300` | Global connector cache TTL in seconds. |
@@ -57,6 +66,7 @@ This table documents the runtime environment variables used by the funding bot, 
 | Connectors | `CSR_NETWORK_API_BASE_URL` | Optional | `https://api.candid.org/rfp/v1/opportunity` | `https://api.candid.org/rfp/v1/opportunity` | CSR/Candid endpoint override. |
 | Connectors | `GRANTS_GOV_API_CREDENTIALS` | Optional | *(empty)* | `{"api_key":"replace-me"}` | JSON credentials for the Grants.gov connector. |
 | Connectors | `CSR_NETWORK_API_CREDENTIALS` | Optional | *(empty)* | `{"subscription_key":"replace-me"}` | JSON credentials for the CSR Network connector. |
+| Connectors | `NGO_DIRECTORY_API_CREDENTIALS` | Optional | *(empty)* | `{"auth_type":"oauth2_client_credentials",...}` | Optional JSON credentials for NGO Directory live requests when a private proxy or authenticated upstream is used. |
 | Connectors | `GRANTS_PORTAL_PAGE_SIZE` | Optional | inherits `PORTAL_PAGE_SIZE` | `100` | Grants Portal page size override. |
 | Connectors | `GRANTS_PORTAL_CACHE_TTL` | Optional | inherits `PORTAL_CACHE_TTL` | `300` | Grants Portal cache TTL override. |
 | Connectors | `GRANTS_PORTAL_RATE_LIMIT_CAPACITY` | Optional | inherits global default | `5` | Grants Portal burst size override. |
@@ -98,4 +108,4 @@ This table documents the runtime environment variables used by the funding bot, 
 
 - Connector credential aliases registered with `register-credential` can point at any additional user-defined environment variable; those names are intentionally deployment-specific and are not fixed by the application.
 - For local dashboard work over plain HTTP, set `SESSION_COOKIE_SECURE=0`.
-- For container deployments, prefer `/app/data/funding_bot.db` and `/app/data/privacy_policies` so data lands on the mounted volume.
+- For container deployments, prefer `/app/data/funding_bot.db`, `/app/data/backups`, and `/app/data/privacy_policies` so state lands on the mounted volume.

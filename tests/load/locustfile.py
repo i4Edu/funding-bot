@@ -16,7 +16,9 @@ class DashboardAdminUser(HttpUser):
 
     def on_start(self) -> None:
         role = os.environ.get("LOAD_TEST_ROLE", "admin")
-        password = os.environ.get("LOAD_TEST_PASSWORD", os.environ.get("ADMIN_PASSWORD", "admin-secret"))
+        password = os.environ.get(
+            "LOAD_TEST_PASSWORD", os.environ.get("ADMIN_PASSWORD", "admin-secret")
+        )
         response = self.client.get(
             "/dashboard",
             headers=_basic_auth_header(role, password),

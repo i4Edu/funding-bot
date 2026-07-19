@@ -18,7 +18,9 @@ For deployment and scaling guidance, see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md
 For common runtime problems, diagnostic commands, and error recovery, see [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
 For common setup, connector, deduplication, export, and API questions, see [docs/FAQ.md](docs/FAQ.md).
 For Kubernetes rollout details, see [docs/KUBERNETES.md](docs/KUBERNETES.md).
+For backup, restore, and disaster recovery guidance, see [docs/BACKUP_RECOVERY.md](docs/BACKUP_RECOVERY.md).
 For profiling commands, baselines, and flame graph workflows, see [docs/PROFILING.md](docs/PROFILING.md).
+For database index coverage, query plans, monitoring, and benchmark commands, see [docs/INDEXING.md](docs/INDEXING.md).
 For release/versioning rules, see [docs/VERSIONING.md](docs/VERSIONING.md).
 For a fast local setup guide, see [docs/QUICKSTART.md](docs/QUICKSTART.md).
 For the complete environment variable reference, see [docs/ENV_VARS.md](docs/ENV_VARS.md).
@@ -39,6 +41,8 @@ For the operational breach runbook, see [docs/INCIDENT_RESPONSE.md](docs/INCIDEN
 - [API reference](docs/API.md)
 - [Collaboration guide](docs/COLLABORATION.md)
 - [Deployment guide](docs/DEPLOYMENT.md)
+- [Backup and recovery runbook](docs/BACKUP_RECOVERY.md)
+- [Database indexing guide](docs/INDEXING.md)
 - [Environment variable reference](docs/ENV_VARS.md)
 
 ## Overview
@@ -963,7 +967,8 @@ Use one of these usernames as the role name:
 | `/tasks/<id>/status` | `POST` | `staff`, `admin`, `auditor` | Transition a task through `todo`, `in-progress`, `blocked`, and `done` with state-machine validation. |
 | `/feedback` | `POST` | `staff`, `admin` | Submit partner feature-request or bug-report feedback. |
 | `/metrics` | `GET` | `admin`, `auditor` | Prometheus-compatible text metrics for Grafana scraping, including task totals and status counts. |
-| `/health` | `GET` | Public | Health-check endpoint with embedded queue mode and queue-health snapshot. |
+| `/health` | `GET` | Public | Lightweight liveness endpoint for the web process and database. |
+| `/ready` | `GET` | Public | Dependency-aware readiness endpoint for database, Redis, Celery, and connectors. |
 | `/health/queue` | `GET` | Public | Queue health snapshot including queue depth, worker status, and cron/queue migration mode. |
 
 ### Keyboard navigation and screen reader checks
@@ -1023,6 +1028,10 @@ The `/metrics` endpoint exposes the following gauges and counters in the Prometh
 | `funding_bot_db_query_duration_seconds_max{statement}` | gauge | Maximum observed query latency by statement |
 | `funding_bot_db_queries_in_flight{statement}` | gauge | Queries currently executing |
 | `funding_bot_db_query_slow_threshold_seconds` | gauge | Configured slow-query threshold |
+| `funding_bot_health_checks_total{endpoint}` | counter | Total `/health` and `/ready` probes performed |
+| `funding_bot_health_failures_total{endpoint}` | counter | Total degraded `/health` and `/ready` probes |
+| `funding_bot_health_component_checks_total{component}` | counter | Total component checks performed by health endpoints |
+| `funding_bot_health_component_failures_total{component}` | counter | Total component check failures |
 | `funding_bot_queue_health_status` | gauge | Queue health state (`1` = broker reachable and metrics collected; `0` = disabled or degraded) |
 | `funding_bot_queue_broker_up` | gauge | Whether the Celery broker is reachable |
 | `funding_bot_queue_active_tasks` | gauge | Active Celery tasks currently executing |
@@ -1068,6 +1077,8 @@ curl -u admin:$ADMIN_PASSWORD \
 - One-off subject/body overrides still work and keep the locale-aware Bengali or English opt-out notice.
 
 ### Queue health monitoring
+
+Use `GET /health` for liveness and `GET /ready` for readiness. The full strategy and probe behavior are documented in [docs/HEALTH_CHECKS.md](docs/HEALTH_CHECKS.md).
 
 Set the optional queue-monitoring environment variables when Celery is enabled:
 
@@ -1273,7 +1284,7 @@ Recommended secret/config inputs:
 - dashboard auth: `ADMIN_PASSWORD`, `STAFF_PASSWORD`, `AUDITOR_PASSWORD`
 - persistence/runtime: `BOT_DB_PATH`, `ENABLE_TASK_QUEUE`, `ENABLE_LEGACY_CRON`, `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND`
 
-Use a `CronJob` for scheduled summary delivery, a second `CronJob` for retention cleanup (`python -m funding_bot enforce-data-retention`), and a `Deployment`/`Service`/`Ingress` set for the dashboard. Horizontal scaling is defined in `k8s/hpa.yaml`, vertical sizing recommendations live in `k8s/vpa.yaml`, and the full rollout checklist is documented in [docs/KUBERNETES.md](docs/KUBERNETES.md).
+Use a `CronJob` for scheduled summary delivery, a second `CronJob` for retention cleanup (`python -m funding_bot enforce-data-retention`), dedicated backup/verification CronJobs, and a `Deployment`/`Service`/`Ingress` set for the dashboard. Horizontal scaling is defined in `k8s/hpa.yaml`, vertical sizing recommendations live in `k8s/vpa.yaml`, backup procedures live in [docs/BACKUP_RECOVERY.md](docs/BACKUP_RECOVERY.md), and the full rollout checklist is documented in [docs/KUBERNETES.md](docs/KUBERNETES.md).
 
 ## Compliance Documentation
 
@@ -1360,9 +1371,12 @@ Cron can remain as a migration fallback while queue-backed workers are introduce
 
 ```cron
 0 9 * * * cd /path/to/funding-bot && python -m funding_bot send-daily-summary
+0 2 * * * cd /path/to/funding-bot && python scripts/backup_sqlite.py --db "$BOT_DB_PATH" --output-dir ./backups --mode full --retention-days 35
+*/15 * * * * cd /path/to/funding-bot && python scripts/backup_sqlite.py --db "$BOT_DB_PATH" --output-dir ./backups --mode wal --retention-days 7
+20 2 * * * cd /path/to/funding-bot && python scripts/verify_backup.py --latest-in ./backups
 ```
 
-For Kubernetes deployments, mirror either the legacy CLI schedule with a `CronJob` or the new worker model with a Celery-compatible broker deployment.
+For Kubernetes deployments, mirror either the legacy CLI schedule with a `CronJob` or the new worker model with a Celery-compatible broker deployment. See [docs/BACKUP_RECOVERY.md](docs/BACKUP_RECOVERY.md) for backup cadence, restore steps, retention, verification, and disaster recovery guidance.
 
 ## Partner Onboarding
 

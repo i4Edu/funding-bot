@@ -112,7 +112,8 @@ Before increasing dashboard replicas or worker counts, run the concurrent admin-
 
 ### Application health endpoints
 
-- `GET /health` returns overall app status and embeds queue mode/health details
+- `GET /health` is the lightweight liveness endpoint for the Flask process and database
+- `GET /ready` is the readiness endpoint for dependency-aware traffic admission
 - `GET /health/queue` returns queue-only diagnostics:
   - queue mode (`cron`, `queue`, or `hybrid`)
   - worker count and worker names
@@ -122,7 +123,9 @@ Before increasing dashboard replicas or worker counts, run the concurrent admin-
 - `GET /health/database` returns SQLAlchemy pool status, configured sizing, lifecycle counters, and aggregated query-monitoring data
 - `GET /health/cache` returns cache backend/reachability details
 
-Use `/health/queue` for worker-specific alerts and `/health` for general readiness/liveness checks.
+`/ready` checks database, Redis, Celery, and connector health. Integrations that are intentionally disabled by configuration report `status: "disabled"` and do not fail readiness. See [HEALTH_CHECKS.md](HEALTH_CHECKS.md) for the detailed strategy.
+
+Use `/health/queue` for worker-specific alerts, `/health` for liveness, and `/ready` for readiness.
 
 ### Flower dashboard
 
@@ -156,8 +159,9 @@ to require login for the Flower UI.
 
 ### Metrics and alerts
 
-The `/metrics` endpoint exports queue metrics alongside app metrics, SQLAlchemy pool counters, database query histograms/counters, and cache hit/miss/set/invalidation metrics. Alert on:
+The `/metrics` endpoint exports queue metrics alongside app metrics, SQLAlchemy pool counters, database query histograms/counters, cache hit/miss/set/invalidation metrics, and health probe counters. Alert on:
 
+- readiness failures increasing over time
 - queue health status dropping to `0`
 - worker count dropping below the expected replica count
 - queue depth growing continuously over multiple scrape intervals
@@ -216,6 +220,7 @@ Only introduce queue partitioning after confirming a real throughput bottleneck.
 1. **Baseline**: `ENABLE_TASK_QUEUE=0`, `ENABLE_LEGACY_CRON=1`
 2. **Enable hybrid mode**: turn on `ENABLE_TASK_QUEUE=1` and deploy broker + workers
 3. **Verify**:
+   - `/ready` returns `200`
    - `/health/queue` reports healthy workers
    - Flower shows the expected queue and task names
    - web-triggered discovery returns queued task metadata
@@ -227,6 +232,8 @@ Only introduce queue partitioning after confirming a real throughput bottleneck.
 
 - [ ] Broker is reachable from web and worker pods
 - [ ] `ENABLE_TASK_QUEUE` and `ENABLE_LEGACY_CRON` reflect the intended mode
+- [ ] `/health` returns `200`
+- [ ] `/ready` returns `200`
 - [ ] `/health/queue` returns healthy workers
 - [ ] Flower is reachable for operators
 - [ ] Worker replicas match observed queue depth

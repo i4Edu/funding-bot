@@ -56,9 +56,13 @@ def main() -> int:
         print(f"{name}: {covered}/{total} executable lines covered ({percent:.1f}%)")
 
     overall = 100.0 if executable_total == 0 else (covered_total / executable_total) * 100
-    print(f"Connector coverage: {covered_total}/{executable_total} executable lines ({overall:.1f}%)")
+    print(
+        f"Connector coverage: {covered_total}/{executable_total} executable lines ({overall:.1f}%)"
+    )
     if overall < threshold:
-        print(f"Connector coverage {overall:.1f}% is below the required {threshold:.1f}% threshold.")
+        print(
+            f"Connector coverage {overall:.1f}% is below the required {threshold:.1f}% threshold."
+        )
         return 1
     return 0
 

@@ -132,7 +132,9 @@ class ArchiveManager:
         self._s3_client = boto3.client("s3")
         return self._s3_client
 
-    def archive_file(self, path: str | Path, *, archive_name: str | None = None) -> list[dict[str, Any]]:
+    def archive_file(
+        self, path: str | Path, *, archive_name: str | None = None
+    ) -> list[dict[str, Any]]:
         source = Path(path)
         name = archive_name or source.name
         archived_locations: list[dict[str, Any]] = []
@@ -157,7 +159,9 @@ class ArchiveManager:
         target_root = self.cold_storage_dir or DEFAULT_ARCHIVE_DIR
         target_path = Path(target_root) / archive_name
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
+        target_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8"
+        )
         locations = self.archive_file(target_path, archive_name=archive_name)
         return {
             "path": str(target_path),
@@ -176,63 +180,100 @@ class WarehouseExportService:
         export_format: str | None = None,
         output_dir: str | Path | None = None,
         archive: bool = False,
+        dry_run: bool = False,
         archive_manager: ArchiveManager | None = None,
+        progress_callback: Any | None = None,
     ) -> dict[str, Any]:
         normalized_datasets = normalize_datasets(datasets)
         normalized_format = normalize_export_format(export_format)
         export_root = Path(output_dir or DEFAULT_EXPORT_OUTPUT_DIR)
-        export_root.mkdir(parents=True, exist_ok=True)
         exported_at = self.bot._to_iso()
         archive_manager = archive_manager or ArchiveManager.from_env()
         artifacts: list[dict[str, Any]] = []
+        total_datasets = len(normalized_datasets)
+        if not dry_run:
+            export_root.mkdir(parents=True, exist_ok=True)
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "stage": "warehouse-export",
+                    "description": (
+                        "Previewing warehouse datasets"
+                        if dry_run
+                        else "Exporting warehouse datasets"
+                    ),
+                    "completed": 0,
+                    "total": total_datasets,
+                }
+            )
         for dataset in normalized_datasets:
             rows = self._dataset_rows(dataset)
             file_name = f"{dataset}_{exported_at.replace(':', '').replace('+', '_')}.{self._suffix_for(normalized_format)}"
             file_path = export_root / file_name
-            row_count = self._write_dataset(
-                dataset=dataset,
-                rows=rows,
-                export_format=normalized_format,
-                file_path=file_path,
-                exported_at=exported_at,
-            )
-            checksum = hashlib.sha256(file_path.read_bytes()).hexdigest()
+            row_count = len(rows)
             artifact = {
                 "dataset": dataset,
                 "format": normalized_format,
                 "path": str(file_path),
                 "row_count": row_count,
-                "sha256": checksum,
+                "will_archive": bool(archive),
             }
-            if archive:
-                artifact["archived_locations"] = archive_manager.archive_file(
-                    file_path,
-                    archive_name=file_name,
+            if dry_run:
+                artifact["sha256"] = None
+            else:
+                self._write_dataset(
+                    dataset=dataset,
+                    rows=rows,
+                    export_format=normalized_format,
+                    file_path=file_path,
+                    exported_at=exported_at,
                 )
+                artifact["sha256"] = hashlib.sha256(file_path.read_bytes()).hexdigest()
+                if archive:
+                    artifact["archived_locations"] = archive_manager.archive_file(
+                        file_path,
+                        archive_name=file_name,
+                    )
             artifacts.append(artifact)
+            if progress_callback is not None:
+                progress_callback(
+                    {
+                        "stage": "warehouse-export",
+                        "description": (
+                            f"Previewing warehouse datasets ({dataset})"
+                            if dry_run
+                            else f"Exporting warehouse datasets ({dataset})"
+                        ),
+                        "current": dataset,
+                        "completed": len(artifacts),
+                        "total": total_datasets,
+                    }
+                )
 
-        self.bot._log_action(
-            "data_warehouse_exported",
-            datasets=normalized_datasets,
-            export_format=normalized_format,
-            output_dir=str(export_root),
-            archive=archive,
-            artifacts=[
-                {
-                    "dataset": artifact["dataset"],
-                    "format": artifact["format"],
-                    "path": artifact["path"],
-                    "row_count": artifact["row_count"],
-                    "archived_locations": artifact.get("archived_locations", []),
-                }
-                for artifact in artifacts
-            ],
-        )
+        if not dry_run:
+            self.bot._log_action(
+                "data_warehouse_exported",
+                datasets=normalized_datasets,
+                export_format=normalized_format,
+                output_dir=str(export_root),
+                archive=archive,
+                artifacts=[
+                    {
+                        "dataset": artifact["dataset"],
+                        "format": artifact["format"],
+                        "path": artifact["path"],
+                        "row_count": artifact["row_count"],
+                        "archived_locations": artifact.get("archived_locations", []),
+                    }
+                    for artifact in artifacts
+                ],
+            )
         return {
             "datasets": normalized_datasets,
             "format": normalized_format,
             "output_dir": str(export_root),
             "archive": archive,
+            "dry_run": dry_run,
             "count": len(artifacts),
             "artifacts": artifacts,
             "exported_at": exported_at,
@@ -244,8 +285,7 @@ class WarehouseExportService:
         if dataset == "tasks":
             return self.bot.list_tasks()
         if dataset == "matches":
-            rows = self.bot.connection.execute(
-                """
+            rows = self.bot.connection.execute("""
                 SELECT
                     o.signature AS match_id,
                     o.signature AS opportunity_signature,
@@ -267,12 +307,10 @@ class WarehouseExportService:
                 LEFT JOIN applications a
                     ON a.opportunity_signature = o.signature
                 ORDER BY o.discovered_at DESC, o.signature DESC
-                """
-            ).fetchall()
+                """).fetchall()
             return [dict(row) for row in rows]
         if dataset == "results":
-            rows = self.bot.connection.execute(
-                """
+            rows = self.bot.connection.execute("""
                 SELECT
                     a.id AS application_id,
                     a.opportunity_signature,
@@ -305,8 +343,7 @@ class WarehouseExportService:
                     a.next_action,
                     a.submission_reference
                 ORDER BY a.submitted_at DESC, a.id DESC
-                """
-            ).fetchall()
+                """).fetchall()
             return [dict(row) for row in rows]
         raise ValueError(f"Unsupported export dataset {dataset!r}.")
 
@@ -330,7 +367,9 @@ class WarehouseExportService:
                 "count": len(rows),
                 "records": rows,
             }
-            file_path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
+            file_path.write_text(
+                json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8"
+            )
             return len(rows)
         flattened_rows = [_flatten_row(row) for row in rows]
         if export_format == "csv":

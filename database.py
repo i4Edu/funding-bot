@@ -32,8 +32,12 @@ class DatabasePoolConfig:
         return cls(
             pool_size=_read_int_env("FUNDING_BOT_DB_POOL_SIZE", 5, minimum=1),
             max_overflow=_read_int_env("FUNDING_BOT_DB_MAX_OVERFLOW", 10, minimum=0),
-            pool_timeout_seconds=_read_float_env("FUNDING_BOT_DB_POOL_TIMEOUT_SECONDS", 30.0, minimum=1.0),
-            pool_recycle_seconds=_read_float_env("FUNDING_BOT_DB_POOL_RECYCLE_SECONDS", 1800.0, minimum=0.0),
+            pool_timeout_seconds=_read_float_env(
+                "FUNDING_BOT_DB_POOL_TIMEOUT_SECONDS", 30.0, minimum=1.0
+            ),
+            pool_recycle_seconds=_read_float_env(
+                "FUNDING_BOT_DB_POOL_RECYCLE_SECONDS", 1800.0, minimum=0.0
+            ),
             pre_ping=_read_bool_env("FUNDING_BOT_DB_POOL_PRE_PING", True),
         )
 
@@ -165,7 +169,9 @@ class DatabaseQueryMonitor:
             self._metric_bucket(statement)["in_flight"] += 1
         return statement
 
-    def finish(self, statement: str, duration_seconds: float, error: BaseException | None = None) -> None:
+    def finish(
+        self, statement: str, duration_seconds: float, error: BaseException | None = None
+    ) -> None:
         status = _query_status(error)
         with self._lock:
             for metric in (self._summary, self._metric_bucket(statement)):

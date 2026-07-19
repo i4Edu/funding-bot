@@ -10,6 +10,7 @@ This guide describes the dashboard-focused Kubernetes manifests under `k8s/`.
 - `k8s/hpa.yaml` — horizontal pod autoscaling from CPU and memory usage
 - `k8s/vpa.yaml` — vertical recommendations applied when new pods start
 - supporting resources: `namespace.yaml`, `configmap.yaml`, `secret.yaml`, `persistentvolumeclaim.yaml`, `cronjob.yaml`
+- backup/restore procedures: [docs/BACKUP_RECOVERY.md](BACKUP_RECOVERY.md)
 
 ## Prerequisites
 
@@ -25,7 +26,7 @@ Update these placeholders before applying the manifests:
 - `k8s/deployment.yaml`: replace `ghcr.io/example/funding-bot:v1.0.0` with your published image tag or digest.
 - `k8s/ingress.yaml`: replace `funding-bot.example.com` and `funding-bot-tls`.
 - `k8s/secret.yaml`: replace dashboard and SMTP placeholders.
-- `k8s/configmap.yaml`: set queue mode and SMTP/runtime values for your environment.
+- `k8s/configmap.yaml`: set queue mode, SMTP/runtime values, and backup retention paths for your environment.
 - `k8s/persistentvolumeclaim.yaml`: tune storage class/size if your cluster requires it.
 
 ## Apply the manifests
@@ -47,11 +48,11 @@ kubectl apply -f k8s/cronjob.yaml
 
 ## Health checks
 
-The dashboard exposes `GET /health`, which is used for:
+The dashboard exposes both `GET /health` and `GET /ready`:
 
-- `startupProbe` to delay restarts until Flask is serving
-- `readinessProbe` to keep pods out of service until healthy
-- `livenessProbe` to restart unhealthy pods
+- `startupProbe` uses `/health` to delay restarts until Flask is serving
+- `readinessProbe` uses `/ready` to keep pods out of service until dependencies are ready
+- `livenessProbe` uses `/health` to restart unhealthy pods
 
 ## Autoscaling strategy
 
@@ -69,10 +70,17 @@ The dashboard exposes `GET /health`, which is used for:
 ## Verification
 
 ```bash
-kubectl get deploy,svc,ingress,hpa,vpa -n funding-bot
+kubectl get deploy,svc,ingress,hpa,vpa,cronjob -n funding-bot
 kubectl rollout status deployment/funding-bot -n funding-bot
 kubectl describe hpa funding-bot -n funding-bot
 kubectl get pods -n funding-bot
+```
+
+Backup-specific checks:
+
+```bash
+kubectl get cronjob funding-bot-nightly-backup funding-bot-wal-backup funding-bot-backup-verification -n funding-bot
+kubectl create job --from=cronjob/funding-bot-backup-verification backup-verify-manual -n funding-bot
 ```
 
 Check the dashboard health endpoint through the service or ingress after rollout:
@@ -80,4 +88,5 @@ Check the dashboard health endpoint through the service or ingress after rollout
 ```bash
 kubectl port-forward -n funding-bot svc/funding-bot 8080:80
 curl http://127.0.0.1:8080/health
+curl http://127.0.0.1:8080/ready
 ```

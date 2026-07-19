@@ -1,4 +1,4 @@
-import { defineConfig } from "playwright";
+import { defineConfig } from "playwright/test";
 
 const port = process.env.PLAYWRIGHT_BASE_PORT || "5010";
 const baseURL = process.env.PLAYWRIGHT_BASE_URL || `http://127.0.0.1:${port}`;

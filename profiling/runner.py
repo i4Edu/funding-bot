@@ -21,15 +21,9 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from funding_bot import FundingBot, GrantsPortalConnector  # noqa: E402
-from web.app import (
-    _dashboard_context,
-    _task_dashboard_context,
-)
+from web.app import _dashboard_context, _task_dashboard_context
 from web.app import app as flask_app  # noqa: E402
-from web.app import (
-    list_donors,
-    list_opportunities,
-)
+from web.app import list_donors, list_opportunities
 
 REPORT_TIMESTAMP = datetime(2026, 7, 19, 0, 0, tzinfo=timezone.utc)
 BASELINE_PATH = PROJECT_ROOT / "profiling" / "baselines.json"
@@ -86,7 +80,9 @@ def _slugify(name: str) -> str:
     return name.strip().lower().replace(" ", "-").replace("_", "-")
 
 
-def _build_deduplication_payload(*, unique_records: int = 1600, duplicates_per_record: int = 2) -> list[dict[str, Any]]:
+def _build_deduplication_payload(
+    *, unique_records: int = 1600, duplicates_per_record: int = 2
+) -> list[dict[str, Any]]:
     opportunities: list[dict[str, Any]] = []
     for index in range(unique_records):
         source = "Grants Portal" if index % 2 == 0 else "CSR Network"
@@ -538,7 +534,10 @@ def run_profile_suite(
         raise ValueError(f"Unknown operations: {', '.join(missing)}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    results = [benchmark_operation(registry[name], iterations=iterations, output_dir=output_dir) for name in operation_names]
+    results = [
+        benchmark_operation(registry[name], iterations=iterations, output_dir=output_dir)
+        for name in operation_names
+    ]
 
     if with_flamegraphs:
         for result in results:
