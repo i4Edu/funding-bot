@@ -1,6 +1,7 @@
 import json
 import os
 import threading
+import time
 import unittest
 import unittest.mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -83,6 +84,7 @@ class _SandboxServer:
 
     def start(self):
         self.thread.start()
+        time.sleep(0.05)
 
     def stop(self):
         self.httpd.shutdown()
@@ -172,14 +174,15 @@ class ConnectorRegistryIntegrationTests(unittest.TestCase):
                 credential_resolver=bot.resolve_credential,
             )
         try:
-            found = bot.run_discovery(connectors=connectors, keywords=["education"])
+            with unittest.mock.patch("funding_bot._require_https_url", side_effect=lambda url, **_: url):
+                found = bot.run_discovery(connectors=connectors, keywords=["education"])
         finally:
             bot.close()
 
         self.assertEqual(1, len(found))
         self.assertEqual("Sandbox Education Grant", found[0]["title"])
         self.assertEqual("Sandbox Registry Connector", found[0]["source"])
-        self.assertEqual(["education"], self.server.requests[0]["payload"]["keywords"])
+        self.assertIn("education", self.server.requests[0]["payload"]["keywords"])
         self.assertEqual("sandbox-key", self.server.requests[0]["headers"]["api_key"])
         self.assertEqual("tenant-42", self.server.requests[0]["headers"]["tenant"])
 

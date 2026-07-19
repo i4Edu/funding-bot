@@ -46,6 +46,13 @@ When `discover` or `test-connector` receives a keyword:
    expands the search set.
 3. Matching then runs against opportunity title, summary, tags, and category.
 
+## TLS and transport security
+
+- Remote connectors must use `https://` base URLs.
+- Insecure connector URLs are rejected before any outbound request is attempted.
+- The default connector HTTP client uses the Python `requests` library with
+  certificate validation enabled and a minimum TLS version of 1.2.
+
 Example:
 
 ```bash

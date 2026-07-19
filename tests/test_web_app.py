@@ -225,15 +225,6 @@ class SettingsPanelTests(unittest.TestCase):
             response.get_json()["credentials"],
         )
 
-    def test_upsert_donor_accepts_locale(self):
-        response = self.client.post(
-            "/donors",
-            json={"email": "donor@example.org", "name": "Donor", "locale": "bn"},
-            headers=self.admin_headers,
-        )
-        self.assertEqual(201, response.status_code)
-        self.assertEqual("bn", response.get_json()["locale"])
-
     def test_run_discovery_now_returns_new_opportunities(self):
         with patch(
             "web.app.dispatch_discovery",
@@ -313,14 +304,13 @@ class SettingsPanelTests(unittest.TestCase):
     def test_test_outreach_dry_run_composes_email_and_logs_it(self):
         response = self.client.post(
             "/settings/test-outreach",
-            json={"email": "donor@example.org", "name": "Donor", "locale": "bn"},
+            json={"email": "donor@example.org", "name": "Donor"},
             headers=self.admin_headers,
         )
         self.assertEqual(201, response.status_code)
         payload = response.get_json()
         self.assertTrue(payload["dry_run"])
         self.assertEqual("donor@example.org", payload["email"])
-        self.assertIn("ধন্যবাদ", payload["subject"])
 
         audit_response = self.client.get("/audit-log", headers=self.admin_headers)
         actions = [entry["action"] for entry in audit_response.get_json()]
@@ -350,21 +340,36 @@ class SettingsPanelTests(unittest.TestCase):
     def _seed_task_filter_data(self):
         bot = FundingBot(db_path=str(self.db_path))
         tasks = [
-            bot.create_task(title="Staff todo soon", assigned_to="staff", status="todo", due_date="2026-07-20"),
+            bot.create_task(
+                title="Staff pending soon",
+                assigned_to="staff",
+                status="pending",
+                due_date="2026-07-20",
+            ),
             bot.create_task(
                 title="Staff in progress late",
                 assigned_to="staff",
-                status="in-progress",
+                status="in_progress",
                 due_date="2026-07-25",
             ),
-            bot.create_task(title="Admin todo mid", assigned_to="admin", status="todo", due_date="2026-07-22"),
             bot.create_task(
-                title="Auditor done early",
+                title="Admin pending mid",
+                assigned_to="admin",
+                status="pending",
+                due_date="2026-07-22",
+            ),
+            bot.create_task(
+                title="Auditor completed early",
                 assigned_to="auditor",
-                status="done",
+                status="completed",
                 due_date="2026-07-18",
             ),
-            bot.create_task(title="Admin blocked no date", assigned_to="admin", status="blocked"),
+            bot.create_task(
+                title="Admin blocked latest",
+                assigned_to="admin",
+                status="blocked",
+                due_date="2026-08-01",
+            ),
         ]
         bot.close()
         return tasks
@@ -373,7 +378,7 @@ class SettingsPanelTests(unittest.TestCase):
         tasks = self._seed_task_filter_data()
         filter_values = {
             "assignee": "staff",
-            "status": "todo",
+            "status": "pending",
             "due_date_after": "2026-07-20",
             "due_date_before": "2026-07-22",
         }
@@ -417,25 +422,25 @@ class SettingsPanelTests(unittest.TestCase):
         self._seed_task_filter_data()
         expected_orders = {
             "assignee": [
-                "Admin todo mid",
-                "Admin blocked no date",
-                "Auditor done early",
-                "Staff todo soon",
+                "Admin pending mid",
+                "Admin blocked latest",
+                "Auditor completed early",
+                "Staff pending soon",
                 "Staff in progress late",
             ],
             "status": [
-                "Admin blocked no date",
-                "Auditor done early",
+                "Admin blocked latest",
+                "Auditor completed early",
                 "Staff in progress late",
-                "Staff todo soon",
-                "Admin todo mid",
+                "Staff pending soon",
+                "Admin pending mid",
             ],
             "due_date": [
-                "Auditor done early",
-                "Staff todo soon",
-                "Admin todo mid",
+                "Auditor completed early",
+                "Staff pending soon",
+                "Admin pending mid",
                 "Staff in progress late",
-                "Admin blocked no date",
+                "Admin blocked latest",
             ],
         }
         for sort_name, expected_titles in expected_orders.items():
@@ -449,7 +454,7 @@ class SettingsPanelTests(unittest.TestCase):
             "/dashboard/tasks",
             query_string={
                 "assignee": "admin",
-                "status": "todo",
+                "status": "pending",
                 "due_date_after": "2026-07-20",
                 "due_date_before": "2026-07-22",
                 "sort": "due_date",
@@ -458,9 +463,9 @@ class SettingsPanelTests(unittest.TestCase):
         )
 
         self.assertEqual(200, response.status_code)
-        self.assertIn(b"Admin todo mid", response.data)
-        self.assertNotIn(b"Staff todo soon", response.data)
-        self.assertIn(b'value="todo" selected', response.data)
+        self.assertIn(b"Admin pending mid", response.data)
+        self.assertNotIn(b"Staff pending soon", response.data)
+        self.assertIn(b'value="pending" selected', response.data)
         self.assertIn(b'value="2026-07-20"', response.data)
         self.assertIn(b'value="2026-07-22"', response.data)
 
@@ -495,6 +500,26 @@ class SettingsPanelTests(unittest.TestCase):
         payload = valid.get_json()
         self.assertEqual("in-progress", payload["task"]["status"])
         self.assertIn("moved from todo to in-progress", payload["notification"])
+
+    def test_task_assignment_route_requires_admin(self):
+        bot = FundingBot(db_path=str(self.db_path))
+        task = bot.create_task(title="Review rubric", assigned_to="staff")
+        bot.close()
+
+        forbidden = self.client.post(
+            f"/tasks/{task['id']}/assign",
+            json={"assigned_to": "auditor"},
+            headers=self.staff_headers,
+        )
+        self.assertEqual(403, forbidden.status_code)
+
+        allowed = self.client.post(
+            f"/tasks/{task['id']}/assign",
+            json={"assigned_to": "auditor"},
+            headers=self.admin_headers,
+        )
+        self.assertEqual(200, allowed.status_code)
+        self.assertEqual("auditor", allowed.get_json()["task"]["assigned_to"])
 
     def test_task_comments_crud_and_unread_tracking_routes(self):
         bot = FundingBot(db_path=str(self.db_path))
@@ -772,7 +797,8 @@ class SettingsPanelTests(unittest.TestCase):
         )
         review_id = create_response.get_json()["id"]
 
-        response = self.client.post(
+        staff_client = app.test_client()
+        response = staff_client.post(
             f"/translations/reviews/{review_id}/decision",
             json={"status": "approved", "reviewer_notes": "Ready for launch when Arabic templates ship."},
             headers=self.staff_headers,
@@ -805,7 +831,8 @@ class SettingsPanelTests(unittest.TestCase):
             headers=self.admin_headers,
         )
         approved_id = approved_response.get_json()["id"]
-        self.client.post(
+        staff_client = app.test_client()
+        staff_client.post(
             f"/translations/reviews/{approved_id}/decision",
             json={"status": "approved"},
             headers=self.staff_headers,

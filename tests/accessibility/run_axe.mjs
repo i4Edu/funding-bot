@@ -3,7 +3,7 @@ import AxeBuilder from "@axe-core/playwright";
 import { chromium } from "playwright";
 
 const baseUrl = process.env.ACCESSIBILITY_BASE_URL || "http://127.0.0.1:5001";
-const routes = ["/dashboard", "/dashboard/tasks", "/settings"];
+const routes = ["/dashboard", "/dashboard/tasks", "/settings", "/translations"];
 const colorSchemes = ["light", "dark"];
 const headers = {};
 

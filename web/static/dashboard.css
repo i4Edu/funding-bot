@@ -367,6 +367,7 @@ kbd {
 }
 
 .btn-outline-primary,
+.btn-outline-success,
 .btn-outline-secondary,
 .btn-outline-danger {
   background: transparent;
@@ -377,14 +378,31 @@ kbd {
   color: var(--primary-bg);
 }
 
+.btn-outline-success {
+  border-color: var(--success-bg);
+  color: #0f5132;
+}
+
 .btn-outline-secondary {
   border-color: var(--secondary-bg);
-  color: var(--secondary-bg);
+  color: #334155;
 }
 
 .btn-outline-danger {
   border-color: var(--danger-bg);
   color: var(--danger-bg);
+}
+
+@media (prefers-color-scheme: dark) {
+  .btn-outline-success {
+    border-color: #4ade80;
+    color: #dcfce7;
+  }
+
+  .btn-outline-secondary {
+    border-color: #94a3b8;
+    color: #e2e8f0;
+  }
 }
 
 .btn-sm,

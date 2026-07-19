@@ -550,6 +550,10 @@ class Task:
     created_at: str
     updated_at: str
     id: int | None = None
+    external_id: str | None = None
+    source: str = "manual"
+    assignee_email: str | None = None
+    assignee_name: str | None = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row | None) -> "Task | None":
@@ -1030,6 +1034,10 @@ class _BasePortalConnector:
         base_url: str | None = None,
         source_name: str | None = None,
         credentials: dict[str, Any] | None = None,
+        credential_name: str | None = None,
+        credential_vault: CredentialVault | OAuth2ClientCredentialsVault | None = None,
+        request_session: Any | None = None,
+        request_timeout: float = 30.0,
         transport: str = "demo",
         cache_ttl: float | None = None,
         page_size: int | None = None,
@@ -1050,6 +1058,10 @@ class _BasePortalConnector:
         )
         self.source_name = source_name or self.source_name
         self.credentials = dict(credentials or {})
+        self.credential_name = credential_name
+        self._credential_vault = self._wrap_credential_vault(credential_vault)
+        self._request_session = request_session
+        self.request_timeout = max(1.0, float(request_timeout))
         self.transport = transport
         self.page_size = self._resolve_page_size(page_size)
         cache_ttl = self._resolve_cache_ttl(cache_ttl)
@@ -1084,6 +1096,31 @@ class _BasePortalConnector:
             "state_transitions": 0,
             "rate_limited_requests": 0,
         }
+
+    @staticmethod
+    def _wrap_credential_vault(
+        credential_vault: CredentialVault | OAuth2ClientCredentialsVault | None,
+    ) -> OAuth2ClientCredentialsVault:
+        if isinstance(credential_vault, OAuth2ClientCredentialsVault):
+            return credential_vault
+        return OAuth2ClientCredentialsVault(credential_vault or EnvVarVault())
+
+    def _get_resolved_credentials(self) -> dict[str, Any]:
+        resolved: dict[str, Any] = {}
+        if self.credential_name:
+            resolved = dict(self._credential_vault.resolve_credentials(self.credential_name))
+        if self.credentials:
+            resolved.update(self.credentials)
+        return resolved
+
+    def _get_request_session(self) -> Any:
+        if self._request_session is None:
+            if requests is None:
+                raise FundingBotError(
+                    "The requests package is required for live connector HTTP transport."
+                )
+            self._request_session = requests.Session()
+        return self._request_session
 
     def _resolve_page_size(self, page_size: int | None) -> int:
         if page_size is None:
@@ -1172,6 +1209,10 @@ class _BasePortalConnector:
             if self._refresh_circuit_state() == "open":
                 self._metrics["short_circuits"] += 1
                 degraded = True
+                self._logger.warning(
+                    "Connector %s request short-circuited because the circuit breaker is open.",
+                    self.source_name,
+                )
                 return self._build_degraded_result(keyword_list, reason="circuit_open")
 
             use_remote = self.http_client is not None or self.transport == "http"
@@ -1184,6 +1225,7 @@ class _BasePortalConnector:
                         f"{self.source_name} rate limit exceeded; retry in {retry_after:.2f} seconds."
                     )
                     degraded = True
+                    self._logger.warning("%s", self._last_error)
                     return self._build_degraded_result(
                         keyword_list,
                         reason="rate_limit_exceeded",
@@ -1194,6 +1236,12 @@ class _BasePortalConnector:
                     result = self._fetch_remote_result(keyword_list)
                 except Exception as exc:
                     degraded = True
+                    self._logger.warning(
+                        "Connector %s remote fetch failed for keywords %s: %s",
+                        self.source_name,
+                        keyword_list,
+                        exc,
+                    )
                     return self._build_degraded_result(
                         keyword_list,
                         reason="connector_error",
@@ -1550,9 +1598,25 @@ class _BasePortalConnector:
         *,
         headers: dict[str, str] | None = None,
     ) -> Any:
-        return self._call_with_retry(
-            lambda: self._invoke_http_get_client(url, params, headers=headers)
-        )
+        def operation() -> Any:
+            try:
+                return self._invoke_http_get_client(url, params, headers=headers)
+            except urllib.error.HTTPError as exc:
+                if exc.code != 429:
+                    raise
+                retry_after_header = exc.headers.get("Retry-After", "1") if exc.headers else "1"
+                try:
+                    retry_after = float(retry_after_header)
+                except (TypeError, ValueError):
+                    retry_after = 1.0
+                self._metrics["rate_limited_requests"] += 1
+                self._last_rate_limit_retry_after = retry_after
+                self._sleep(max(retry_after, 0.0))
+                raise ConnectionError(
+                    f"Rate limit exceeded for connector {self.source_name!r}; retry after {retry_after} seconds."
+                ) from exc
+
+        return self._call_with_retry(operation)
 
     def detect_schema_version(self, payload: Any, declared_version: Any = None) -> int:
         if declared_version is not None:
@@ -1702,11 +1766,11 @@ class _BasePortalConnector:
 
 
 class GrantsPortalConnector(_BasePortalConnector):
-    """Stub connector for grants portals."""
+    """Connector for live Grants.gov opportunity search."""
 
     connector_slug = "grants-portal"
     source_name = "Grants Portal"
-    base_url = "https://grants.example.org/opportunities"
+    base_url = "https://api.grants.gov/v1/api/search2"
     keyword_category_mappings = {
         "education": {
             "keywords": ("learning", "school improvement", "innovation grant"),
@@ -1717,6 +1781,127 @@ class GrantsPortalConnector(_BasePortalConnector):
             "categories": ("Education",),
         },
     }
+
+    def __init__(
+        self,
+        http_client: Callable[..., Any] | None = None,
+        *,
+        base_url: str | None = None,
+        credentials: dict[str, Any] | None = None,
+        credential_name: str | None = None,
+        credential_vault: CredentialVault | OAuth2ClientCredentialsVault | None = None,
+        request_session: Any | None = None,
+        transport: str = "demo",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            http_client,
+            base_url=base_url or os.environ.get("GRANTS_GOV_API_BASE_URL") or self.base_url,
+            credentials=credentials,
+            credential_name=credential_name or "GRANTS_GOV_API_CREDENTIALS",
+            credential_vault=credential_vault,
+            request_session=request_session,
+            transport=transport,
+            **kwargs,
+        )
+
+    def _fetch_remote_result(self, keywords: list[str]) -> dict[str, Any]:
+        if self.http_client is not None:
+            return super()._fetch_remote_result(keywords)
+
+        credentials = self._get_resolved_credentials()
+        keyword_query = " ".join(_normalize_text_list(keywords))
+        payload: dict[str, Any] = {
+            "keyword": keyword_query,
+            "rows": self.page_size,
+            "oppStatuses": str(credentials.get("opp_statuses", "forecasted|posted")),
+            "startRecordNum": int(credentials.get("start_record_num", 0) or 0),
+        }
+        sort_by = str(credentials.get("sort_by", "")).strip()
+        if sort_by:
+            payload["sortBy"] = sort_by
+        agencies = _normalize_text_list(credentials.get("agencies"))
+        if agencies:
+            payload["agencies"] = "|".join(agencies)
+        funding_categories = _normalize_text_list(credentials.get("funding_categories"))
+        if funding_categories:
+            payload["fundingCategories"] = "|".join(funding_categories)
+
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "funding-bot/1.0",
+        }
+        authorization_header = str(credentials.get("authorization_header", "")).strip()
+        if authorization_header:
+            headers["Authorization"] = authorization_header
+        elif credentials.get("access_token") or credentials.get("bearer_token"):
+            headers["Authorization"] = (
+                f"******'access_token') or credentials.get('bearer_token')}"
+            )
+        api_key = str(credentials.get("api_key", "")).strip()
+        if api_key:
+            headers["X-API-Key"] = api_key
+
+        response = _perform_json_request(
+            "POST",
+            self.base_url,
+            session=self._get_request_session(),
+            headers=headers,
+            json_payload=payload,
+            timeout=self.request_timeout,
+        )
+        data = response.get("data", {}) if isinstance(response, dict) else {}
+        hits = data.get("oppHits", []) if isinstance(data, dict) else []
+        opportunities: list[dict[str, Any]] = []
+        for row in hits if isinstance(hits, list) else []:
+            if not isinstance(row, dict):
+                continue
+            donor_name = str(row.get("agency", "")).strip() or "Grants.gov"
+            title = str(row.get("title", "")).strip() or "Untitled opportunity"
+            opportunity_id = str(row.get("id", "")).strip()
+            opportunity_number = str(row.get("number", "")).strip()
+            open_date = str(row.get("openDate", "")).strip() or "TBD"
+            close_date = str(row.get("closeDate", "")).strip() or "TBD"
+            tags = _normalize_text_list(
+                [
+                    row.get("oppStatus"),
+                    row.get("agencyCode"),
+                    *(row.get("cfdaList", []) if isinstance(row.get("cfdaList"), list) else []),
+                ]
+            )
+            opportunities.append(
+                {
+                    "source": self.source_name,
+                    "donor_name": donor_name,
+                    "title": title,
+                    "portal_url": (
+                        f"https://www.grants.gov/search-results-detail/{opportunity_id}"
+                        if opportunity_id
+                        else "https://www.grants.gov/search-results-detail"
+                    ),
+                    "summary": (
+                        f"{donor_name} opportunity {opportunity_number or title} "
+                        f"opens {open_date} and closes {close_date}."
+                    ),
+                    "category": str(row.get("docType", "Government Grant")).strip()
+                    or "Government Grant",
+                    "tags": tags,
+                }
+            )
+
+        return {
+            "schema_version": self.result_schema_version,
+            "opportunities": opportunities,
+            "metadata": {
+                "connector_name": self.source_name,
+                "source_status": "remote",
+                "provider": "grants.gov",
+                "response_keys": sorted(str(key) for key in response) if isinstance(response, dict) else [],
+                "hit_count": int(data.get("hitCount", len(opportunities))) if isinstance(data, dict) else len(opportunities),
+                "auth_applied": "Authorization" in headers or "X-API-Key" in headers,
+            },
+        }
 
     def _demo_data(self) -> list[dict[str, Any]]:
         return [
@@ -1733,11 +1918,11 @@ class GrantsPortalConnector(_BasePortalConnector):
 
 
 class CSRNetworkConnector(_BasePortalConnector):
-    """Stub connector for CSR funding networks."""
+    """Connector for live CSR opportunity search."""
 
     connector_slug = "csr-network"
     source_name = "CSR Network"
-    base_url = "https://csr.example.org/opportunities"
+    base_url = "https://api.candid.org/rfp/v1/opportunity"
     keyword_category_mappings = {
         "csr": {
             "keywords": ("corporate social responsibility", "corporate giving"),
@@ -1748,6 +1933,120 @@ class CSRNetworkConnector(_BasePortalConnector):
             "categories": ("Corporate Partnerships",),
         },
     }
+
+    def __init__(
+        self,
+        http_client: Callable[..., Any] | None = None,
+        *,
+        base_url: str | None = None,
+        credentials: dict[str, Any] | None = None,
+        credential_name: str | None = None,
+        credential_vault: CredentialVault | OAuth2ClientCredentialsVault | None = None,
+        request_session: Any | None = None,
+        transport: str = "demo",
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            http_client,
+            base_url=base_url or os.environ.get("CSR_NETWORK_API_BASE_URL") or self.base_url,
+            credentials=credentials,
+            credential_name=credential_name or "CSR_NETWORK_API_CREDENTIALS",
+            credential_vault=credential_vault,
+            request_session=request_session,
+            transport=transport,
+            **kwargs,
+        )
+
+    def _fetch_remote_result(self, keywords: list[str]) -> dict[str, Any]:
+        if self.http_client is not None:
+            return super()._fetch_remote_result(keywords)
+
+        credentials = self._get_resolved_credentials()
+        subscription_key = str(
+            credentials.get("subscription_key")
+            or credentials.get("api_key")
+            or credentials.get("subscriptionKey")
+            or ""
+        ).strip()
+        if not subscription_key:
+            raise CredentialNotFoundError(
+                "CSR Network connector requires a Candid subscription_key/api_key credential."
+            )
+
+        params: dict[str, Any] = {"page_size": self.page_size}
+        keyword_query = " ".join(_normalize_text_list(keywords))
+        if keyword_query:
+            params["q"] = keyword_query
+
+        headers = {
+            "Accept": "application/json",
+            "Subscription-Key": subscription_key,
+            "User-Agent": "funding-bot/1.0",
+        }
+        response = _perform_json_request(
+            "GET",
+            self.base_url,
+            session=self._get_request_session(),
+            headers=headers,
+            params=params,
+            timeout=self.request_timeout,
+        )
+        if isinstance(response, dict):
+            raw_items = response.get("results")
+            if raw_items is None:
+                raw_items = response.get("items")
+            if raw_items is None:
+                raw_items = response.get("data", [])
+            response_keys = sorted(str(key) for key in response)
+        else:
+            raw_items = response
+            response_keys = []
+
+        opportunities: list[dict[str, Any]] = []
+        for row in raw_items if isinstance(raw_items, list) else []:
+            if not isinstance(row, dict):
+                continue
+            funder = row.get("funder", {})
+            funder_name = (
+                str(funder.get("name", "")).strip()
+                if isinstance(funder, dict)
+                else str(funder).strip()
+            )
+            program_areas = _normalize_text_list(row.get("program_areas"))
+            eligibility = _normalize_text_list(row.get("eligibility"))
+            row_tags = row.get("tags", [])
+            tags = _normalize_text_list(
+                [*program_areas, *eligibility, *(row_tags if isinstance(row_tags, list) else [row_tags])]
+            )
+            category = (
+                str(row.get("category", "")).strip()
+                or (program_areas[0] if program_areas else "Corporate Partnerships")
+            )
+            opportunities.append(
+                {
+                    "source": self.source_name,
+                    "donor_name": funder_name or "Candid Open Opportunities",
+                    "title": str(row.get("title", "")).strip() or "Untitled CSR opportunity",
+                    "portal_url": str(row.get("url", "")).strip()
+                    or (str(funder.get("url", "")).strip() if isinstance(funder, dict) else ""),
+                    "summary": str(row.get("summary", "")).strip()
+                    or str(row.get("description", "")).strip(),
+                    "category": category,
+                    "tags": tags,
+                }
+            )
+
+        return {
+            "schema_version": self.result_schema_version,
+            "opportunities": opportunities,
+            "metadata": {
+                "connector_name": self.source_name,
+                "source_status": "remote",
+                "provider": "candid-open-rfp",
+                "response_keys": response_keys,
+                "auth_applied": True,
+            },
+        }
 
     def _demo_data(self) -> list[dict[str, Any]]:
         return [
@@ -2508,8 +2807,8 @@ DEFAULT_OUTREACH_TEMPLATE_NAME = "default"
 OUTREACH_TEMPLATE_CATALOG_DIR = Path(__file__).resolve().parent / "i18n" / "outreach_templates"
 
 
-def _load_localized_outreach_templates() -> dict[str, dict[str, dict[str, str]]]:
-    catalog: dict[str, dict[str, dict[str, str]]] = {}
+def _load_localized_outreach_templates() -> dict[str, dict[str, dict[str, Any]]]:
+    catalog: dict[str, dict[str, dict[str, Any]]] = {}
     for locale_name in SUPPORTED_OUTREACH_LOCALES:
         catalog_path = OUTREACH_TEMPLATE_CATALOG_DIR / f"{locale_name}.json"
         with catalog_path.open("r", encoding="utf-8") as handle:
@@ -2528,10 +2827,23 @@ def _load_localized_outreach_templates() -> dict[str, dict[str, dict[str, str]]]
                 raise ValueError(
                     f"Outreach template {template_name!r} in {catalog_path} must define string subject and body."
                 )
-            catalog.setdefault(template_name, {})[locale_name] = {
-                "subject": subject,
-                "body": body,
-            }
+            segments = template_body.get("segments", {})
+            if not isinstance(segments, dict):
+                raise ValueError(
+                    f"Outreach template {template_name!r} in {catalog_path} must define 'segments' as an object."
+                )
+            for segment_name, segment_template in segments.items():
+                if not isinstance(segment_template, dict):
+                    raise ValueError(
+                        f"Outreach template {template_name!r} segment {segment_name!r} in {catalog_path} must be an object."
+                    )
+                segment_subject = segment_template.get("subject", "")
+                segment_body = segment_template.get("body", "")
+                if not isinstance(segment_subject, str) or not isinstance(segment_body, str):
+                    raise ValueError(
+                        f"Outreach template {template_name!r} segment {segment_name!r} in {catalog_path} must define string subject and body."
+                    )
+            catalog.setdefault(template_name, {})[locale_name] = dict(template_body)
     return catalog
 
 
@@ -2548,7 +2860,7 @@ def _validate_locale(locale: str | None) -> str:
 
 
 def _validate_localized_outreach_templates(
-    catalog: dict[str, dict[str, dict[str, str]]],
+    catalog: dict[str, dict[str, dict[str, Any]]],
 ) -> None:
     for template_name, localized_templates in catalog.items():
         missing_locales = sorted(set(SUPPORTED_OUTREACH_LOCALES) - set(localized_templates))
@@ -2563,6 +2875,45 @@ def _validate_localized_outreach_templates(
             if not subject or not body:
                 raise ValueError(
                     f"Outreach template {template_name!r} for locale {locale_name!r} must define non-empty subject and body."
+                )
+            segments = localized_template.get("segments", {})
+            if not isinstance(segments, dict):
+                raise ValueError(
+                    f"Outreach template {template_name!r} for locale {locale_name!r} must define 'segments' as an object."
+                )
+            for segment_name, segment_template in segments.items():
+                segment_subject = ""
+                segment_body = ""
+                if isinstance(segment_template, dict):
+                    segment_subject = str(segment_template.get("subject", "")).strip()
+                    segment_body = str(segment_template.get("body", "")).strip()
+                if not segment_subject or not segment_body:
+                    raise ValueError(
+                        f"Outreach template {template_name!r} segment {segment_name!r} for locale {locale_name!r} must define non-empty subject and body."
+                    )
+            default_segments = {
+                segment_name
+                for segment_name in localized_templates[DEFAULT_OUTREACH_LOCALE].get("segments", {})
+            }
+            locale_segments = {segment_name for segment_name in segments}
+            if locale_segments != default_segments:
+                missing_segments = sorted(default_segments - locale_segments)
+                extra_segments = sorted(locale_segments - default_segments)
+                problems: list[str] = []
+                if missing_segments:
+                    problems.append(f"missing segments {missing_segments}")
+                if extra_segments:
+                    problems.append(f"unexpected segments {extra_segments}")
+                raise ValueError(
+                    f"Outreach template {template_name!r} for locale {locale_name!r} does not match segment coverage: "
+                    + ", ".join(problems)
+                    + "."
+                )
+            default_notice = localized_templates[DEFAULT_OUTREACH_LOCALE].get("opt_out_notice")
+            locale_notice = localized_template.get("opt_out_notice")
+            if isinstance(default_notice, str) and not str(locale_notice or "").strip():
+                raise ValueError(
+                    f"Outreach template {template_name!r} for locale {locale_name!r} must define opt_out_notice."
                 )
 
 
@@ -3131,7 +3482,7 @@ class FundingBot:
         self._ensure_column(
             "donors",
             "data_classification",
-            "TEXT NOT NULL DEFAULT 'confidential'",
+            "TEXT NOT NULL DEFAULT 'secret'",
         )
         self._ensure_column(
             "donors",
@@ -3884,6 +4235,15 @@ class FundingBot:
         return templates
 
     @classmethod
+    def validate_outreach_template_catalogs(cls) -> None:
+        _validate_localized_outreach_templates(_load_localized_outreach_templates())
+
+    @classmethod
+    def list_catalog_outreach_templates(cls) -> tuple[str, ...]:
+        cls.validate_outreach_template_catalogs()
+        return tuple(sorted(cls._load_outreach_template_catalog(cls.DEFAULT_TEMPLATE_LOCALE).keys()))
+
+    @classmethod
     def _resolve_catalog_template(
         cls,
         template_name: str,
@@ -3891,6 +4251,7 @@ class FundingBot:
         segment: str,
         locale: str,
     ) -> tuple[str, str] | None:
+        cls.validate_outreach_template_catalogs()
         locales_to_try = [cls._validate_locale(locale)]
         if cls.DEFAULT_TEMPLATE_LOCALE not in locales_to_try:
             locales_to_try.append(cls.DEFAULT_TEMPLATE_LOCALE)
@@ -4798,16 +5159,16 @@ class FundingBot:
         )
         final_field_classifications = self._build_field_classifications(
             defaults=default_field_classifications,
-            fields=set(default_field_classifications),
+            fields=set(value) | set(field_classifications or {}),
             overrides=field_classifications
             if field_classifications is not None
             else (
                 self._decode_json_blob(
                     existing["field_classifications_json"],
-                    default=default_field_classifications,
+                    default={},
                 )
                 if existing
-                else default_field_classifications
+                else {}
             ),
         )
         self._assert_field_classifications_within_record(
@@ -5770,6 +6131,14 @@ class FundingBot:
                     )
                     metadata = dict(result.get("metadata", {}))
                     source_status = str(metadata.get("source_status", "remote"))
+                    if source_status == "degraded":
+                        raise RuntimeError(
+                            str(
+                                metadata.get("last_error")
+                                or metadata.get("degraded_reason")
+                                or f"{connector_name} is degraded"
+                            )
+                        )
                 else:
                     opportunities = [dict(item) for item in connector.fetch_opportunities(keyword_list)]
                     schema_version = int(getattr(connector, "result_schema_version", _CONNECTOR_RESULT_SCHEMA_VERSION))
@@ -6051,7 +6420,9 @@ class FundingBot:
         )
         normalized_source = str(source or "manual").strip() or "manual"
         normalized_assignee_email = (
-            _validate_email(assignee_email) if assignee_email and str(assignee_email).strip() else None
+            _validate_email(str(assignee_email))
+            if assignee_email is not None and str(assignee_email).strip()
+            else None
         )
         normalized_assignee_name = (
             str(assignee_name).strip() if assignee_name and str(assignee_name).strip() else None
@@ -6342,7 +6713,9 @@ class FundingBot:
         if not normalized_assigned_to:
             raise ValueError("Task assignee is required.")
         normalized_assignee_email = (
-            _validate_email(assignee_email) if assignee_email and str(assignee_email).strip() else None
+            _validate_email(str(assignee_email))
+            if assignee_email is not None and str(assignee_email).strip()
+            else None
         )
         normalized_assignee_name = (
             str(assignee_name).strip() if assignee_name and str(assignee_name).strip() else None
@@ -6368,8 +6741,9 @@ class FundingBot:
                 commit=False,
                 task_id=task_id,
                 title=task["title"],
-                previous_assignee=task["assignee"],
-                assignee=normalized_assigned_to,
+                previous_assignee=task["assigned_to"],
+                previous_assigned_to=task["assigned_to"],
+                assigned_to=normalized_assigned_to,
                 previous_assignee_email=task.get("assignee_email"),
                 assignee_email=normalized_assignee_email,
                 changed_by=str(changed_by or "").strip().lower() or None,
@@ -6382,6 +6756,22 @@ class FundingBot:
             happened_at=changed_at,
         )
         return updated_task
+
+    def assign_task(
+        self,
+        task_id: int,
+        *,
+        assigned_to: str,
+        changed_by: str | None = None,
+    ) -> dict[str, Any]:
+        existing = self.get_task(task_id)
+        return self.update_task_assignment(
+            task_id,
+            assigned_to=assigned_to,
+            assignee_email=existing.get("assignee_email"),
+            assignee_name=existing.get("assignee_name"),
+            changed_by=changed_by,
+        )
 
     def create_task_comment(
         self,
@@ -6559,13 +6949,13 @@ class FundingBot:
         if existing is None:
             if payload.get("title") is None:
                 raise ValueError("Field 'title' is required for new tasks.")
-            if payload.get("assigned_to") is None:
-                raise ValueError("Field 'assigned_to' is required for new tasks.")
+            if payload.get("assigned_to") is None and payload.get("assignee") is None:
+                raise ValueError("Field 'assignee' is required for new tasks.")
             return self.create_task(
                 title=str(payload.get("title", "")),
-                assigned_to=str(payload.get("assigned_to", "")),
+                assigned_to=str(payload.get("assigned_to", payload.get("assignee", ""))),
                 description=str(payload.get("description", "")),
-                status=str(payload.get("status", "todo")),
+                status=str(payload.get("status", "pending")),
                 created_at=None,
                 due_date=payload.get("due_date"),
                 external_id=external_id,
@@ -6574,7 +6964,9 @@ class FundingBot:
             )
 
         updated_title = str(payload.get("title", existing["title"])).strip()
-        updated_assigned_to = str(payload.get("assigned_to", existing["assigned_to"])).strip().lower()
+        updated_assigned_to = str(
+            payload.get("assigned_to", payload.get("assignee", existing["assignee"]))
+        ).strip().lower()
         updated_description = str(payload.get("description", existing["description"])).strip()
         updated_status = self._normalize_task_status(str(payload.get("status", existing["status"])))
         updated_due_date = (
@@ -6596,7 +6988,7 @@ class FundingBot:
                 ("external_id", existing["external_id"], updated_external_id),
                 ("title", existing["title"], updated_title),
                 ("description", existing["description"], updated_description),
-                ("assigned_to", existing["assigned_to"], updated_assigned_to),
+                ("assignee", existing["assignee"], updated_assigned_to),
                 ("status", existing["status"], updated_status),
                 ("due_date", existing["due_date"], updated_due_date),
                 ("source", existing["source"], updated_source),
@@ -6606,7 +6998,7 @@ class FundingBot:
         self.connection.execute(
             """
             UPDATE tasks
-            SET external_id = ?, title = ?, description = ?, assigned_to = ?, status = ?,
+            SET external_id = ?, title = ?, description = ?, assignee = ?, status = ?,
                 due_date = ?, source = ?, updated_at = ?
             WHERE id = ?
             """,
@@ -6631,7 +7023,7 @@ class FundingBot:
                 commit=commit,
                 task_id=refreshed["id"],
                 title=refreshed["title"],
-                assigned_to=refreshed["assigned_to"],
+                assignee=refreshed["assignee"],
                 external_id=refreshed["external_id"],
                 changed_fields=changed_fields,
                 status=refreshed["status"],
@@ -6640,14 +7032,14 @@ class FundingBot:
             )
         elif commit:
             self.connection.commit()
-        if existing["assigned_to"] != refreshed["assigned_to"]:
+        if existing["assignee"] != refreshed["assignee"]:
             self._log_action(
                 "task_assignment_changed",
                 commit=commit,
                 task_id=refreshed["id"],
                 title=refreshed["title"],
-                previous_assignee=existing["assigned_to"],
-                assigned_to=refreshed["assigned_to"],
+                previous_assignee=existing["assignee"],
+                assignee=refreshed["assignee"],
                 external_id=refreshed["external_id"],
             )
         return refreshed
@@ -6972,12 +7364,23 @@ class FundingBot:
         locale: str | None = None,
     ) -> dict[str, Any]:
         donor_email = _validate_email(donor_email)
+        requested_locale = self._validate_locale(locale) if locale is not None else None
         donor = self.connection.execute(
             "SELECT * FROM donors WHERE email = ?",
             (donor_email,),
         ).fetchone()
         if donor is None:
-            self.upsert_donor(email=donor_email, name=donor_name, locale=locale)
+            self.upsert_donor(email=donor_email, name=donor_name, locale=requested_locale)
+            donor = self.connection.execute(
+                "SELECT * FROM donors WHERE email = ?",
+                (donor_email,),
+            ).fetchone()
+        elif requested_locale is not None and donor["locale"] != requested_locale:
+            self.connection.execute(
+                "UPDATE donors SET locale = ? WHERE email = ?",
+                (requested_locale, donor_email),
+            )
+            self.connection.commit()
             donor = self.connection.execute(
                 "SELECT * FROM donors WHERE email = ?",
                 (donor_email,),
@@ -7004,7 +7407,7 @@ class FundingBot:
                     f"{donor_email} was contacted less than seven days ago."
                 )
 
-        donor_locale = self._validate_locale(locale or donor["locale"])
+        donor_locale = self._validate_locale(requested_locale or donor["locale"])
         profile = self.load_organization_profile()
         merged_context = {
             "donor_name": donor_name,
@@ -7067,8 +7470,19 @@ class FundingBot:
             (sent_iso, donor_email),
         )
         self.connection.commit()
-        self._log_action("outreach_sent", donor_email=donor_email, subject=subject)
-        return {"email": donor_email, "subject": subject, "body": body, "sent_at": sent_iso}
+        self._log_action(
+            "outreach_sent",
+            donor_email=donor_email,
+            subject=subject,
+            locale=donor_locale,
+        )
+        return {
+            "email": donor_email,
+            "subject": subject,
+            "body": body,
+            "sent_at": sent_iso,
+            "locale": donor_locale,
+        }
 
     def send_outreach_task(
         self,
@@ -7142,6 +7556,7 @@ class FundingBot:
         context: dict[str, Any] | None = None,
         sender: Any | None = None,
         sent_at: datetime | None = None,
+        locale: str | None = None,
     ) -> dict[str, Any]:
         """Send outreach using a stored template."""
         donor = self.connection.execute(
@@ -7149,7 +7564,7 @@ class FundingBot:
             (donor_email,),
         ).fetchone()
         donor_segment = donor["segment"] if donor else "unknown"
-        donor_locale = self._validate_locale(donor["locale"] if donor else None)
+        donor_locale = self._validate_locale(locale or (donor["locale"] if donor else None))
         row = self.connection.execute(
             """
             SELECT subject_template, body_template, segment
@@ -7172,7 +7587,7 @@ class FundingBot:
         else:
             subject_template = row["subject_template"]
             body_template = row["body_template"]
-        return self.send_outreach(
+        result = self.send_outreach(
             donor_email=donor_email,
             donor_name=donor_name,
             subject_template=subject_template,
@@ -7182,6 +7597,8 @@ class FundingBot:
             sent_at=sent_at,
             locale=donor_locale,
         )
+        result["template_name"] = template_name
+        return result
 
     def record_outreach_event(self, communication_id: int, event_type: str) -> None:
         """Store an outreach engagement event."""

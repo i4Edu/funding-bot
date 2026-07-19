@@ -131,8 +131,43 @@ def settings_page() -> str:
 @app.get("/translations", endpoint="translation_review_dashboard")
 def translation_review_dashboard() -> str:
     return render_template(
-        "base.html",
+        "translations.html",
         current_role="admin",
+        ui_locale={"code": "ar", "direction": "rtl", "is_rtl": True},
+        review_counts={"pending": 1, "approved": 1, "rejected": 1},
+        selected_status="",
+        selected_review_locale="ar",
+        supported_locales=[
+            {
+                "code": "en",
+                "direction": "ltr",
+                "display_name": "English",
+                "native_name": "English",
+                "is_rtl": False,
+            },
+            {
+                "code": "ar",
+                "direction": "rtl",
+                "display_name": "Arabic",
+                "native_name": "العربية",
+                "is_rtl": True,
+            },
+        ],
+        reviews=[
+            {
+                "id": 1,
+                "locale": "ar",
+                "locale_metadata": {"display_name": "Arabic"},
+                "translation_key": "outreach.default.subject",
+                "created_at": "2026-07-18T10:00:00Z",
+                "source_text": "Thank you for supporting our mission.",
+                "translated_text": "شكرًا لدعم رسالتنا.",
+                "submitter_notes": "Use formal tone.",
+                "status": "pending",
+                "reviewed_by_role": None,
+                "reviewed_at": None,
+            }
+        ],
     )
 
 

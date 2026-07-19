@@ -3,9 +3,9 @@
 {% block title %}Task Board{% endblock %}
 
 {% block nav_links %}
-        <a class="nav-link text-white" href="{{ url_for('dashboard') }}" aria-label="Open dashboard page">Dashboard</a>
-        <a class="nav-link text-white" href="{{ url_for('settings_page') }}" aria-label="Open settings page">Settings</a>
-        <a class="nav-link text-white" href="{{ url_for('translation_review_dashboard') }}" aria-label="Open translation review dashboard">Translations</a>
+        <a class="nav-link app-nav-link" href="{{ url_for('dashboard') }}" aria-label="Open dashboard page">Dashboard</a>
+        <a class="nav-link app-nav-link" href="{{ url_for('settings_page') }}" aria-label="Open settings page">Settings</a>
+        <a class="nav-link app-nav-link" href="{{ url_for('translation_review_dashboard') }}" aria-label="Open translation review dashboard">Translations</a>
 {% endblock %}
 
 {% block head %}
@@ -16,17 +16,17 @@
 
       .kanban-dropzone {
         min-height: 18rem;
-        border: 2px dashed rgba(25, 135, 84, 0.15);
+        border: 2px dashed var(--border-color);
         border-radius: 0.75rem;
-        background: rgba(255, 255, 255, 0.75);
+        background: var(--surface-alt);
         padding: 0.75rem;
       }
 
       .kanban-dropzone.drag-over,
       .kanban-dropzone:focus-visible {
-        border-color: #198754;
-        background: rgba(25, 135, 84, 0.08);
-        outline: 3px solid rgba(25, 135, 84, 0.25);
+        border-color: var(--success-bg);
+        background: color-mix(in srgb, var(--success-bg) 10%, var(--surface-alt));
+        outline: 3px solid color-mix(in srgb, var(--success-bg) 25%, transparent);
         outline-offset: 2px;
       }
 
@@ -61,7 +61,7 @@
 
       <div id="board-message" class="alert d-none" role="status" aria-live="polite" aria-atomic="true" tabindex="-1"></div>
 
-      <div class="row g-4 mb-4" role="region" aria-label="Task metrics">
+      <div class="row g-4 mb-4" aria-label="Task metrics">
         {% for status, total in task_counts.items() %}
         <div class="col-md-6 col-xl-3">
           <div class="card border-0 shadow-sm h-100" role="group" aria-label="{{ status.replace('-', ' ').title() }} task count" tabindex="0">
@@ -146,7 +146,7 @@
                   data-can-move="{{ 'true' if task.can_move else 'false' }}"
                   draggable="{{ 'true' if task.can_move else 'false' }}"
                   tabindex="0"
-                  role="button"
+                  role="listitem"
                   aria-label="{{ task.title }}. Status {{ task.status.replace('-', ' ') }}. Assigned to {{ task.assigned_to }}. Due {{ task.due_date or 'none' }}."
                   aria-keyshortcuts="Enter Space ArrowLeft ArrowRight"
                 >
@@ -166,7 +166,7 @@
                   </div>
                 </article>
                 {% else %}
-                <p class="text-muted small mb-0">No {{ status_name.replace('-', ' ') }} tasks.</p>
+                <p role="listitem" class="text-muted small mb-0">No {{ status_name.replace('-', ' ') }} tasks.</p>
                 {% endfor %}
               </div>
             </div>

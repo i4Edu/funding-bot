@@ -28,6 +28,17 @@ from funding_bot import (
 )
 
 
+TEST_ARTIFACTS_DIR = Path(".test-artifacts")
+
+
+def _reset_test_dir(name: str) -> Path:
+    path = TEST_ARTIFACTS_DIR / name
+    if path.exists():
+        rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 class FakeBrowserClient:
     def __init__(self, failures_before_success=0):
         self.failures_before_success = failures_before_success
@@ -129,7 +140,7 @@ class FundingBotTests(unittest.TestCase):
             credential_alias="unicef-portal",
             browser_client=FakeBrowserClient(failures_before_success=1),
             form_data={"project_name": "Literacy Lab"},
-            attachments=["/tmp/proposal.pdf"],
+            attachments=[".test-artifacts/proposal.pdf"],
             max_retries=3,
         )
         self.assertEqual("submitted", result["status"])
@@ -485,7 +496,7 @@ class FundingBotTests(unittest.TestCase):
         self.assertIn("UNICEF CSR Grant", summary["body"])
         self.assertIn("Pending Applications: 1", summary["body"])
 
-    def _task_filter_fixtures(self):
+    def _legacy_task_filter_fixtures(self):
         return [
             self.bot.create_task(
                 title="Staff todo soon",
@@ -518,8 +529,8 @@ class FundingBotTests(unittest.TestCase):
             ),
         ]
 
-    def test_list_tasks_supports_all_filter_combinations(self):
-        tasks = self._task_filter_fixtures()
+    def _legacy_test_list_tasks_supports_all_filter_combinations(self):
+        tasks = self._legacy_task_filter_fixtures()
         filter_values = {
             "assigned_to": "staff",
             "status": "todo",
@@ -566,8 +577,8 @@ class FundingBotTests(unittest.TestCase):
                     msg=f"Unexpected results for filters {active_filters!r}",
                 )
 
-    def test_list_tasks_supports_sorting_by_assignee_status_and_due_date(self):
-        self._task_filter_fixtures()
+    def _legacy_test_list_tasks_supports_sorting_by_assignee_status_and_due_date(self):
+        self._legacy_task_filter_fixtures()
         expected_orders = {
             "assignee": [
                 "Admin todo mid",
@@ -711,6 +722,121 @@ class DataResidencyAndPrivacyPolicyTests(unittest.TestCase):
             self.assertEqual(3, len(versions))
         finally:
             bot.close()
+
+
+class TaskFilteringFundingBotTests(unittest.TestCase):
+    def setUp(self):
+        self.bot = FundingBot()
+
+    def tearDown(self):
+        self.bot.close()
+
+    def _task_filter_fixtures(self):
+        return [
+            self.bot.create_task(
+                title="Staff pending soon",
+                assigned_to="staff",
+                status="pending",
+                due_date="2026-07-20",
+            ),
+            self.bot.create_task(
+                title="Staff in progress late",
+                assigned_to="staff",
+                status="in_progress",
+                due_date="2026-07-25",
+            ),
+            self.bot.create_task(
+                title="Admin pending mid",
+                assigned_to="admin",
+                status="pending",
+                due_date="2026-07-22",
+            ),
+            self.bot.create_task(
+                title="Auditor completed early",
+                assigned_to="auditor",
+                status="completed",
+                due_date="2026-07-18",
+            ),
+            self.bot.create_task(
+                title="Admin blocked no date",
+                assigned_to="admin",
+                status="blocked",
+                due_date="2026-08-01",
+            ),
+        ]
+
+    def test_list_tasks_supports_all_filter_combinations(self):
+        tasks = self._task_filter_fixtures()
+        filter_values = {
+            "assigned_to": "staff",
+            "status": "pending",
+            "due_date_after": "2026-07-20",
+            "due_date_before": "2026-07-22",
+        }
+
+        def matches(task, active_filters):
+            due_date = task["due_date"][:10] if task["due_date"] else None
+            return all(
+                (
+                    task["assigned_to"] == filter_values["assigned_to"]
+                    if name == "assigned_to"
+                    else task["status"] == filter_values["status"]
+                    if name == "status"
+                    else due_date is not None and due_date >= filter_values["due_date_after"]
+                    if name == "due_date_after"
+                    else due_date is not None and due_date <= filter_values["due_date_before"]
+                )
+                for name in active_filters
+            )
+
+        for size in range(1, len(filter_values) + 1):
+            for active_filters in itertools.combinations(filter_values, size):
+                expected_titles = [task["title"] for task in tasks if matches(task, active_filters)]
+                rows = self.bot.list_tasks(
+                    assigned_to=filter_values["assigned_to"] if "assigned_to" in active_filters else None,
+                    status=filter_values["status"] if "status" in active_filters else None,
+                    due_date_after=(
+                        filter_values["due_date_after"] if "due_date_after" in active_filters else None
+                    ),
+                    due_date_before=(
+                        filter_values["due_date_before"] if "due_date_before" in active_filters else None
+                    ),
+                    sort="due_date",
+                )
+                self.assertEqual(
+                    expected_titles,
+                    [task["title"] for task in rows],
+                    msg=f"Unexpected results for filters {active_filters!r}",
+                )
+
+    def test_list_tasks_supports_sorting_by_assignee_status_and_due_date(self):
+        self._task_filter_fixtures()
+        expected_orders = {
+            "assignee": [
+                "Admin pending mid",
+                "Admin blocked no date",
+                "Auditor completed early",
+                "Staff pending soon",
+                "Staff in progress late",
+            ],
+            "status": [
+                "Admin blocked no date",
+                "Auditor completed early",
+                "Staff in progress late",
+                "Staff pending soon",
+                "Admin pending mid",
+            ],
+            "due_date": [
+                "Auditor completed early",
+                "Staff pending soon",
+                "Admin pending mid",
+                "Staff in progress late",
+                "Admin blocked no date",
+            ],
+        }
+        for sort_name, expected_titles in expected_orders.items():
+            rows = self.bot.list_tasks(sort=sort_name)
+            self.assertEqual(expected_titles, [task["title"] for task in rows])
 
 
 class SMTPEmailSenderTests(unittest.TestCase):
@@ -884,10 +1010,12 @@ from funding_bot import (
     CSRNetworkConnector,
     CrowdfundingConnector,
     FileVault,
+    FoundationDirectoryConnector,
     GlobalGivingConnector,
     GrantsPortalConnector,
     KickstarterForGoodConnector,
     NGODirectoryConnector,
+    OAuth2ClientCredentialsVault,
     TokenBucketRateLimiter,
     _resolve_cli_log_level,
     create_connector,
@@ -920,6 +1048,77 @@ class PortalConnectorTests(unittest.TestCase):
         self.assertEqual("Community Literacy Matching Grant", ngo_rows[0]["title"])
 
         self.assertEqual([], grants.fetch_opportunities(["health"]))
+
+    def test_connector_metrics_track_requests_errors_and_latency(self):
+        FundingBot.reset_connector_metrics()
+        GrantsPortalConnector().fetch_opportunities(["education"])
+
+        def failing_http_client(_url, _params, _credentials=None):
+            raise RuntimeError("connector unavailable")
+
+        degraded = GrantsPortalConnector(http_client=failing_http_client, transport="http")
+        result = degraded.fetch_result(["education"])
+
+        self.assertEqual("degraded", result["metadata"]["source_status"])
+        metrics = {
+            row["connector_name"]: row
+            for row in FundingBot.connector_metrics_snapshot()
+        }
+        grants_metrics = metrics["Grants Portal"]
+        self.assertEqual(2, grants_metrics["requests_total"])
+        self.assertEqual(1, grants_metrics["errors_total"])
+        self.assertEqual(2, grants_metrics["latency_seconds_count"])
+        self.assertGreaterEqual(grants_metrics["latency_seconds_sum"], 0.0)
+
+    def test_oauth2_connector_credentials_are_resolved_for_remote_calls(self):
+        FundingBot.reset_connector_metrics()
+        calls = []
+
+        def fake_token_http_client(url, form_data, headers):
+            calls.append({"url": url, "form_data": dict(form_data), "headers": dict(headers)})
+            return {"access_token": "token-123", "token_type": "Bearer", "expires_in": 3600}
+
+        vault = OAuth2ClientCredentialsVault(
+            FileVault("."),
+            token_http_client=fake_token_http_client,
+            refresh_skew_seconds=60,
+        )
+        with unittest.mock.patch.object(
+            vault,
+            "get_secret",
+            return_value=json.dumps(
+                {
+                    "auth_type": "oauth2_client_credentials",
+                    "oauth2": {
+                        "token_url": "https://auth.example.org/oauth/token",
+                        "client_id": "connector-client",
+                        "client_secret": "connector-secret",
+                        "scope": "grants.read",
+                    },
+                    "credentials": {"tenant": "ngo-team"},
+                }
+            ),
+        ):
+            credentials = vault.resolve_credentials("CONNECTOR_SECRET")
+
+        seen_credentials = []
+
+        def fake_http_client(_url, _params, connector_credentials=None):
+            seen_credentials.append(dict(connector_credentials or {}))
+            return {"opportunities": []}
+
+        GrantsPortalConnector(
+            http_client=fake_http_client,
+            transport="http",
+            credentials=credentials,
+        ).fetch_opportunities(["education"])
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual("client_credentials", calls[0]["form_data"]["grant_type"])
+        self.assertEqual("Basic Y29ubmVjdG9yLWNsaWVudDpjb25uZWN0b3Itc2VjcmV0", calls[0]["headers"]["Authorization"])
+        self.assertEqual("token-123", seen_credentials[0]["access_token"])
+        self.assertEqual("******", seen_credentials[0]["authorization_header"])
+        self.assertEqual("ngo-team", seen_credentials[0]["tenant"])
 
     def test_remote_connectors_paginate_until_all_results_are_collected(self):
         calls = []
@@ -1641,6 +1840,84 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
         self.assertIn("Support i4Edu", english_result["subject"])
         self.assertIn("Expand access to equitable education.", english_result["body"])
 
+    def test_secret_donor_fields_are_encrypted_and_tagged(self):
+        self.bot.upsert_donor(
+            email="sensitive@example.org",
+            name="Sensitive Donor",
+            preferences={"notes": "deeply-sensitive-preference"},
+        )
+
+        row = self.bot.connection.execute(
+            """
+            SELECT preferences_json, data_classification, field_classifications_json
+            FROM donors
+            WHERE email = ?
+            """,
+            ("sensitive@example.org",),
+        ).fetchone()
+        donor = self.bot.get_donor("sensitive@example.org")
+
+        self.assertNotIn("deeply-sensitive-preference", row["preferences_json"])
+        self.assertEqual("secret", row["data_classification"])
+        self.assertEqual("deeply-sensitive-preference", donor["preferences"]["notes"])
+        self.assertEqual("secret", donor["field_classifications"]["preferences"])
+
+    def test_organization_profile_is_encrypted_and_tracks_classification_changes(self):
+        self.bot.store_organization_profile(
+            {
+                "name": "i4Edu",
+                "mission": "Expand access to equitable education.",
+                "tax_id": "SECRET-TAX-ID",
+            }
+        )
+        stored = self.bot.connection.execute(
+            """
+            SELECT value_json, data_classification, field_classifications_json
+            FROM organization_profile
+            WHERE key = 'profile'
+            """
+        ).fetchone()
+        self.assertNotIn("SECRET-TAX-ID", stored["value_json"])
+        self.assertEqual("secret", stored["data_classification"])
+        self.assertEqual(
+            "secret",
+            json.loads(stored["field_classifications_json"])["tax_id"],
+        )
+        self.assertEqual("SECRET-TAX-ID", self.bot.load_organization_profile()["tax_id"])
+
+        self.bot.store_setting(
+            "profile",
+            {
+                "name": "i4Edu",
+                "mission": "Expand access to equitable education.",
+                "tax_id": "SECRET-TAX-ID",
+            },
+            field_classifications={"mission": "internal"},
+        )
+        latest_change = self.bot.connection.execute(
+            """
+            SELECT details_json
+            FROM audit_logs
+            WHERE action = 'data_classification_changed'
+              AND details_json LIKE '%organization_profile%'
+            ORDER BY id DESC
+            LIMIT 1
+            """
+        ).fetchone()
+        self.assertEqual(
+            "internal",
+            json.loads(latest_change["details_json"])["field_classifications"]["mission"],
+        )
+
+    def test_classification_enforcement_rejects_invalid_record_level(self):
+        with self.assertRaises(ValueError):
+            self.bot.upsert_donor(
+                email="invalid@example.org",
+                name="Invalid Donor",
+                data_classification="confidential",
+                field_classifications={"preferences": "secret"},
+            )
+
 
 class OutreachAnalyticsAndGdprTests(unittest.TestCase):
     """Tests outreach analytics reporting and GDPR workflows."""
@@ -1983,7 +2260,8 @@ class CliExtensionTests(unittest.TestCase):
         self.assertEqual("2026-06", report["period"])
 
     def test_monthly_audit_report_command_writes_output_file_with_missing_parent_dir(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = _reset_test_dir("monthly-audit-report")
+        try:
             output_path = Path(tmpdir) / "reports" / "2026-06-audit.json"
             with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
                 main(
@@ -2004,6 +2282,8 @@ class CliExtensionTests(unittest.TestCase):
             report = json.loads(output_path.read_text(encoding="utf-8"))
             self.assertEqual("2026-06", report["period"])
             self.assertIn(str(output_path), stdout.getvalue())
+        finally:
+            rmtree(tmpdir)
 
 
 class MonthlyAuditReportTests(unittest.TestCase):
@@ -2287,6 +2567,84 @@ class CliDataRetentionCommandsTests(unittest.TestCase):
             bot.close()
 
 
+class CliLoggingAndInteractiveTests(unittest.TestCase):
+    def setUp(self):
+        self.db_path = Path(".test_cli_interactive.db")
+        if self.db_path.exists():
+            self.db_path.unlink()
+        bot = FundingBot(db_path=self.db_path, trusted_sources={"Grants Portal"})
+        bot.store_organization_profile({"name": "i4Edu"})
+        bot.close()
+
+    def tearDown(self):
+        if self.db_path.exists():
+            self.db_path.unlink()
+
+    def test_resolve_cli_log_levels(self):
+        self.assertEqual(logging.WARNING, _resolve_cli_log_level())
+        self.assertEqual(logging.INFO, _resolve_cli_log_level(verbose=True))
+        self.assertEqual(logging.ERROR, _resolve_cli_log_level(quiet=True))
+
+    def test_main_passes_verbosity_flags_to_logging_config(self):
+        cases = (
+            (["--verbose", "--db", str(self.db_path), "list-opportunities"], {"verbose": True, "quiet": False}),
+            (["--quiet", "--db", str(self.db_path), "list-opportunities"], {"verbose": False, "quiet": True}),
+            (["--db", str(self.db_path), "list-opportunities"], {"verbose": False, "quiet": False}),
+        )
+        for argv, expected in cases:
+            with self.subTest(argv=argv):
+                with (
+                    unittest.mock.patch("funding_bot._configure_cli_logging") as configure_logging,
+                    unittest.mock.patch("sys.stdout", new_callable=io.StringIO),
+                ):
+                    main(argv)
+                configure_logging.assert_called_once_with(**expected)
+
+    def test_send_outreach_prompts_for_missing_required_arguments(self):
+        with (
+            unittest.mock.patch("builtins.input", side_effect=["donor@example.org", "Donor"]) as prompt,
+            unittest.mock.patch("funding_bot._queue_async_task") as queue_task,
+        ):
+            main(["--db", str(self.db_path), "send-outreach", "--dry-run"])
+
+        self.assertEqual(2, prompt.call_count)
+        self.assertEqual("send-outreach", queue_task.call_args.args[0])
+        self.assertEqual(
+            {
+                "db_path": str(self.db_path),
+                "donor_email": "donor@example.org",
+                "donor_name": "Donor",
+                "subject_template": None,
+                "body_template": None,
+                "locale": None,
+                "dry_run": True,
+            },
+            queue_task.call_args.kwargs["task_kwargs"],
+        )
+
+    def test_test_connector_reprompts_until_a_valid_choice_is_given(self):
+        with (
+            unittest.mock.patch("builtins.input", side_effect=["invalid-connector", "csr-network"]),
+            unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            unittest.mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+        ):
+            main(["--db", str(self.db_path), "test-connector", "--limit", "1"])
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual("csr-network", payload["connector"])
+        self.assertIn("Invalid value for --connector", stderr.getvalue())
+
+    def test_non_interactive_mode_errors_when_required_arguments_are_missing(self):
+        with (
+            unittest.mock.patch("sys.stderr", new_callable=io.StringIO) as stderr,
+            self.assertRaises(SystemExit) as exc_info,
+        ):
+            main(["--non-interactive", "--db", str(self.db_path), "send-outreach", "--dry-run"])
+
+        self.assertEqual(2, exc_info.exception.code)
+        self.assertIn("--email, --name", stderr.getvalue())
+
+
 class SearchSettingsAndDiscoveryTests(unittest.TestCase):
     """Tests for persisted settings and end-to-end discovery orchestration."""
 
@@ -2428,10 +2786,13 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
             bot.close()
 
     def test_set_organization_profile_and_show_settings_commands(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = _reset_test_dir("organization-profile")
+        try:
             profile_path = Path(tmpdir) / "profile.json"
             profile_path.write_text(json.dumps({"name": "i4Edu"}), encoding="utf-8")
             main(["--db", str(self.db_path), "set-organization-profile", "--file", str(profile_path)])
+        finally:
+            rmtree(tmpdir)
 
         main(["--db", str(self.db_path), "register-credential", "--alias", "smtp", "--env-var", "SMTP_PASSWORD"])
 

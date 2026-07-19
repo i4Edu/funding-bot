@@ -1225,6 +1225,42 @@ def get_task_directory_route(task_id: int) -> Response:
     return jsonify({"task": task})
 
 
+@app.get("/api/tasks/export")
+@require_role("admin", "auditor")
+def export_tasks_route() -> Response:
+    tasks = _bot().list_tasks(
+        assigned_to=request.args.get("assigned_to") or request.args.get("assignee"),
+        status=request.args.get("status"),
+        due_date_before=request.args.get("due_date_before"),
+        due_date_after=request.args.get("due_date_after"),
+        source=request.args.get("source"),
+        sort=request.args.get("sort"),
+        assignee_email=request.args.get("assignee_email"),
+        viewer_email=request.args.get("viewer_email"),
+    )
+    return jsonify({"tasks": tasks, "count": len(tasks)})
+
+
+@app.post("/api/tasks/sync")
+@require_role("admin")
+def sync_tasks_route() -> Response:
+    payload = _get_request_json()
+    tasks = payload.get("tasks")
+    if not isinstance(tasks, list):
+        raise ValueError("Field 'tasks' must be a list of task objects.")
+    synced = _bot().sync_tasks(tasks, default_source=str(payload.get("source", "external_sync")))
+    return jsonify({"tasks": synced, "count": len(synced)})
+
+
+@app.post("/api/tasks/import")
+@require_role("admin")
+def import_tasks_route() -> Response:
+    csv_text = _read_task_import_csv()
+    source = request.args.get("source") or request.form.get("source") or "csv_import"
+    imported = _bot().import_tasks_from_csv(csv_text, default_source=str(source))
+    return jsonify({"tasks": imported, "count": len(imported)}), 201
+
+
 @app.post("/tasks/<int:task_id>/assign")
 @app.post("/tasks/<int:task_id>/assignment")
 @app.post("/task-directory/<int:task_id>/assignment")

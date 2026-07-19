@@ -11,7 +11,7 @@
       integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
       crossorigin="anonymous"
     >
-    <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+    <link rel="stylesheet" href="/static">
     <style>
       .skip-link {
         position: absolute;
@@ -40,9 +40,9 @@
     <nav class="navbar navbar-expand-lg navbar-dark bg-success shadow-sm app-navbar" role="navigation" aria-label="Primary navigation">
       <div class="container-fluid">
         <span class="navbar-brand mb-0 h1">Nonprofit Funding Bot</span>
-        <a class="nav-link app-nav-link" href="{{ url_for('dashboard_tasks') }}" aria-label="Open task board">Task Board</a>
-        <a class="nav-link app-nav-link" href="{{ url_for('settings_page') }}" aria-label="Open settings page">Settings</a>
-        <span class="navbar-text app-role-chip" aria-label="Signed in as {{ current_role }}">Role: {{ current_role }}</span>
+        <a class="nav-link app-nav-link" href="/dashboard/tasks" aria-label="Open task board">Task Board</a>
+        <a class="nav-link app-nav-link" href="/settings" aria-label="Open settings page">Settings</a>
+        <span class="navbar-text app-role-chip" aria-label="Signed in as auditor">Role: auditor</span>
       </div>
     </nav>
 
@@ -53,7 +53,7 @@
           <div class="card border-0 shadow-sm h-100" role="group" aria-labelledby="stat-new-opps" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted" id="stat-new-opps">New Opportunities</h2>
-              <p class="display-6 mb-1" aria-labelledby="stat-new-opps">{{ new_opportunities_count }}</p>
+              <p class="display-6 mb-1" aria-labelledby="stat-new-opps">4</p>
               <p class="text-muted mb-0">Found in the last 7 days</p>
             </div>
           </div>
@@ -62,7 +62,7 @@
           <div class="card border-0 shadow-sm h-100" role="group" aria-labelledby="stat-apps-submitted" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted" id="stat-apps-submitted">Applications Submitted</h2>
-              <p class="display-6 mb-1" aria-labelledby="stat-apps-submitted">{{ applications_submitted_count }}</p>
+              <p class="display-6 mb-1" aria-labelledby="stat-apps-submitted">2</p>
               <p class="text-muted mb-0">Tracked in the system</p>
             </div>
           </div>
@@ -71,7 +71,7 @@
           <div class="card border-0 shadow-sm h-100" role="group" aria-labelledby="stat-pending-apps" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted" id="stat-pending-apps">Pending Applications</h2>
-              <p class="display-6 mb-1" aria-labelledby="stat-pending-apps">{{ pending_applications_count }}</p>
+              <p class="display-6 mb-1" aria-labelledby="stat-pending-apps">1</p>
               <p class="text-muted mb-0">Awaiting next action</p>
             </div>
           </div>
@@ -80,7 +80,7 @@
           <div class="card border-0 shadow-sm h-100" role="group" aria-labelledby="stat-donor-comms" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted" id="stat-donor-comms">Donor Communications</h2>
-              <p class="display-6 mb-1" aria-labelledby="stat-donor-comms">{{ donor_communications_count }}</p>
+              <p class="display-6 mb-1" aria-labelledby="stat-donor-comms">5</p>
               <p class="text-muted mb-0">Emails logged</p>
             </div>
           </div>
@@ -89,16 +89,16 @@
           <div class="card border-0 shadow-sm h-100" role="group" aria-labelledby="stat-my-tasks" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted" id="stat-my-tasks">Visible Tasks</h2>
-              <p class="display-6 mb-1" aria-labelledby="stat-my-tasks">{{ my_tasks_count }}</p>
+              <p class="display-6 mb-1" aria-labelledby="stat-my-tasks">3</p>
               <p class="text-muted mb-0">Across your current scope</p>
             </div>
           </div>
         </div>
         <div class="col-md-6 col-xl-2">
-          <div class="card border-0 shadow-sm h-100 {% if overdue_tasks_count %}border border-danger-subtle{% endif %}" role="group" aria-labelledby="stat-overdue-tasks" tabindex="0">
+          <div class="card border-0 shadow-sm h-100 border border-danger-subtle" role="group" aria-labelledby="stat-overdue-tasks" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted" id="stat-overdue-tasks">Overdue Tasks</h2>
-              <p class="display-6 mb-1 {% if overdue_tasks_count %}text-danger{% endif %}" aria-labelledby="stat-overdue-tasks">{{ overdue_tasks_count }}</p>
+              <p class="display-6 mb-1 text-danger" aria-labelledby="stat-overdue-tasks">1</p>
               <p class="text-muted mb-0">Highlighted below</p>
             </div>
           </div>
@@ -110,24 +110,22 @@
           <div class="card border-0 shadow-sm">
             <div class="card-header bg-white d-flex justify-content-between align-items-center">
               <h2 class="h5 mb-0" id="overdue-tasks-heading">Overdue Tasks</h2>
-              <a class="btn btn-sm btn-outline-danger" href="{{ url_for('dashboard_tasks') }}" aria-label="Open task board">Open task board</a>
+              <a class="btn btn-sm btn-outline-danger" href="/dashboard/tasks" aria-label="Open task board">Open task board</a>
             </div>
             <div class="card-body">
               <div class="list-group" aria-labelledby="overdue-tasks-heading">
-                {% for task in overdue_tasks %}
+                
                 <div class="list-group-item list-group-item-danger">
                   <div class="d-flex justify-content-between align-items-start gap-3">
                     <div>
-                      <div class="fw-semibold">{{ task.title }}</div>
-                      <div class="small text-muted">Assigned to {{ task.assigned_to }}</div>
-                      <div class="small">{{ task.description or "No description provided." }}</div>
+                      <div class="fw-semibold">Submit report</div>
+                      <div class="small text-muted">Assigned to auditor</div>
+                      <div class="small">Wrap up audit</div>
                     </div>
-                    <span class="badge text-bg-danger">Due {{ task.due_date }}</span>
+                    <span class="badge text-bg-danger">Due 2026-07-20</span>
                   </div>
                 </div>
-                {% else %}
-                <div class="list-group-item text-muted">No overdue tasks in your current view.</div>
-                {% endfor %}
+                
               </div>
             </div>
           </div>
@@ -155,22 +153,18 @@
                     </tr>
                   </thead>
                   <tbody>
-                    {% for opportunity in recent_opportunities %}
+                    
                     <tr>
-                      <td>{{ opportunity.title }}</td>
-                      <td>{{ opportunity.donor_name }}</td>
+                      <td>Education Grant</td>
+                      <td>UNICEF</td>
                       <td>
                         <span class="badge text-bg-secondary">
-                          {{ opportunity.status.replace('_', ' ').title() }}
+                          New
                         </span>
                       </td>
-                      <td>{{ opportunity.discovered_at }}</td>
+                      <td>2026-07-18</td>
                     </tr>
-                    {% else %}
-                    <tr>
-                      <td colspan="4" class="text-center text-muted py-4">No opportunities found.</td>
-                    </tr>
-                    {% endfor %}
+                    
                   </tbody>
                 </table>
               </div>
@@ -185,19 +179,17 @@
             </div>
             <div class="card-body">
               <ul class="list-group list-group-flush" id="recent-apps-region" aria-labelledby="recent-apps-heading" tabindex="0">
-                {% for application in recent_applications %}
+                
                 <li class="list-group-item px-0">
-                  <div class="fw-semibold">{{ application.title }}</div>
-                  <div class="small text-muted">{{ application.donor_name }}</div>
+                  <div class="fw-semibold">Education Grant</div>
+                  <div class="small text-muted">UNICEF</div>
                   <div class="small mt-1">
-                    <span class="badge text-bg-primary">{{ application.status.replace('_', ' ').title() }}</span>
+                    <span class="badge text-bg-primary">Submitted</span>
                   </div>
-                  <div class="small text-muted mt-2">{{ application.submitted_at }}</div>
-                  <div class="small">{{ application.next_action }}</div>
+                  <div class="small text-muted mt-2">2026-07-18</div>
+                  <div class="small">Await review</div>
                 </li>
-                {% else %}
-                <li class="list-group-item px-0 text-muted">No applications submitted yet.</li>
-                {% endfor %}
+                
               </ul>
             </div>
           </section>
@@ -251,9 +243,9 @@
         }
 
         const shortcutActions = {
-          KeyD: () => window.location.assign("{{ url_for('dashboard') }}"),
-          KeyS: () => window.location.assign("{{ url_for('settings_page') }}"),
-          KeyT: () => window.location.assign("{{ url_for('dashboard_tasks') }}"),
+          KeyD: () => window.location.assign("/dashboard"),
+          KeyS: () => window.location.assign("/settings"),
+          KeyT: () => window.location.assign("/dashboard/tasks"),
           KeyM: () => focusAndScroll(document.getElementById("main-content")),
           KeyO: () => focusAndScroll(document.getElementById("recent-opps-region")),
           KeyA: () => focusAndScroll(document.getElementById("recent-apps-region")),

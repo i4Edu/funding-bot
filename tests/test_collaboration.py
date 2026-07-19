@@ -59,13 +59,17 @@ class CollaborationModelTests(unittest.TestCase):
     def test_assign_task_updates_assignee_and_audit_log(self):
         task = self.bot.create_task(title="Prepare budget", assigned_to="staff")
 
-        updated = self.bot.assign_task(task["id"], assigned_to="auditor", changed_by="admin")
+        updated = self.bot.update_task_assignment(
+            task["id"],
+            assigned_to="auditor",
+            changed_by="admin",
+        )
 
         self.assertEqual("auditor", updated["assigned_to"])
         audit_entry = self.bot.list_audit_logs(limit=1)[0]
         self.assertEqual("task_assignment_changed", audit_entry["action"])
         details = json.loads(audit_entry["details_json"])
-        self.assertEqual("staff", details["previous_assigned_to"])
+        self.assertEqual("staff", details["previous_assignee"])
         self.assertEqual("auditor", details["assigned_to"])
 
     def test_task_status_transitions_allow_valid_sequence_and_reject_closed_task_changes(self):
@@ -148,15 +152,19 @@ class CollaborationApiTests(unittest.TestCase):
         self.assertEqual(201, created.status_code)
         task = created.get_json()["task"]
         self.assertEqual("staff", task["assigned_to"])
-        self.assertEqual("2026-07-20T00:00:00+00:00", task["due_date"])
+        self.assertEqual("2026-07-20", task["due_date"])
 
         fetched = self.client.get(f"/tasks/{task['id']}", headers=self.admin_headers)
         self.assertEqual(200, fetched.status_code)
-        self.assertEqual(task["title"], fetched.get_json()["task"]["title"])
+        self.assertEqual(task["title"], fetched.get_json()["title"])
 
         reassigned = self.client.post(
             f"/tasks/{task['id']}/assign",
-            json={"assigned_to": "auditor"},
+            json={
+                "assigned_to": "auditor",
+                "assignee_email": "auditor@example.org",
+                "assignee_name": "Audit Lane",
+            },
             headers=self.admin_headers,
         )
         self.assertEqual(200, reassigned.status_code)

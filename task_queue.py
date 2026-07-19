@@ -11,8 +11,9 @@ from urllib.parse import urlparse
 from funding_bot import FundingBot, QueueTaskContext, SMTPEmailSender
 
 DEFAULT_QUEUE_NAME = "funding-bot"
-DEFAULT_BROKER_URL = "filesystem://"
-DEFAULT_RESULT_BACKEND = "cache+memory://"
+DEFAULT_BROKER_URL = "redis://redis:6379/0"
+DEFAULT_RESULT_BACKEND = "redis://redis:6379/1"
+DEFAULT_RABBITMQ_BROKER_URL = "******rabbitmq:5672//"
 DEFAULT_RABBITMQ_BROKER_URL = "amqp://" "guest:guest@rabbitmq:5672//"
 DEFAULT_DAILY_SUMMARY_HOUR = 9
 DEFAULT_DAILY_SUMMARY_MINUTE = 0
@@ -22,7 +23,6 @@ BROKER_PROCESSED_DIR = BROKER_ROOT / "processed"
 BROKER_CONTROL_DIR = BROKER_ROOT / "control"
 for _directory in (BROKER_QUEUE_DIR, BROKER_PROCESSED_DIR, BROKER_CONTROL_DIR):
     _directory.mkdir(parents=True, exist_ok=True)
-DEFAULT_RABBITMQ_BROKER_URL = "amqp://" "guest:guest@rabbitmq:5672//"
 
 
 def _coerce_bool(value: Any, *, default: bool = False) -> bool:
