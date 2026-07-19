@@ -116,3 +116,23 @@ The command returns JSON with:
 
 If a connector raises an exception, the JSON response includes `status: "error"`
 and an `error` field for troubleshooting.
+
+## Fallback and result schema migrations
+
+Connector discovery stores normalized responses in the `connector_result_cache`
+table together with:
+
+- `schema_version` — the normalized result schema version currently used by the bot
+- `source_status` — whether the row came from a live fetch, cached fallback, or default fallback
+- `metadata_json` — upstream version hints, fallback activation details, and migration history
+
+When a remote connector cannot be reached:
+
+1. `PORTAL_FALLBACK_MODE=cache-first` reuses the most recent cached response if one exists.
+2. If no cached row exists, the connector's built-in demo/default records are returned.
+3. `cache-only`, `default-only`, and `disabled` are also supported.
+
+Legacy upstream payloads are migrated before use. For example, older rows using
+fields such as `funder`, `link`, `description`, `type`, or `topics` are mapped
+to the current normalized fields (`donor_name`, `portal_url`, `summary`,
+`category`, and `tags`).

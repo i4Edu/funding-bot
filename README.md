@@ -12,6 +12,7 @@ For collaboration workflow, permissions, and task API examples, see [docs/COLLAB
 For deployment and scaling guidance, see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 For contributor setup, pull request expectations, and code review standards, see [CONTRIBUTING.md](CONTRIBUTING.md).
 For vulnerability reporting, disclosure timelines, incident response, and the penetration-testing checklist, see [docs/SECURITY.md](docs/SECURITY.md).
+For the operational breach runbook, see [docs/INCIDENT_RESPONSE.md](docs/INCIDENT_RESPONSE.md).
 
 ## Overview
 
@@ -78,6 +79,28 @@ The project is designed for nonprofit operations teams that need a lightweight w
           |                           ^
           | staff/admin/auditor UI    |
           +---------------------------+
+
+## Data classification
+
+Funding Bot stores a `data_classification` tag on every persisted model. Supported values are:
+
+- `public`
+- `internal`
+- `confidential`
+- `secret`
+
+### Field-level tags
+
+| Model | Field | Classification |
+| --- | --- | --- |
+| `organization_profile` | `name`, `mission`, `website` | `public` |
+| `organization_profile` | `registration_number`, `contact_email`, `phone`, `address` | `confidential` |
+| `organization_profile` | `tax_id`, `bank_account`, `bank_details` | `secret` |
+| `donors` | `email`, `opted_out`, `last_contact_at` | `confidential` |
+| `donors` | `name`, `segment`, `locale` | `internal` |
+| `donors` | `preferences` | `secret` |
+
+Secret donor preferences and organization-profile payloads are encrypted at rest in the database layer. Classification changes are recorded in the audit log.
 ```
 
 ### Component responsibilities
@@ -199,6 +222,8 @@ The core bot uses the Python standard library plus Babel for locale-aware docume
 ```bash
 pip install -r web/requirements.txt
 ```
+
+Set `FUNDING_BOT_ENCRYPTION_KEY` in deployed environments so encrypted donor and organization fields use a deployment-specific key.
 
 ## Document localization
 
@@ -427,6 +452,28 @@ Environment variables:
 | `KICKSTARTER_FOR_GOOD_PAGE_SIZE` | inherits `PORTAL_PAGE_SIZE` | Page size override for the Kickstarter for Good connector. |
 | `KICKSTARTER_FOR_GOOD_CACHE_TTL` | inherits `PORTAL_CACHE_TTL` | Cache TTL override for the Kickstarter for Good connector. |
 
+## Connector fallback and schema versioning
+
+Discovery now persists connector responses in `connector_result_cache` with:
+
+- `schema_version` for the normalized connector-result format
+- `source_status` (`remote`, `cached`, or `default`)
+- `metadata_json` for upstream version detection, fallback mode, and migration details
+
+When a connector is unreachable, `run_discovery()` can degrade gracefully by
+reusing the last cached normalized result or falling back to the connector's
+built-in demo/default dataset.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `PORTAL_FALLBACK_MODE` | `cache-first` | Fallback policy for connector failures: `cache-first`, `cache-only`, `default-only`, or `disabled`. |
+
+Schema handling rules:
+
+1. Connectors detect upstream payload versions from explicit version fields or legacy field names.
+2. Older payloads are migrated into the current normalized schema before discovery continues.
+3. Cached legacy rows are upgraded in place the next time they are reused, with migration details recorded in `metadata_json`.
+
 ## Connector rate limiting
 
 Remote connector calls also use per-connector token-bucket rate limiting so
@@ -538,6 +585,9 @@ Use one of these usernames as the role name:
 | `/tasks` | `POST` | `admin` | Create a task with an assignee, optional due date, and initial workflow status. |
 | `/tasks/<id>` | `GET` | `staff`, `admin`, `auditor` | Fetch one task as JSON. Staff users are limited to their own lane. |
 | `/tasks/<id>/assign` | `POST` | `admin` | Assign or reassign a task to another dashboard role. |
+| `/api/tasks/export` | `GET` | `admin`, `auditor` | Export tasks for external tools with the same filters used by the task directory. |
+| `/api/tasks/sync` | `POST` | `admin` | Upsert tasks from external systems using a JSON `tasks` array. |
+| `/api/tasks/import` | `POST` | `admin` | Bulk import tasks from CSV with validation and all-or-nothing transaction rollback. |
 | `/opportunities` | `GET` | `staff`, `admin`, `auditor` | List opportunities as JSON. |
 | `/opportunities/<signature>` | `GET` | `staff`, `admin`, `auditor` | Show one opportunity, linked application, and submission attempts. |
 | `/opportunities/<signature>/submit` | `POST` | `admin` | Record a submission result for an opportunity. |
@@ -630,7 +680,7 @@ Add a scrape target pointing to `http://<host>:5000/metrics` in your Prometheus 
 | Parameter | Example | Description |
 | --- | --- | --- |
 | `assignee` | `staff` | Filter to an exact assignee. Staff users are restricted to their own role. |
-| `status` | `in-progress` | Filter by task status. Accepted values: `todo`, `in-progress`, `done`, `blocked`. |
+| `status` | `in-progress` | Filter by task status. Accepted values: `todo`, `pending`, `in-progress`, `in_progress`, `done`, `completed`, `blocked`. |
 | `due_date_before` | `2026-07-31` | Include only tasks due on or before the given UTC date. |
 | `due_date_after` | `2026-07-01` | Include only tasks due on or after the given UTC date. |
 | `sort` | `due_date` | Sort results by `assignee`, `status`, or `due_date`. Prefix with `-` for descending order (for example `-due_date` or `-assignee`). Default: `updated_at`. |
@@ -706,6 +756,65 @@ curl -u staff:$STAFF_PASSWORD \
 
 Allowed categories: `feature_request`, `bug_report`, `general`.
 The `message` field must be non-empty and at most 2000 characters.
+
+### External task sync API
+
+Export tasks for another tool:
+
+```bash
+curl -u auditor:$AUDITOR_PASSWORD \
+  "http://localhost:5000/api/tasks/export?sort=due_date&source=external_sync"
+```
+
+Sync tasks from JSON:
+
+```bash
+curl -u admin:$ADMIN_PASSWORD \
+  -X POST http://localhost:5000/api/tasks/sync \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tasks": [
+      {
+        "external_id": "asana-42",
+        "title": "Prepare kickoff notes",
+        "assigned_to": "staff",
+        "status": "todo",
+        "due_date": "2026-07-20"
+      }
+    ]
+  }'
+```
+
+Task mutations are audited automatically. Reassignments create dedicated
+`task_assignment_changed` entries in addition to general create/update logs.
+
+### CSV task import format
+
+`POST /api/tasks/import` accepts either:
+
+- a raw `text/csv` request body, or
+- a multipart form upload named `file`
+
+Allowed CSV columns:
+
+- `external_id`
+- `title` *(required for new tasks)*
+- `description`
+- `assigned_to` *(required for new tasks)*
+- `status`
+- `due_date` *(ISO date such as `2026-07-20`)*
+- `source`
+
+Example:
+
+```csv
+external_id,title,description,assigned_to,status,due_date,source
+legacy-1,Import kickoff checklist,Imported from onboarding spreadsheet,staff,todo,2026-07-10,csv_seed
+legacy-2,Review imported work,Imported from onboarding spreadsheet,auditor,blocked,2026-07-12,csv_seed
+```
+
+Imports run inside a single database transaction. If any row fails validation,
+the entire import is rolled back and no task records are changed.
 
 ## Proof: Search and Donor Communication
 

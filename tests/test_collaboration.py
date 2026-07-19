@@ -96,6 +96,48 @@ class CollaborationModelTests(unittest.TestCase):
         with self.assertRaises(TaskTransitionError):
             self.bot.transition_task_status(task["id"], new_status="todo", changed_by="staff")
 
+    def test_sync_tasks_audits_assignment_and_field_changes(self):
+        self.bot.create_task(
+            title="Prepare budget",
+            assigned_to="staff",
+            external_id="ext-1",
+            due_date="2026-07-10",
+        )
+
+        synced = self.bot.sync_tasks(
+            [
+                {
+                    "external_id": "ext-1",
+                    "title": "Prepare revised budget",
+                    "assigned_to": "auditor",
+                    "status": "in-progress",
+                    "due_date": "2026-07-12",
+                }
+            ]
+        )
+
+        self.assertEqual("auditor", synced[0]["assigned_to"])
+        self.assertEqual("in_progress", synced[0]["status"])
+        actions = [entry["action"] for entry in self.bot.list_audit_logs(limit=10)]
+        self.assertIn("task_updated", actions)
+        self.assertIn("task_assignment_changed", actions)
+        self.assertIn("tasks_synced", actions)
+
+    def test_import_tasks_from_csv_rolls_back_on_error(self):
+        csv_text = "\n".join(
+            [
+                "external_id,title,assigned_to,status,due_date",
+                "ext-1,Collect letters,staff,todo,2026-07-10",
+                "ext-2,Bad status,auditor,not-a-status,2026-07-11",
+            ]
+        )
+
+        with self.assertRaises(ValueError):
+            self.bot.import_tasks_from_csv(csv_text)
+
+        self.assertEqual([], self.bot.list_tasks())
+        self.assertEqual([], self.bot.list_audit_logs(action="tasks_imported"))
+
 
 class CollaborationApiTests(unittest.TestCase):
     def setUp(self):
@@ -212,6 +254,85 @@ class CollaborationApiTests(unittest.TestCase):
         )
         self.assertEqual(200, valid.status_code)
         self.assertEqual("in-progress", valid.get_json()["task"]["status"])
+
+    def test_task_sync_and_export_routes_round_trip(self):
+        sync_response = self.client.post(
+            "/api/tasks/sync",
+            json={
+                "tasks": [
+                    {
+                        "external_id": "sync-1",
+                        "title": "Import prior backlog",
+                        "assigned_to": "staff",
+                        "status": "todo",
+                        "due_date": "2026-07-09",
+                    },
+                    {
+                        "external_id": "sync-2",
+                        "title": "Audit imported backlog",
+                        "assigned_to": "auditor",
+                        "status": "blocked",
+                        "due_date": "2026-07-11",
+                    },
+                ]
+            },
+            headers=self.admin_headers,
+        )
+
+        self.assertEqual(200, sync_response.status_code)
+        self.assertEqual(2, sync_response.get_json()["count"])
+
+        export_response = self.client.get(
+            "/api/tasks/export?sort=due_date",
+            headers=self.auditor_headers,
+        )
+        self.assertEqual(200, export_response.status_code)
+        payload = export_response.get_json()
+        self.assertEqual(2, payload["count"])
+        self.assertEqual(
+            ["Import prior backlog", "Audit imported backlog"],
+            [task["title"] for task in payload["tasks"]],
+        )
+
+    def test_csv_import_route_validates_and_rolls_back(self):
+        invalid_csv = "\n".join(
+            [
+                "external_id,title,assigned_to,status,due_date",
+                "csv-1,Import kickoff checklist,staff,todo,2026-07-10",
+                "csv-2,Invalid row,auditor,nope,2026-07-11",
+            ]
+        )
+
+        response = self.client.post(
+            "/api/tasks/import",
+            data=invalid_csv,
+            headers={**self.admin_headers, "Content-Type": "text/csv"},
+        )
+        self.assertEqual(400, response.status_code)
+
+        export_response = self.client.get("/api/tasks/export", headers=self.admin_headers)
+        self.assertEqual(0, export_response.get_json()["count"])
+
+    def test_csv_import_route_creates_tasks_and_audit_entries(self):
+        valid_csv = "\n".join(
+            [
+                "external_id,title,description,assigned_to,status,due_date,source",
+                "csv-1,Import kickoff checklist,Legacy onboarding,staff,todo,2026-07-10,csv_seed",
+                "csv-2,Review imported work,Imported from spreadsheet,auditor,blocked,2026-07-12,csv_seed",
+            ]
+        )
+
+        response = self.client.post(
+            "/api/tasks/import",
+            data=valid_csv,
+            headers={**self.admin_headers, "Content-Type": "text/csv"},
+        )
+        self.assertEqual(201, response.status_code)
+        self.assertEqual(2, response.get_json()["count"])
+
+        audit_response = self.client.get("/audit-log", headers=self.admin_headers)
+        actions = [entry["action"] for entry in audit_response.get_json()]
+        self.assertIn("tasks_imported", actions)
 
 
 if __name__ == "__main__":

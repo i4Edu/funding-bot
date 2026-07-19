@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import signal
-import tempfile
+import urllib.error
 import unittest
 import unittest.mock
 from datetime import datetime, timedelta, timezone
@@ -13,7 +13,6 @@ from shutil import rmtree
 from zipfile import ZipFile
 
 from funding_bot import (
-    ConnectionSecurityError,
     DuplicateSubmissionError,
     FundingBot,
     FundingBotError,
@@ -23,9 +22,8 @@ from funding_bot import (
     OutreachThrottledError,
     SMTPEmailSender,
     TaskTransitionError,
-    _default_http_json_client,
-    create_connector,
 )
+import task_queue
 
 
 TEST_ARTIFACTS_DIR = Path(".test-artifacts")
@@ -62,6 +60,27 @@ class FakeClock:
     def sleep(self, seconds):
         self.sleeps.append(seconds)
         self.current += seconds
+
+
+class FakeHTTPResponse:
+    def __init__(self, payload, status_code=200):
+        self._payload = payload
+        self.status_code = status_code
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+class StaticSecretVault:
+    def __init__(self, secrets):
+        self.secrets = dict(secrets)
+
+    def get_secret(self, name):
+        return self.secrets[name]
 
 
 class FundingBotTests(unittest.TestCase):
@@ -274,7 +293,7 @@ class FundingBotTests(unittest.TestCase):
 
         report = self.bot.build_gdpr_compliance_report(
             cadence="monthly",
-            as_of=datetime(2026, 7, 1, tzinfo=timezone.utc),
+            as_of=datetime(2026, 7, 19, tzinfo=timezone.utc),
         )
         self.assertEqual("gdpr_compliance_self_check", report["report_type"])
         self.assertEqual("monthly", report["cadence"])
@@ -1030,10 +1049,12 @@ class PortalConnectorTests(unittest.TestCase):
         grants = GrantsPortalConnector()
         csr = CSRNetworkConnector()
         ngo = NGODirectoryConnector()
+        foundation = FoundationDirectoryConnector()
 
         grants_rows = grants.fetch_opportunities(["education"])
         csr_rows = csr.fetch_opportunities(["digital learning"])
         ngo_rows = ngo.fetch_opportunities(["literacy"])
+        foundation_rows = foundation.fetch_opportunities(["arts"])
 
         self.assertEqual(1, len(grants_rows))
         self.assertEqual("Grants Portal", grants_rows[0]["source"])
@@ -1047,7 +1068,118 @@ class PortalConnectorTests(unittest.TestCase):
         self.assertEqual("NGO Directory", ngo_rows[0]["source"])
         self.assertEqual("Community Literacy Matching Grant", ngo_rows[0]["title"])
 
+        self.assertEqual(1, len(foundation_rows))
+        self.assertEqual("Foundation Directory", foundation_rows[0]["source"])
+        self.assertEqual("Regional Arts Access Grant", foundation_rows[0]["title"])
+
         self.assertEqual([], grants.fetch_opportunities(["health"]))
+
+    def test_ngo_directory_connector_fetches_live_directory_pages(self):
+        calls = []
+
+        def fake_http_client(url, payload, credentials=None, headers=None):
+            calls.append(
+                {
+                    "url": url,
+                    "payload": dict(payload),
+                    "credentials": dict(credentials or {}),
+                    "headers": dict(headers or {}),
+                }
+            )
+            self.assertEqual("test-api-key", (headers or {}).get("X-API-Key"))
+            if payload["page"] == 1:
+                return {
+                    "results": [
+                        {
+                            "funder_name": "Bright Futures Foundation",
+                            "recipient_name": "City Learning Trust",
+                            "grant_title": "STEM Access Grant",
+                            "purpose": "Support after-school STEM labs.",
+                            "detail_url": "https://api.candid.org/grants/1",
+                            "subject": "Education",
+                        }
+                    ],
+                    "total_pages": 2,
+                }
+            return {
+                "results": [
+                    {
+                        "funder": {"name": "Bright Futures Foundation"},
+                        "recipient": {"name": "Rural Learning Collective"},
+                        "title": "Rural Innovation Grant",
+                        "description": "Expand rural learning hubs.",
+                        "url": "https://api.candid.org/grants/2",
+                        "category": "Education",
+                    }
+                ],
+                "total_pages": 2,
+            }
+
+        try:
+            connectors = bot.connector_registry.build_connectors(
+                [
+                    {
+                        "type": "foundation-directory",
+                        "transport": "http",
+                        "credential_alias": "foundation-api",
+                        "settings": {"http_client": fake_http_client},
+                    }
+                ],
+                credential_resolver=bot.resolve_credential,
+            )
+            found = bot.run_discovery(connectors, keywords=["education"])
+        finally:
+            bot.close()
+            os.environ.pop("FOUNDATION_DIRECTORY_TEST_KEY", None)
+
+        self.assertEqual(2, len(found))
+        self.assertEqual([1, 2], [call["payload"]["page"] for call in calls])
+        self.assertEqual("Foundation Directory", found[0]["source"])
+        self.assertEqual("STEM Access Grant", found[0]["title"])
+
+    def test_foundation_directory_connector_waits_and_retries_after_rate_limit(self):
+        clock = FakeClock()
+        calls = []
+
+        def rate_limited_http_client(url, payload, credentials=None, headers=None):
+            calls.append(payload["page"])
+            if len(calls) == 1:
+                raise urllib.error.HTTPError(
+                    url,
+                    429,
+                    "Too Many Requests",
+                    {"Retry-After": "1.5"},
+                    None,
+                )
+            return {
+                "results": [
+                    {
+                        "funder_name": "Rate Limit Foundation",
+                        "recipient_name": "Learning Lab",
+                        "grant_title": "Recovered Opportunity",
+                        "detail_url": "https://api.candid.org/grants/3",
+                        "purpose": "Recovered after rate limiting.",
+                        "subject": "Education",
+                    }
+                ],
+                "total_pages": 1,
+            }
+
+        connector = FoundationDirectoryConnector(
+            http_client=rate_limited_http_client,
+            credentials={"api_key": "test-api-key"},
+            transport="http",
+            max_retries=1,
+            sleep_func=clock.sleep,
+            time_func=clock.monotonic,
+        )
+
+        rows = connector.fetch_opportunities(["education"])
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("Recovered Opportunity", rows[0]["title"])
+        self.assertEqual([1.5, 0.25], clock.sleeps)
+        self.assertEqual([1, 1], calls)
 
     def test_connector_metrics_track_requests_errors_and_latency(self):
         FundingBot.reset_connector_metrics()
@@ -1282,6 +1414,10 @@ class PortalConnectorTests(unittest.TestCase):
             ["csr", "corporate social responsibility", "corporate giving"],
             validation["keyword_mappings"]["csr"]["keywords"],
         )
+
+    def test_create_connector_supports_crowdfunding_slugs(self):
+        self.assertIsInstance(create_connector("globalgiving"), GlobalGivingConnector)
+        self.assertIsInstance(create_connector("kickstarter-for-good"), KickstarterForGoodConnector)
 
     def test_connector_rejects_insecure_base_url(self):
         with self.assertRaises(ConnectionSecurityError):
@@ -2452,17 +2588,37 @@ class DataRetentionPolicyTests(unittest.TestCase):
         )
         self.bot.connection.execute(
             """
-            INSERT INTO tasks (title, description, assigned_to, status, created_at, updated_at)
-            VALUES (?, ?, ?, 'done', ?, ?)
+            INSERT INTO tasks (
+                external_id, title, description, assignee, status, due_date, source, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, 'done', ?, 'manual', ?, ?)
             """,
-            ("Expired task", "", "staff", "2026-05-01T00:00:00+00:00", "2026-05-01T00:00:00+00:00"),
+            (
+                None,
+                "Expired task",
+                "",
+                "staff",
+                "2026-05-01T00:00:00+00:00",
+                "2026-05-01T00:00:00+00:00",
+                "2026-05-01T00:00:00+00:00",
+            ),
         )
         self.bot.connection.execute(
             """
-            INSERT INTO tasks (title, description, assigned_to, status, created_at, updated_at)
-            VALUES (?, ?, ?, 'done', ?, ?)
+            INSERT INTO tasks (
+                external_id, title, description, assignee, status, due_date, source, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, 'done', ?, 'manual', ?, ?)
             """,
-            ("Recent task", "", "staff", "2026-07-10T00:00:00+00:00", "2026-07-10T00:00:00+00:00"),
+            (
+                None,
+                "Recent task",
+                "",
+                "staff",
+                "2026-07-10T00:00:00+00:00",
+                "2026-07-10T00:00:00+00:00",
+                "2026-07-10T00:00:00+00:00",
+            ),
         )
         self.bot.connection.commit()
 
@@ -2718,8 +2874,14 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
         self.db_path = Path(".test_cli_settings.db")
         if self.db_path.exists():
             self.db_path.unlink()
+        self._previous_always_eager = task_queue.celery_app.conf.task_always_eager
+        self._previous_store_eager = getattr(task_queue.celery_app.conf, "task_store_eager_result", None)
+        task_queue.celery_app.conf.task_always_eager = True
+        task_queue.celery_app.conf.task_store_eager_result = True
 
     def tearDown(self):
+        task_queue.celery_app.conf.task_always_eager = self._previous_always_eager
+        task_queue.celery_app.conf.task_store_eager_result = self._previous_store_eager
         if self.db_path.exists():
             self.db_path.unlink()
 
@@ -2728,12 +2890,14 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
             main(["--db", str(self.db_path), "discover", "--keywords", "education"])
 
         output = stdout.getvalue()
+        self.assertIn("Queued discover task", output)
         self.assertIn("Education Innovation Grant", output)
 
     def test_discover_command_reports_no_results(self):
         with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
             main(["--db", str(self.db_path), "discover", "--keywords", "no-such-keyword"])
 
+        self.assertIn("Queued discover task", stdout.getvalue())
         self.assertIn("No new opportunities found.", stdout.getvalue())
 
     def test_test_connector_command_prints_validation_and_sample_results(self):
@@ -2775,6 +2939,7 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
             )
 
         output = stdout.getvalue()
+        self.assertIn("Queued send-outreach task", output)
         self.assertIn("dry run", output)
 
         bot = FundingBot(db_path=self.db_path)

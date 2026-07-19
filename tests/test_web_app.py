@@ -152,7 +152,12 @@ class SettingsPanelTests(unittest.TestCase):
     def test_update_organization_settings_as_admin(self):
         response = self.client.post(
             "/settings/organization",
-            json={"name": "i4Edu", "mission": "Educate", "privacy_jurisdictions": ["EU", "US"]},
+            json={
+                "name": "i4Edu",
+                "mission": "Educate",
+                "privacy_jurisdictions": ["EU", "US"],
+                "field_classifications": {"mission": "internal"},
+            },
             headers=self.admin_headers,
         )
         self.assertEqual(200, response.status_code)
@@ -160,6 +165,18 @@ class SettingsPanelTests(unittest.TestCase):
             {"name": "i4Edu", "mission": "Educate", "privacy_jurisdictions": ["EU", "US"]},
             response.get_json()["organization_profile"],
         )
+
+    def test_upsert_donor_returns_classification_metadata(self):
+        response = self.client.post(
+            "/donors",
+            json={"email": "donor@example.org", "name": "Donor", "locale": "bn"},
+            headers=self.admin_headers,
+        )
+        self.assertEqual(201, response.status_code)
+        payload = response.get_json()
+        self.assertEqual("bn", payload["locale"])
+        self.assertEqual("secret", payload["data_classification"])
+        self.assertEqual("secret", payload["field_classifications"]["preferences"])
 
     def test_generate_privacy_policy_returns_versions_and_artifacts(self):
         self.client.post(

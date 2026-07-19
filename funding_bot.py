@@ -17,7 +17,7 @@ import threading
 import time
 import urllib.parse
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from email.mime.text import MIMEText
@@ -549,6 +549,7 @@ class Task:
     due_date: str
     created_at: str
     updated_at: str
+    data_classification: str = "internal"
     id: int | None = None
     external_id: str | None = None
     source: str = "manual"
@@ -562,7 +563,8 @@ class Task:
         data = dict(row)
         if "assignee" not in data and "assigned_to" in data:
             data["assignee"] = data.pop("assigned_to")
-        return cls(**data)
+        allowed = {field.name for field in fields(cls)}
+        return cls(**{key: value for key, value in data.items() if key in allowed})
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -1836,9 +1838,8 @@ class GrantsPortalConnector(_BasePortalConnector):
         if authorization_header:
             headers["Authorization"] = authorization_header
         elif credentials.get("access_token") or credentials.get("bearer_token"):
-            headers["Authorization"] = (
-                f"******'access_token') or credentials.get('bearer_token')}"
-            )
+            access_token = credentials.get("access_token") or credentials.get("bearer_token")
+            headers["Authorization"] = "Bearer " + str(access_token)
         api_key = str(credentials.get("api_key", "")).strip()
         if api_key:
             headers["X-API-Key"] = api_key
@@ -2558,15 +2559,15 @@ _DEFAULT_CONNECTORS: list[PortalConnector] | None = None
 def default_connectors() -> list[PortalConnector]:
     """Return the built-in portal connectors used by ``run_discovery``.
 
-    Each connector returns demo data unless an ``http_client`` is supplied,
-    which keeps discovery safe to run out-of-the-box while still exercising
-    the full search pipeline end-to-end.
+    Grants Portal and CSR Network default to live HTTP transports so
+    ``run_discovery`` can query real upstream sources while the remaining
+    connectors keep their existing defaults.
     """
     global _DEFAULT_CONNECTORS
     if _DEFAULT_CONNECTORS is None:
         _DEFAULT_CONNECTORS = [
-            GrantsPortalConnector(),
-            CSRNetworkConnector(),
+            GrantsPortalConnector(transport="http"),
+            CSRNetworkConnector(transport="http"),
             NGODirectoryConnector(),
             FoundationDirectoryConnector(),
             GlobalGivingConnector(),
@@ -3121,6 +3122,7 @@ class FundingBot:
             )
         self.connector_registry = connector_registry or DEFAULT_CONNECTOR_REGISTRY
         self._data_residency_status = self.validate_data_storage_location()
+        self._active_queue_controllers: dict[str, GracefulShutdownController] = {}
         self.connection = sqlite3.connect(self.db_path)
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.connection.execute("PRAGMA busy_timeout = 5000")
@@ -3983,10 +3985,82 @@ class FundingBot:
             )
 
     def _apply_migrations(self) -> None:
-        """Schema is created in-place; retained for backward-compatible startup."""
+        migrations_dir = Path(__file__).resolve().parent / "migrations"
+        if not migrations_dir.exists():
+            return
+        applied = {
+            row["name"]
+            for row in self.connection.execute("SELECT name FROM schema_migrations").fetchall()
+        }
+        for migration_path in sorted(migrations_dir.glob("*.sql")):
+            if migration_path.name in applied:
+                continue
+            self.connection.executescript(migration_path.read_text(encoding="utf-8"))
+            self.connection.execute(
+                "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+                (migration_path.name, self._to_iso()),
+            )
+            self.connection.commit()
 
     def _ensure_tasks_schema(self) -> None:
-        """Task tables are created in `_create_schema`; retained for compatibility."""
+        columns = [
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(tasks)").fetchall()
+        ]
+        if columns and "assigned_to" in columns and "assignee" not in columns:
+            self.connection.executescript(
+                """
+                ALTER TABLE tasks RENAME TO tasks_legacy;
+                CREATE TABLE tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    external_id TEXT UNIQUE,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    assignee TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    due_date TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    assignee_email TEXT,
+                    assignee_name TEXT
+                );
+                INSERT INTO tasks (
+                    id, external_id, title, description, assignee, status, due_date,
+                    source, created_at, updated_at, assignee_email, assignee_name
+                )
+                SELECT
+                    id,
+                    external_id,
+                    title,
+                    COALESCE(description, ''),
+                    LOWER(assigned_to),
+                    CASE LOWER(status)
+                        WHEN 'todo' THEN 'pending'
+                        WHEN 'in-progress' THEN 'in_progress'
+                        WHEN 'done' THEN 'completed'
+                        ELSE REPLACE(LOWER(status), '-', '_')
+                    END,
+                    COALESCE(date(due_date), date(updated_at), date(created_at), date('now')),
+                    COALESCE(source, 'manual'),
+                    created_at,
+                    updated_at,
+                    assignee_email,
+                    assignee_name
+                FROM tasks_legacy;
+                DROP TABLE tasks_legacy;
+                """
+            )
+        self._ensure_column("tasks", "external_id", "TEXT")
+        self._ensure_column("tasks", "due_date", "TEXT")
+        self._ensure_column("tasks", "source", "TEXT NOT NULL DEFAULT 'manual'")
+        self._ensure_column("tasks", "assignee_email", "TEXT")
+        self._ensure_column("tasks", "assignee_name", "TEXT")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_tasks_external_id ON tasks(external_id)")
+        self.connection.execute("CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date)")
+        self.connection.commit()
 
     @staticmethod
     def _validate_segment(segment: str | None) -> str:
@@ -4542,7 +4616,10 @@ class FundingBot:
     ) -> dict[str, Any]:
         now = self._to_iso()
         existing = self.connection.execute(
-            "SELECT created_at, completed_at, duplicate_requests FROM task_runs WHERE task_id = ?",
+            """
+            SELECT created_at, completed_at, duplicate_requests, shutdown_requested
+            FROM task_runs WHERE task_id = ?
+            """,
             (task_id,),
         ).fetchone()
         created_at = existing["created_at"] if existing else now
@@ -4618,7 +4695,10 @@ class FundingBot:
                     duplicate_requests,
                     int(existing["duplicate_requests"] or 0) if existing else 0,
                 ),
-                int(shutdown_requested),
+                max(
+                    int(shutdown_requested),
+                    int(existing["shutdown_requested"] or 0) if existing else 0,
+                ),
                 normalized_retry_limit,
                 normalized_attempts,
                 normalized_backoff_seconds,
@@ -4791,6 +4871,43 @@ class FundingBot:
         rows = self.connection.execute(query, params).fetchall()
         return [self._serialize_dead_letter_row(row) for row in rows]
 
+    @staticmethod
+    def generate_idempotency_key(task_name: str, payload: dict[str, Any] | None = None) -> str:
+        canonical_payload = json.dumps(payload or {}, sort_keys=True, separators=(",", ":"))
+        raw_key = f"{str(task_name).strip().lower()}|{canonical_payload}"
+        return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+    def request_task_run_shutdown(self, task_id: str, *, signal_name: str | None = None) -> dict[str, Any]:
+        timestamp = self._to_iso()
+        message = "Shutdown requested for in-flight task."
+        if signal_name:
+            message = f"{message} Signal: {signal_name}."
+        self.connection.execute(
+            """
+            UPDATE task_runs
+            SET shutdown_requested = 1,
+                message = ?,
+                updated_at = ?
+            WHERE task_id = ?
+            """,
+            (message, timestamp, task_id),
+        )
+        self.connection.commit()
+        controller = self._active_queue_controllers.get(task_id)
+        if controller is not None:
+            controller.received_signals.append(getattr(signal, signal_name, signal.SIGTERM))
+            controller._shutdown_event.set()
+        task_run = self.get_task_run(task_id)
+        if task_run is None:
+            raise FundingBotError(f"Task run {task_id!r} does not exist.")
+        self._log_action(
+            "queue_task_shutdown_requested",
+            task_id=task_id,
+            task_name=task_run["task_name"],
+            signal=signal_name,
+        )
+        return task_run
+
     def get_queue_metrics(self) -> dict[str, int]:
         run_counts = self.connection.execute(
             """
@@ -4829,6 +4946,7 @@ class FundingBot:
         *,
         idempotency_key: str | None = None,
         worker_id: str | None = None,
+        install_signal_handlers: bool = True,
         retry_limit: int | None = None,
         backoff_seconds: float | None = None,
         backoff_max_seconds: float | None = None,
@@ -4840,20 +4958,67 @@ class FundingBot:
         normalized_payload = dict(payload or {})
         normalized_idempotency_key = (
             idempotency_key
-            or hashlib.sha256(
-                (
-                    f"{normalized_task_name}|"
-                    f"{json.dumps(normalized_payload, sort_keys=True, separators=(',', ':'))}|"
-                    f"{time.monotonic_ns()}"
-                ).encode("utf-8")
-            ).hexdigest()
+            or self.generate_idempotency_key(normalized_task_name, normalized_payload)
         )
         config = self._load_queue_retry_config(
             retry_limit=retry_limit,
             backoff_seconds=backoff_seconds,
             backoff_max_seconds=backoff_max_seconds,
         )
-        controller = GracefulShutdownController()
+        existing_task_run = self.get_task_run(normalized_idempotency_key)
+        if existing_task_run is not None:
+            self.record_task_run(
+                normalized_idempotency_key,
+                existing_task_run["task_name"],
+                status=existing_task_run["status"],
+                progress=existing_task_run["progress"],
+                message=existing_task_run["message"],
+                payload=existing_task_run["payload"],
+                result=existing_task_run["result"],
+                error_message=existing_task_run["error_message"],
+                callback_name=existing_task_run.get("callback_name"),
+                callback_payload=existing_task_run.get("callback_payload"),
+                idempotency_key=existing_task_run["idempotency_key"],
+                worker_id=existing_task_run.get("worker_id"),
+                duplicate_requests=int(existing_task_run.get("duplicate_requests", 0)) + 1,
+                shutdown_requested=bool(existing_task_run.get("shutdown_requested")),
+                retry_limit=int(existing_task_run.get("retry_limit", config["retry_limit"])),
+                attempts=int(existing_task_run.get("attempts", 0)),
+                backoff_seconds=float(
+                    existing_task_run.get("backoff_seconds", config["backoff_seconds"])
+                ),
+                backoff_max_seconds=float(
+                    existing_task_run.get("backoff_max_seconds", config["backoff_max_seconds"])
+                ),
+                dead_lettered=bool(existing_task_run.get("dead_lettered")),
+                last_attempt_at=existing_task_run.get("last_attempt_at"),
+                next_retry_at=existing_task_run.get("next_retry_at"),
+                completed_at=(
+                    datetime.fromisoformat(existing_task_run["completed_at"])
+                    if existing_task_run.get("completed_at")
+                    else None
+                ),
+            )
+            duplicate_task_run = self.get_task_run(normalized_idempotency_key)
+            assert duplicate_task_run is not None
+            duplicate_task_run["duplicate"] = True
+            self._log_action(
+                "queue_task_duplicate_prevented",
+                task_id=normalized_idempotency_key,
+                task_name=normalized_task_name,
+                status=duplicate_task_run["status"],
+            )
+            return duplicate_task_run
+
+        controller = GracefulShutdownController(
+            on_shutdown=lambda signum: self.request_task_run_shutdown(
+                normalized_idempotency_key,
+                signal_name=signal.Signals(signum).name,
+            )
+        )
+        if install_signal_handlers:
+            controller.install()
+        self._active_queue_controllers[normalized_idempotency_key] = controller
         context = QueueTaskContext(
             bot=self,
             idempotency_key=normalized_idempotency_key,
@@ -4936,6 +5101,10 @@ class FundingBot:
                     task_name=normalized_task_name,
                     attempts=attempt_number,
                 )
+                task_run["duplicate"] = False
+                self._active_queue_controllers.pop(normalized_idempotency_key, None)
+                if install_signal_handlers:
+                    controller.restore()
                 return task_run
             except Exception as exc:
                 error_message = str(exc)
@@ -5037,6 +5206,10 @@ class FundingBot:
                     error_message=error_message,
                     dead_lettered=True,
                 )
+                task_run["duplicate"] = False
+                self._active_queue_controllers.pop(normalized_idempotency_key, None)
+                if install_signal_handlers:
+                    controller.restore()
                 return task_run
 
             self._record_task_history(
@@ -5076,6 +5249,10 @@ class FundingBot:
                 task_name=normalized_task_name,
                 attempts=attempt_number,
             )
+            task_run["duplicate"] = False
+            self._active_queue_controllers.pop(normalized_idempotency_key, None)
+            if install_signal_handlers:
+                controller.restore()
             return task_run
 
         raise FundingBotError(
@@ -8695,6 +8872,10 @@ def _render_discover_task_result(result: dict[str, Any]) -> None:
 
 
 def _render_outreach_task_result(result: dict[str, Any]) -> None:
+    if result.get("template_name"):
+        print(f"Template: {result['template_name']}")
+    if result.get("locale"):
+        print(f"Locale: {result['locale']}")
     print(f"Subject: {result['subject']}\n")
     print(result["body"])
     if result.get("dry_run"):
@@ -8902,6 +9083,15 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     )
     outreach_parser.add_argument("--email", metavar="EMAIL", help="Donor email address.")
     outreach_parser.add_argument("--name", metavar="NAME", help="Donor name.")
+    outreach_parser.add_argument(
+        "--template-name",
+        default=FundingBot.DEFAULT_OUTREACH_TEMPLATE,
+        metavar="NAME",
+        help=(
+            "Built-in outreach template to preview/send when --subject and --body are omitted "
+            f"(default: {FundingBot.DEFAULT_OUTREACH_TEMPLATE})."
+        ),
+    )
     outreach_parser.add_argument(
         "--subject",
         default=None,
@@ -9146,6 +9336,7 @@ def main(argv: list[str] | None = None) -> None:
                     "db_path": args.db,
                     "donor_email": args.email,
                     "donor_name": args.name,
+                    "template_name": args.template_name,
                     "subject_template": args.subject,
                     "body_template": args.body,
                     "locale": args.locale,

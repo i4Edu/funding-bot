@@ -329,7 +329,7 @@ def _group_tasks_by_status(tasks: list[dict[str, Any]]) -> dict[str, list[dict[s
 
 
 def _can_move_task(role: str | None, task: dict[str, Any]) -> bool:
-    return role == "admin" or task.get("assigned_to") == role
+    return role == "admin" or task.get("assignee") == role
 
 
 def _serialize_translation_review(review: Any) -> dict[str, Any]:
@@ -400,9 +400,9 @@ def _task_status_counts(tasks: list[dict[str, Any]]) -> dict[str, int]:
 
 def _task_assignee_options() -> list[str]:
     rows = _bot().connection.execute(
-        "SELECT DISTINCT assigned_to FROM tasks WHERE assigned_to != '' ORDER BY assigned_to COLLATE NOCASE ASC"
+        "SELECT DISTINCT assignee FROM tasks WHERE assignee != '' ORDER BY assignee COLLATE NOCASE ASC"
     ).fetchall()
-    return [str(row["assigned_to"]) for row in rows]
+    return [str(row["assignee"]) for row in rows]
 
 
 def _resolve_ui_locale() -> dict[str, Any]:
@@ -482,7 +482,7 @@ def _dashboard_context() -> dict[str, Any]:
         "pending_translation_reviews_count": pending_translation_reviews_count,
         "my_tasks_count": sum(my_task_counts.values()),
         "my_open_tasks_count": sum(
-            count for status, count in my_task_counts.items() if status != "done"
+            count for status, count in my_task_counts.items() if status != "completed"
         ),
         "overdue_tasks": overdue_tasks,
         "overdue_tasks_count": len(overdue_tasks),
@@ -1175,13 +1175,15 @@ def list_tasks_directory_route() -> Response:
             return _json_error("Forbidden", 403)
         assigned_to = current_role
     tasks = _bot().list_tasks(
-        assigned_to=assigned_to,
+        assignee=assigned_to,
         assignee_email=request.args.get("assignee_email"),
         status=request.args.get("status"),
-        due_date_before=request.args.get("due_date_before"),
-        due_date_after=request.args.get("due_date_after"),
+        due_date_before=request.args.get("due_before") or request.args.get("due_date_before"),
+        due_date_after=request.args.get("due_after") or request.args.get("due_date_after"),
         source=request.args.get("source"),
         sort=request.args.get("sort"),
+        sort_by=request.args.get("sort_by"),
+        sort_order=request.args.get("sort_order"),
         viewer_email=request.args.get("viewer_email"),
     )
     return jsonify(tasks)
@@ -1193,18 +1195,21 @@ def list_tasks_directory_route() -> Response:
 def create_task_directory_route() -> Response:
     payload = _get_request_json()
     title = str(payload.get("title", "")).strip()
-    assigned_to = str(payload.get("assigned_to", "")).strip()
+    assigned_to = str(payload.get("assignee", payload.get("assigned_to", ""))).strip()
+    due_date = payload.get("due_date")
     if not title:
         raise ValueError("Field 'title' is required.")
     if not assigned_to:
-        raise ValueError("Field 'assigned_to' is required.")
+        raise ValueError("Field 'assignee' is required.")
+    if due_date in (None, ""):
+        raise ValueError("Field 'due_date' is required.")
 
     task = _bot().create_task(
         title=title,
-        assigned_to=assigned_to,
+        assignee=assigned_to,
         description=str(payload.get("description", "")),
-        status=str(payload.get("status", "todo")),
-        due_date=payload.get("due_date"),
+        status=str(payload.get("status", "pending")),
+        due_date=due_date,
         external_id=payload.get("external_id"),
         source=str(payload.get("source", "manual")),
         assignee_email=payload.get("assignee_email"),
@@ -1212,6 +1217,23 @@ def create_task_directory_route() -> Response:
         sender=_task_assignment_sender(),
     )
     return jsonify({"task": task, "notification": task.get("assignment_notification")}), 201
+
+
+@app.put("/tasks/<int:task_id>")
+@require_role("admin")
+def update_task_route(task_id: int) -> Response:
+    payload = _get_request_json()
+    if not payload:
+        raise ValueError("Request body must include at least one task field to update.")
+    task = _bot().update_task(
+        task_id,
+        title=payload.get("title"),
+        description=payload.get("description"),
+        assignee=payload.get("assignee", payload.get("assigned_to")),
+        status=payload.get("status"),
+        due_date=payload.get("due_date"),
+    )
+    return jsonify({"task": task})
 
 
 @app.get("/tasks/<int:task_id>")
@@ -1229,12 +1251,14 @@ def get_task_directory_route(task_id: int) -> Response:
 @require_role("admin", "auditor")
 def export_tasks_route() -> Response:
     tasks = _bot().list_tasks(
-        assigned_to=request.args.get("assigned_to") or request.args.get("assignee"),
+        assignee=request.args.get("assigned_to") or request.args.get("assignee"),
         status=request.args.get("status"),
-        due_date_before=request.args.get("due_date_before"),
-        due_date_after=request.args.get("due_date_after"),
+        due_date_before=request.args.get("due_before") or request.args.get("due_date_before"),
+        due_date_after=request.args.get("due_after") or request.args.get("due_date_after"),
         source=request.args.get("source"),
         sort=request.args.get("sort"),
+        sort_by=request.args.get("sort_by"),
+        sort_order=request.args.get("sort_order"),
         assignee_email=request.args.get("assignee_email"),
         viewer_email=request.args.get("viewer_email"),
     )
@@ -1390,7 +1414,7 @@ def metrics() -> Response:
     queue_health = _get_queue_health_snapshot()
     queue_status_value = 1 if queue_health["status"] == "ok" else 0
     task_assignments = conn.execute(
-        "SELECT assigned_to, COUNT(*) AS total FROM tasks GROUP BY assigned_to ORDER BY assigned_to ASC"
+        "SELECT assignee, COUNT(*) AS total FROM tasks GROUP BY assignee ORDER BY assignee ASC"
     ).fetchall()
 
     lines = [
@@ -1478,7 +1502,7 @@ def metrics() -> Response:
     )
     for row in task_assignments:
         lines.append(
-            f'funding_bot_tasks_assigned_total{{assigned_to="{row["assigned_to"]}"}} {row["total"]}'
+            f'funding_bot_tasks_assigned_total{{assigned_to="{row["assignee"]}"}} {row["total"]}'
         )
     lines.extend(
         [

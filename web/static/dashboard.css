@@ -403,9 +403,15 @@ kbd {
     border-color: #94a3b8;
     color: #e2e8f0;
   }
+
+  .btn-outline-danger {
+    border-color: #fca5a5;
+    color: #fecaca;
+  }
 }
 
 .btn-sm,
+.form-control-sm,
 .form-select-sm {
   min-height: 2.25rem;
   padding: 0.45rem 0.7rem;

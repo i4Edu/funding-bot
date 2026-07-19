@@ -43,6 +43,7 @@ try {
             { selector: ".badge.text-bg-secondary", minimum: 4.5 },
             { selector: ".badge.text-bg-success", minimum: 4.5 },
             { selector: ".badge.text-bg-warning", minimum: 4.5 },
+            { selector: ".badge.text-bg-danger", minimum: 4.5 },
             { selector: ".badge.text-bg-light", minimum: 4.5 },
             { selector: ".badge.text-bg-info", minimum: 4.5 },
           ];

@@ -13,7 +13,6 @@ from funding_bot import FundingBot, QueueTaskContext, SMTPEmailSender
 DEFAULT_QUEUE_NAME = "funding-bot"
 DEFAULT_BROKER_URL = "redis://redis:6379/0"
 DEFAULT_RESULT_BACKEND = "redis://redis:6379/1"
-DEFAULT_RABBITMQ_BROKER_URL = "******rabbitmq:5672//"
 DEFAULT_RABBITMQ_BROKER_URL = "amqp://" "guest:guest@rabbitmq:5672//"
 DEFAULT_DAILY_SUMMARY_HOUR = 9
 DEFAULT_DAILY_SUMMARY_MINUTE = 0
@@ -320,6 +319,7 @@ def send_outreach_task(
     *,
     donor_email: str,
     donor_name: str,
+    template_name: str = FundingBot.DEFAULT_OUTREACH_TEMPLATE,
     subject_template: str | None = None,
     body_template: str | None = None,
     locale: str | None = None,
@@ -331,6 +331,7 @@ def send_outreach_task(
         payload = {
             "donor_email": donor_email,
             "donor_name": donor_name,
+            "template_name": template_name,
             "subject_template": subject_template,
             "body_template": body_template,
             "locale": locale,
@@ -350,14 +351,15 @@ def send_outreach_task(
                         locale=str(resolved_locale),
                     )
                 result = context.bot.send_outreach_from_template(
-                    context.bot.DEFAULT_OUTREACH_TEMPLATE,
+                    str(task_payload.get("template_name") or context.bot.DEFAULT_OUTREACH_TEMPLATE),
                     str(task_payload["donor_email"]),
                     str(task_payload["donor_name"]),
                     sender=sender,
+                    locale=str(resolved_locale) if resolved_locale is not None else None,
                 )
             else:
                 fallback = context.bot._resolve_catalog_template(
-                    context.bot.DEFAULT_OUTREACH_TEMPLATE,
+                    str(task_payload.get("template_name") or context.bot.DEFAULT_OUTREACH_TEMPLATE),
                     segment="unknown",
                     locale=str(resolved_locale or context.bot.DEFAULT_TEMPLATE_LOCALE),
                 ) or (
