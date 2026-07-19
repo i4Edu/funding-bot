@@ -788,7 +788,7 @@ def _build_cors_preflight_response() -> Response:
     origin = _origin_from_request()
     if not _is_allowed_cors_origin(origin):
         return _json_error("Origin not allowed for this API.", 403)
-    assert origin is not None, "_is_allowed_cors_origin() returns False for None, so origin must exist here"
+    assert origin is not None, "Origin must be non-None after CORS validation"
     response = app.response_class(status=204)
     return _apply_cors_headers(response, origin=origin, preflight=True)
 
@@ -840,7 +840,7 @@ def attach_security_headers(response: Response) -> Response:
     if _is_api_route(request.path):
         origin = _origin_from_request()
         if _is_allowed_cors_origin(origin):
-            assert origin is not None, "_is_allowed_cors_origin() returns False for None, so origin must exist here"
+            assert origin is not None, "Origin must be non-None after CORS validation"
             response = _apply_cors_headers(
                 response,
                 origin=origin,
