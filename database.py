@@ -149,6 +149,27 @@ class DatabasePoolMonitor:
         return snapshot
 
 
+class _PersistentConnectionProxy:
+    def __init__(self, raw_connection: Any) -> None:
+        self._raw_connection = raw_connection
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._raw_connection, name)
+
+    def __enter__(self) -> "_PersistentConnectionProxy":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, _tb: Any) -> bool:
+        if exc_type is None:
+            self._raw_connection.commit()
+        else:
+            self._raw_connection.rollback()
+        return False
+
+    def close(self) -> None:
+        self._raw_connection.close()
+
+
 class DatabaseManager:
     def __init__(
         self,
@@ -210,7 +231,8 @@ class DatabaseManager:
             )
         self.engine = create_engine(url, **engine_kwargs)
         self.monitor.attach(self.engine)
-        self.connection = self.engine.raw_connection()
+        raw_connection = self.engine.raw_connection()
+        self.connection = _PersistentConnectionProxy(raw_connection)
         sqlite_connection = self.driver_connection
         sqlite_connection.execute("PRAGMA foreign_keys = ON")
         sqlite_connection.execute("PRAGMA busy_timeout = 5000")

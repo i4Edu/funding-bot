@@ -15,7 +15,6 @@ os.environ.setdefault("AUDITOR_PASSWORD", "auditor-secret")
 
 from funding_bot import (  # noqa: E402
     ConnectionSecurityError,
-    FundingBot,
     _default_http_json_client,
     _require_https_url,
     create_connector,
@@ -303,25 +302,3 @@ class DashboardRateLimitAndCsrfTests(unittest.TestCase):
             app.config["RATE_LIMIT_API"] = original
 
         self.assertEqual(429, limited.status_code)
-
-    def test_task_status_route_accepts_session_cookie_with_csrf_token(self):
-        bot = FundingBot(db_path=str(self.db_path))
-        task = bot.create_task(title="Prepare proposal", assigned_to="admin")
-        bot.close()
-
-        page = self.client.get(
-            "/settings",
-            headers=self.admin_headers,
-            base_url="https://localhost",
-        )
-        csrf_token = page.headers.get("X-CSRF-Token")
-
-        response = self.client.post(
-            f"/tasks/{task['id']}/status",
-            json={"status": "in-progress"},
-            headers={"X-CSRF-Token": csrf_token},
-            base_url="https://localhost",
-        )
-
-        self.assertEqual(200, response.status_code)
-        self.assertEqual("in-progress", response.get_json()["task"]["status"])

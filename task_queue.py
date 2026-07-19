@@ -433,7 +433,10 @@ def send_daily_summary_task(
             context.checkpoint("Shutdown requested before daily summary started.")
             sender = None if task_payload.get("dry_run", False) else SMTPEmailSender.from_env()
             if sender is not None and not callable(sender):
-                sender = lambda *_args, **_kwargs: None
+                def _discard_email(*_args: Any, **_kwargs: Any) -> None:
+                    return None
+
+                sender = _discard_email
             result = context.bot.send_daily_summary(
                 recipient=str(task_payload["recipient"]),
                 sender=sender,
@@ -503,7 +506,7 @@ def dispatch_discovery(
             "legacy_cron_enabled": config.enable_legacy_cron,
         }
 
-    payload = _run_discovery_inline(
+    payload: dict[str, Any] = _run_discovery_inline(
         keywords=keywords,
         trusted_sources=trusted_sources,
         db_path=db_path,

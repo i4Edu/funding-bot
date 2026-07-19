@@ -32,7 +32,7 @@
             <div class="card-body">
               <p id="organization-profile-help" class="text-muted small">Update the organization record used in outreach and application documents.</p>
               <form id="organization-form" class="rtl-safe" aria-labelledby="organization-profile-heading" aria-describedby="organization-profile-help">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() if csrf_token is defined else '' }}">
                 <div class="mb-3">
                   <label class="form-label" for="org-name">Organization name</label>
                   <input class="form-control" id="org-name" name="name" value="{{ organization_profile.get('name', '') }}">
@@ -76,7 +76,7 @@
             <div class="card-body">
               <p id="search-settings-help" class="text-muted small">Choose keywords and trusted portals used during automated discovery.</p>
               <form id="search-form" class="rtl-safe" aria-labelledby="search-settings-heading" aria-describedby="search-settings-help">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() if csrf_token is defined else '' }}">
                 <div class="mb-3">
                   <label class="form-label" for="search-keywords">Keyword filters (comma-separated)</label>
                   <input class="form-control" id="search-keywords" name="keywords" value="{{ search_settings.keywords | join(', ') }}">
@@ -102,7 +102,7 @@
                 {% endfor %}
               </ul>
               <form id="credential-form" class="row g-2 rtl-safe" aria-labelledby="credential-aliases-heading" aria-describedby="credential-aliases-help">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() if csrf_token is defined else '' }}">
                 <p id="credential-aliases-help" class="text-muted small mb-0">Add a friendly name for a secret-backed environment variable.</p>
                 <div class="col-5">
                   <label class="form-label small mb-1" for="credential-alias">Alias</label>
@@ -143,7 +143,7 @@
                 <span class="text-muted">storage region {{ residency_status.storage_region }}</span>
               </p>
               <form id="privacy-policy-form" class="rtl-safe" aria-labelledby="privacy-policy-heading">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() if csrf_token is defined else '' }}">
                 <div class="mb-3">
                   <label class="form-label" for="policy-jurisdictions">Jurisdictions (comma-separated)</label>
                   <input class="form-control" id="policy-jurisdictions" name="jurisdictions" value="{{ organization_profile.get('privacy_jurisdictions', residency_status.data_residency) | join(', ') if organization_profile.get('privacy_jurisdictions') is iterable and organization_profile.get('privacy_jurisdictions') is not string else organization_profile.get('privacy_jurisdictions', residency_status.data_residency) }}">
@@ -182,7 +182,7 @@
               <fieldset aria-describedby="outreach-help">
                 <legend class="visually-hidden">Donor outreach test details</legend>
                 <form id="outreach-form" class="rtl-safe" aria-labelledby="outreach-heading" aria-describedby="outreach-help">
-                  <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() if csrf_token is defined else '' }}">
                   <div class="row g-2">
                     <div class="col-6">
                       <label class="form-label small mb-1" for="outreach-email">Donor email</label>

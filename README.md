@@ -13,6 +13,7 @@ For collaboration workflow, permissions, and task API examples, see [docs/COLLAB
 For the complete JSON/text API contract, schemas, diagrams, and curl examples, see [docs/API_REFERENCE.md](docs/API_REFERENCE.md).
 For deployment and scaling guidance, see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
 For Kubernetes rollout details, see [docs/KUBERNETES.md](docs/KUBERNETES.md).
+For profiling commands, baselines, and flame graph workflows, see [docs/PROFILING.md](docs/PROFILING.md).
 For release/versioning rules, see [docs/VERSIONING.md](docs/VERSIONING.md).
 For a fast local setup guide, see [docs/QUICKSTART.md](docs/QUICKSTART.md).
 For the complete environment variable reference, see [docs/ENV_VARS.md](docs/ENV_VARS.md).
@@ -28,6 +29,7 @@ For the operational breach runbook, see [docs/INCIDENT_RESPONSE.md](docs/INCIDEN
 - [Glossary](docs/GLOSSARY.md)
 - [Video walkthroughs](docs/VIDEOS.md)
 - [Connector guide](docs/CONNECTORS.md)
+- [Profiling guide](docs/PROFILING.md)
 - [API reference](docs/API.md)
 - [Collaboration guide](docs/COLLABORATION.md)
 - [Deployment guide](docs/DEPLOYMENT.md)
@@ -259,6 +261,19 @@ pip install -r requirements.txt
 ```
 
 Set `FUNDING_BOT_ENCRYPTION_KEY` in deployed environments so encrypted donor and organization fields use a deployment-specific key.
+`requirements.txt` also installs `py-spy` so the profiling utilities can emit SVG flame graphs in addition to `cProfile` reports.
+
+### Install pre-commit hooks
+
+Use the repository's pre-commit config to run formatting, linting, type checking, and security scans before each commit:
+
+```bash
+pip install pre-commit
+pre-commit install
+pre-commit run --all-files
+```
+
+The configured hooks run `black`, `isort`, `flake8`, `mypy`, `bandit`, `safety`, and `pip-audit`. Dependency scans cover both `requirements.txt` and `web/requirements.txt`.
 
 ## Document localization
 
@@ -349,6 +364,24 @@ LOAD_TEST_PASSWORD=admin-secret \
   --html dashboard-load-report.html --csv dashboard-load
 python tests/load/assert_dashboard_load.py --csv-prefix dashboard-load --max-failures 0 --max-p95-ms 750 --min-rps 5
 ```
+
+### Run performance profiling
+
+```bash
+python scripts/profile_operations.py \
+  --iterations 5 \
+  --output-dir profiling/reports/local \
+  --compare-baseline profiling/baselines.json
+
+python scripts/profile_operations.py \
+  --iterations 5 \
+  --output-dir profiling/reports/local \
+  --compare-baseline profiling/baselines.json \
+  --check-regressions \
+  --with-flamegraphs
+```
+
+See [docs/PROFILING.md](docs/PROFILING.md) for baseline tuning, report contents, and CI behavior.
 
 ### Run the CLI
 

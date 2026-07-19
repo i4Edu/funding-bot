@@ -20,7 +20,8 @@ import threading
 import time
 import urllib.parse
 import zipfile
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, fields
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -34,6 +35,30 @@ import requests
 from jsonschema import ValidationError, validate
 from cache_manager import CacheManager
 from database import DatabaseManager
+from warehouse_exports import ArchiveManager, WarehouseExportService
+try:
+    from colorama import Fore, Style, init as colorama_init
+except ImportError:  # pragma: no cover - exercised when optional CLI extras are absent
+    class _ColorFallback:
+        BLACK = ""
+        BLUE = ""
+        CYAN = ""
+        GREEN = ""
+        MAGENTA = ""
+        RED = ""
+        RESET = ""
+        WHITE = ""
+        YELLOW = ""
+
+    class _StyleFallback:
+        BRIGHT = ""
+        RESET_ALL = ""
+
+    Fore = _ColorFallback()
+    Style = _StyleFallback()
+
+    def colorama_init(*_args: Any, **_kwargs: Any) -> None:
+        return None
 try:
     import aiohttp
 except ImportError:  # pragma: no cover - async HTTP is optional in some envs
@@ -54,6 +79,25 @@ except ImportError:  # pragma: no cover - exercised in environments without Babe
     babel_format_date = None
     babel_format_datetime = None
     babel_format_decimal = None
+
+try:
+    from rich.console import Console
+    from rich.progress import (
+        BarColumn,
+        MofNCompleteColumn,
+        Progress,
+        SpinnerColumn,
+        TextColumn,
+        TimeRemainingColumn,
+    )
+except ImportError:  # pragma: no cover - exercised when rich is unavailable
+    Console = None
+    Progress = None
+    SpinnerColumn = None
+    TextColumn = None
+    BarColumn = None
+    MofNCompleteColumn = None
+    TimeRemainingColumn = None
 
 # ---------------------------------------------------------------------------
 # Simple TTL cache for repeated portal queries
@@ -120,6 +164,22 @@ SUPPORTED_UI_LOCALES: dict[str, dict[str, Any]] = {
     },
 }
 _CONNECTOR_RESULT_SCHEMA_VERSION = 2
+_CLI_PROGRESS_CALLBACK: ContextVar[Callable[[dict[str, Any]], None] | None] = ContextVar(
+    "funding_bot_cli_progress_callback",
+    default=None,
+)
+
+
+@dataclass
+class _CliOutputSettings:
+    stdout_color: bool = False
+    stderr_color: bool = False
+    progress_enabled: bool = False
+    no_color: bool = False
+    json_output: bool = False
+
+
+_CLI_OUTPUT_SETTINGS = _CliOutputSettings()
 
 
 def _validate_email(email: str) -> str:
@@ -1263,6 +1323,95 @@ class TokenBucketRateLimiter:
         return self._tokens
 
 
+@dataclass(frozen=True)
+class ConnectorBatchRequest:
+    connector: PortalConnector
+    keywords: tuple[str, ...]
+
+
+class ConnectorBatchScheduler:
+    """Batch connector requests and coalesce duplicate in-flight work."""
+
+    def __init__(self, *, batch_size: int = 5) -> None:
+        self.batch_size = max(1, int(batch_size))
+
+    def _request_key(self, request: ConnectorBatchRequest) -> str:
+        build_cache_key = getattr(request.connector, "build_cache_key", None)
+        if callable(build_cache_key):
+            connector_cache_key = str(build_cache_key(request.keywords))
+        else:
+            connector_cache_key = json.dumps(sorted(request.keywords))
+        connector_name = getattr(
+            request.connector,
+            "source_name",
+            request.connector.__class__.__name__,
+        )
+        return f"{connector_name}:{connector_cache_key}"
+
+    async def submit_many(self, requests: Iterable[ConnectorBatchRequest]) -> list[Any]:
+        ordered_requests = list(requests)
+        if not ordered_requests:
+            return []
+
+        pending: dict[str, asyncio.Future[Any]] = {}
+        unique_requests: list[tuple[str, ConnectorBatchRequest, asyncio.Future[Any]]] = []
+        futures: list[asyncio.Future[Any]] = []
+        loop = asyncio.get_running_loop()
+
+        for request in ordered_requests:
+            request_key = self._request_key(request)
+            future = pending.get(request_key)
+            if future is None:
+                future = loop.create_future()
+                pending[request_key] = future
+                unique_requests.append((request_key, request, future))
+                _BATCH_METRICS.record_scheduled(coalesced=False)
+            else:
+                _BATCH_METRICS.record_scheduled(coalesced=True)
+            futures.append(future)
+
+        async with _reuse_or_create_aiohttp_session(timeout=10.0) as shared_session:
+            for start in range(0, len(unique_requests), self.batch_size):
+                batch = unique_requests[start : start + self.batch_size]
+                batch_started_at = time.perf_counter()
+                results = await asyncio.gather(
+                    *[
+                        self._execute_request(
+                            request,
+                            shared_session=shared_session,
+                        )
+                        for _, request, _ in batch
+                    ],
+                    return_exceptions=True,
+                )
+                failed = any(isinstance(result, Exception) for result in results)
+                _BATCH_METRICS.record_batch(
+                    batch_size=len(batch),
+                    duration_seconds=time.perf_counter() - batch_started_at,
+                    failed=failed,
+                )
+                for (_, _request, future), result in zip(batch, results):
+                    if future.done():
+                        continue
+                    if isinstance(result, Exception):
+                        future.set_exception(result)
+                    else:
+                        future.set_result(result)
+
+        return [await asyncio.shield(future) for future in futures]
+
+    async def _execute_request(
+        self,
+        request: ConnectorBatchRequest,
+        *,
+        shared_session: Any | None = None,
+    ) -> Any:
+        fetch_result_async = getattr(request.connector, "fetch_result_async", None)
+        if callable(fetch_result_async):
+            return await fetch_result_async(request.keywords, shared_session=shared_session)
+        return await asyncio.to_thread(request.connector.fetch_result, request.keywords)
+
+
 class _BasePortalConnector:
     """Common behavior for demo portal connectors."""
 
@@ -1276,6 +1425,7 @@ class _BasePortalConnector:
     def __init__(
         self,
         http_client: Callable[..., Any] | None = None,
+        async_http_client: Callable[..., Any] | None = None,
         *,
         base_url: str | None = None,
         source_name: str | None = None,
@@ -1299,6 +1449,7 @@ class _BasePortalConnector:
         cache_manager: CacheManager | None = None,
     ) -> None:
         self.http_client = http_client
+        self.async_http_client = async_http_client
         self.base_url = _require_https_url(
             base_url or self.base_url,
             purpose=f"{self.source_name or self.__class__.__name__} connector base URL",
@@ -1312,12 +1463,15 @@ class _BasePortalConnector:
         self.transport = transport
         self.page_size = self._resolve_page_size(page_size)
         cache_ttl = self._resolve_cache_ttl(cache_ttl)
-        self._cache_manager = cache_manager or default_cache_manager()
-        self._cache = _ManagedTTLCache(
-            namespace="connector-data",
-            scope=self.connector_slug,
-            ttl_seconds=cache_ttl,
-        )
+        self._cache_manager = cache_manager
+        if cache_manager is None:
+            self._cache = _TTLCache(ttl_seconds=cache_ttl)
+        else:
+            self._cache = _ManagedTTLCache(
+                namespace="connector-data",
+                scope=self.connector_slug,
+                ttl_seconds=cache_ttl,
+            )
         self.max_retries = max(0, max_retries)
         self.retry_backoff_base = max(0.0, retry_backoff_base)
         self.retry_backoff_factor = max(1.0, retry_backoff_factor)
@@ -1441,6 +1595,18 @@ class _BasePortalConnector:
         except Exception:
             return []
 
+    async def fetch_opportunities_async(
+        self,
+        keywords: Iterable[str],
+        *,
+        shared_session: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        try:
+            result = await self.fetch_result_async(keywords, shared_session=shared_session)
+            return list(result["opportunities"])
+        except Exception:
+            return []
+
     def fetch_result(self, keywords: Iterable[str]) -> dict[str, Any]:
         started_at = time.perf_counter()
         degraded = False
@@ -1485,6 +1651,110 @@ class _BasePortalConnector:
             if use_remote:
                 try:
                     result = self._fetch_remote_result(keyword_list)
+                except Exception as exc:
+                    degraded = True
+                    self._logger.warning(
+                        "Connector %s remote fetch failed for keywords %s: %s",
+                        self.source_name,
+                        keyword_list,
+                        exc,
+                    )
+                    return self._build_degraded_result(
+                        keyword_list,
+                        reason="connector_error",
+                        error=str(exc),
+                    )
+            else:
+                result = {
+                    "schema_version": self.result_schema_version,
+                    "opportunities": [dict(item) for item in self._demo_data()],
+                    "metadata": {
+                        "connector_name": self.source_name,
+                        "source_status": "demo",
+                    },
+                }
+
+            filtered = self._filter_opportunities(result["opportunities"], keyword_list)
+            payload = {
+                "schema_version": result["schema_version"],
+                "opportunities": filtered,
+                "metadata": {
+                    **dict(result.get("metadata", {})),
+                    "cache_key": self.build_cache_key(keyword_list),
+                    "keyword_count": len(keyword_list),
+                },
+            }
+            degraded = payload["metadata"].get("source_status") == "degraded"
+            if self._cache is not None and not degraded:
+                self._cache.set(
+                    cache_key,
+                    {
+                        "schema_version": payload["schema_version"],
+                        "opportunities": [dict(item) for item in payload["opportunities"]],
+                        "metadata": dict(payload["metadata"]),
+                    },
+                )
+            return payload
+        finally:
+            _CONNECTOR_METRICS.record(
+                connector_name=self.source_name,
+                connector_type=self.connector_slug,
+                latency_seconds=time.perf_counter() - started_at,
+                errored=degraded,
+            )
+
+    async def fetch_result_async(
+        self,
+        keywords: Iterable[str],
+        *,
+        shared_session: Any | None = None,
+    ) -> dict[str, Any]:
+        started_at = time.perf_counter()
+        degraded = False
+        try:
+            self._last_rate_limit_retry_after = None
+            keyword_list = self._expand_keywords(keywords)
+            cache_key = self._cache_key(keyword_list)
+            if self._cache is not None:
+                hit, cached = self._cache.get(cache_key)
+                if hit:
+                    return {
+                        "schema_version": cached["schema_version"],
+                        "opportunities": [dict(item) for item in cached["opportunities"]],
+                        "metadata": dict(cached["metadata"]),
+                    }
+
+            if self._refresh_circuit_state() == "open":
+                self._metrics["short_circuits"] += 1
+                degraded = True
+                self._logger.warning(
+                    "Connector %s request short-circuited because the circuit breaker is open.",
+                    self.source_name,
+                )
+                return self._build_degraded_result(keyword_list, reason="circuit_open")
+
+            use_remote = self.http_client is not None or self.async_http_client is not None or self.transport == "http"
+            if use_remote:
+                allowed, retry_after = self._rate_limiter.consume()
+                if not allowed:
+                    self._metrics["rate_limited_requests"] += 1
+                    self._last_rate_limit_retry_after = retry_after
+                    self._last_error = (
+                        f"{self.source_name} rate limit exceeded; retry in {retry_after:.2f} seconds."
+                    )
+                    degraded = True
+                    self._logger.warning("%s", self._last_error)
+                    return self._build_degraded_result(
+                        keyword_list,
+                        reason="rate_limit_exceeded",
+                        error=self._last_error,
+                    )
+            if use_remote:
+                try:
+                    result = await self._fetch_remote_result_async(
+                        keyword_list,
+                        shared_session=shared_session,
+                    )
                 except Exception as exc:
                     degraded = True
                     self._logger.warning(
@@ -1753,6 +2023,80 @@ class _BasePortalConnector:
             },
         }
 
+    async def _fetch_remote_result_async(
+        self,
+        keywords: list[str],
+        *,
+        shared_session: Any | None = None,
+    ) -> dict[str, Any]:
+        client = self.async_http_client or self.http_client or _default_http_json_client_async
+
+        opportunities: list[dict[str, Any]] = []
+        declared_version: Any = None
+        response_keys: set[str] = set()
+        pages_fetched = 0
+        page = 1
+        resolved_credentials = self._get_resolved_credentials()
+
+        while True:
+            async def operation(page_number: int = page) -> Any:
+                payload = {
+                    "keywords": keywords,
+                    "page": page_number,
+                    "page_size": self.page_size,
+                    "health_check": self._circuit_state == "half-open",
+                }
+                attempts = (
+                    lambda: client(
+                        self.base_url,
+                        payload,
+                        resolved_credentials,
+                        session=shared_session,
+                    ),
+                    lambda: client(self.base_url, payload, resolved_credentials),
+                    lambda: client(self.base_url, payload, session=shared_session),
+                    lambda: client(self.base_url, payload),
+                )
+                last_type_error: TypeError | None = None
+                for attempt in attempts:
+                    try:
+                        return await _maybe_await(attempt())
+                    except TypeError as exc:
+                        last_type_error = exc
+                        continue
+                if last_type_error is not None:
+                    raise last_type_error
+                return await _maybe_await(client(self.base_url, payload))
+
+            response = await self._call_with_retry_async(operation)
+            page_payload, page_declared_version, page_response_keys, next_page = self._parse_remote_page(
+                response,
+                current_page=page,
+            )
+            opportunities.extend(page_payload)
+            pages_fetched += 1
+            if page_declared_version is not None:
+                declared_version = page_declared_version
+            response_keys.update(page_response_keys)
+            if next_page is None:
+                break
+            page = next_page
+
+        detected_version = self.detect_schema_version(opportunities, declared_version)
+        return {
+            "schema_version": self.result_schema_version,
+            "opportunities": self.migrate_result_payload(opportunities, detected_version),
+            "metadata": {
+                "connector_name": self.source_name,
+                "source_status": "remote",
+                "detected_schema_version": detected_version,
+                "upstream_schema_version": declared_version,
+                "response_keys": sorted(response_keys),
+                "pages_fetched": pages_fetched,
+                "page_size": self.page_size,
+            },
+        }
+
     def _parse_remote_page(
         self,
         response: Any,
@@ -1980,6 +2324,25 @@ class _BasePortalConnector:
                 if self._is_retryable(exc) and attempt_number < attempts:
                     self._metrics["retry_attempts"] += 1
                     self._sleep(self.retry_backoff_base * (self.retry_backoff_factor ** (attempt_number - 1)))
+                    continue
+                self._record_failure(exc)
+                raise
+            self._record_success()
+            return result
+        raise RuntimeError("Connector retry loop exhausted unexpectedly.")
+
+    async def _call_with_retry_async(self, operation: Callable[[], Any]) -> Any:
+        attempts = self.max_retries + 1
+        for attempt_number in range(1, attempts + 1):
+            self._metrics["requests"] += 1
+            try:
+                result = await _maybe_await(operation())
+            except Exception as exc:
+                if self._is_retryable(exc) and attempt_number < attempts:
+                    self._metrics["retry_attempts"] += 1
+                    await asyncio.sleep(
+                        self.retry_backoff_base * (self.retry_backoff_factor ** (attempt_number - 1))
+                    )
                     continue
                 self._record_failure(exc)
                 raise
@@ -2972,6 +3335,45 @@ def _default_http_json_client(
         raise FundingBotError(f"Connector request to {url!r} failed: {exc}") from exc
 
 
+async def _default_http_json_client_async(
+    url: str,
+    payload: dict[str, Any],
+    credentials: dict[str, Any] | None = None,
+    *,
+    session: Any | None = None,
+) -> Any:
+    secure_url = _require_https_url(url, purpose="Connector request")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    resolved_credentials = dict(credentials or {})
+    authorization_header = str(resolved_credentials.get("authorization_header", "")).strip()
+    access_token = str(resolved_credentials.get("access_token", "")).strip()
+    if authorization_header:
+        headers["Authorization"] = authorization_header
+    elif access_token:
+        token_type = str(resolved_credentials.get("token_type", "Bearer")).strip() or "Bearer"
+        headers["Authorization"] = f"{token_type} {access_token}"
+    for key, value in resolved_credentials.items():
+        if key in {"auth_type", "access_token", "token_type", "authorization_header", "expires_at"}:
+            continue
+        headers[f"X-Connector-{key.replace('_', '-').title()}"] = str(value)
+    if aiohttp is None:
+        return await asyncio.to_thread(_default_http_json_client, url, payload, credentials)
+    try:
+        async with _reuse_or_create_aiohttp_session(session=session, timeout=10.0) as client_session:
+            if client_session is None:
+                return await asyncio.to_thread(_default_http_json_client, url, payload, credentials)
+            async with client_session.post(
+                secure_url,
+                json=payload,
+                headers=headers,
+                ssl=_build_tls_ssl_context(),
+            ) as response:
+                response.raise_for_status()
+                return await response.json()
+    except (aiohttp.ClientError, ValueError) as exc:
+        raise FundingBotError(f"Connector request to {url!r} failed: {exc}") from exc
+
+
 @dataclass(frozen=True)
 class ConnectorPlugin:
     factory: Callable[..., PortalConnector]
@@ -3412,6 +3814,7 @@ class FundingBot:
         "audit_logs_days": 365,
         "communications_days": 365,
         "documents_days": 180,
+        "opportunities_days": 365,
         "submission_attempts_days": 90,
         "completed_tasks_days": 180,
     }
@@ -3419,6 +3822,7 @@ class FundingBot:
         "audit_logs_days": "RETENTION_AUDIT_LOG_DAYS",
         "communications_days": "RETENTION_COMMUNICATION_DAYS",
         "documents_days": "RETENTION_DOCUMENT_DAYS",
+        "opportunities_days": "RETENTION_OPPORTUNITY_DAYS",
         "submission_attempts_days": "RETENTION_SUBMISSION_ATTEMPT_DAYS",
         "completed_tasks_days": "RETENTION_COMPLETED_TASK_DAYS",
     }
@@ -3452,6 +3856,7 @@ class FundingBot:
         self.connector_registry = connector_registry or DEFAULT_CONNECTOR_REGISTRY
         self._data_residency_status = self.validate_data_storage_location()
         self._active_queue_controllers: dict[str, GracefulShutdownController] = {}
+        self._db_lock = threading.RLock()
         self.cache_manager = cache_manager or default_cache_manager()
         if self.db_path == ":memory:":
             self._cache_scope = f"memory-{id(self)}"

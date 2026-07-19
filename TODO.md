@@ -209,9 +209,9 @@ _A prioritized backlog of 200 actionable tasks expanding on the open items in `r
 23. [ ] Convert `discover` CLI command into an async Celery task
 24. [ ] Convert `send-outreach` CLI command into an async Celery task
 25. [ ] Convert daily summary generation into a scheduled Celery beat task
-26. [ ] Add task retry policies with exponential backoff for queue tasks
-27. [ ] Add a dead-letter queue for repeatedly failing tasks
-28. [ ] Add task result persistence for auditing task outcomes
+26. [x] Add task retry policies with exponential backoff for queue tasks
+27. [x] Add a dead-letter queue for repeatedly failing tasks
+28. [x] Add task result persistence for auditing task outcomes
 29. [ ] Add a Flower (or equivalent) dashboard for task queue monitoring
 30. [ ] Add graceful shutdown handling for in-flight queue tasks
 31. [ ] Add idempotency keys to prevent duplicate task execution

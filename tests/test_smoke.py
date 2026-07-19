@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-import base64
-import os
-import shutil
 import sys
 from pathlib import Path
 
@@ -12,61 +9,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-os.environ.setdefault("ADMIN_PASSWORD", "admin-secret")
-os.environ.setdefault("STAFF_PASSWORD", "staff-secret")
-os.environ.setdefault("AUDITOR_PASSWORD", "auditor-secret")
-
-from funding_bot import FundingBot  # noqa: E402
-from web.app import app  # noqa: E402
-
 pytestmark = pytest.mark.smoke
-
-SMOKE_ARTIFACTS_DIR = Path(f".test-smoke-artifacts-{os.getpid()}")
-
-
-def _auth_header(role: str, password: str) -> dict[str, str]:
-    token = base64.b64encode(f"{role}:{password}".encode("utf-8")).decode("ascii")
-    return {"Authorization": f"Basic {token}"}
-
-
-@pytest.fixture()
-def smoke_client(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):
-    db_path = SMOKE_ARTIFACTS_DIR / f"{request.node.name}.db"
-    output_dir = SMOKE_ARTIFACTS_DIR / request.node.name
-    SMOKE_ARTIFACTS_DIR.mkdir(exist_ok=True)
-    if db_path.exists():
-        db_path.unlink()
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-
-    monkeypatch.setenv("BOT_DB_PATH", str(db_path))
-    monkeypatch.setenv("DATA_RESIDENCY", "EU")
-    monkeypatch.setenv("DATA_STORAGE_REGION", "EU")
-    FundingBot.reset_connector_metrics()
-    app.config["TESTING"] = True
-
-    client = app.test_client()
-    yield {
-        "client": client,
-        "db_path": db_path,
-        "output_dir": output_dir,
-        "admin_headers": _auth_header("admin", "admin-secret"),
-        "staff_headers": _auth_header("staff", "staff-secret"),
-        "auditor_headers": _auth_header("auditor", "auditor-secret"),
-    }
-
-    FundingBot.reset_connector_metrics()
-    if db_path.exists():
-        db_path.unlink()
-    if output_dir.exists():
-        shutil.rmtree(output_dir)
-    if SMOKE_ARTIFACTS_DIR.exists() and not any(SMOKE_ARTIFACTS_DIR.iterdir()):
-        SMOKE_ARTIFACTS_DIR.rmdir()
 
 
 @pytest.mark.quick
-def test_health_endpoints_report_ready_state(smoke_client: dict[str, object]) -> None:
-    client = smoke_client["client"]
+def test_health_endpoints_report_ready_state(app_client: dict[str, object]) -> None:
+    client = app_client["client"]
 
     health = client.get("/health")
     queue = client.get("/health/queue")
@@ -81,10 +29,10 @@ def test_health_endpoints_report_ready_state(smoke_client: dict[str, object]) ->
 
 @pytest.mark.quick
 def test_admin_session_supports_dashboard_settings_and_metrics_navigation(
-    smoke_client: dict[str, object],
+    app_client: dict[str, object],
 ) -> None:
-    client = smoke_client["client"]
-    admin_headers = smoke_client["admin_headers"]
+    client = app_client["client"]
+    admin_headers = app_client["admin_headers"]
 
     dashboard = client.get("/dashboard", headers=admin_headers)
     settings = client.get("/settings")
@@ -98,9 +46,9 @@ def test_admin_session_supports_dashboard_settings_and_metrics_navigation(
     assert b"funding_bot_opportunities_total" in metrics.data
 
 
-def test_discovery_submission_and_reporting_flow(smoke_client: dict[str, object]) -> None:
-    client = smoke_client["client"]
-    admin_headers = smoke_client["admin_headers"]
+def test_discovery_submission_and_reporting_flow(app_client: dict[str, object]) -> None:
+    client = app_client["client"]
+    admin_headers = app_client["admin_headers"]
 
     profile = client.post(
         "/settings/organization",
@@ -143,10 +91,10 @@ def test_discovery_submission_and_reporting_flow(smoke_client: dict[str, object]
     assert any(entry["action"] == "application_recorded" for entry in audit_log.get_json())
 
 
-def test_task_board_and_assignment_flow(smoke_client: dict[str, object]) -> None:
-    client = smoke_client["client"]
-    admin_headers = smoke_client["admin_headers"]
-    staff_headers = smoke_client["staff_headers"]
+def test_task_board_and_assignment_flow(app_client: dict[str, object]) -> None:
+    client = app_client["client"]
+    admin_headers = app_client["admin_headers"]
+    staff_headers = app_client["staff_headers"]
 
     created = client.post(
         "/tasks",
@@ -180,10 +128,10 @@ def test_task_board_and_assignment_flow(smoke_client: dict[str, object]) -> None
     assert updated.get_json()["status"] == "in-progress"
 
 
-def test_donor_outreach_and_analytics_flow(smoke_client: dict[str, object]) -> None:
-    client = smoke_client["client"]
-    admin_headers = smoke_client["admin_headers"]
-    auditor_headers = smoke_client["auditor_headers"]
+def test_donor_outreach_and_analytics_flow(app_client: dict[str, object]) -> None:
+    client = app_client["client"]
+    admin_headers = app_client["admin_headers"]
+    auditor_headers = app_client["auditor_headers"]
 
     donor = client.post(
         "/donors",

@@ -75,7 +75,7 @@
             <div class="card-header bg-white"><h2 class="h5 mb-0">Submit Translation</h2></div>
             <div class="card-body">
               <form id="translation-form" class="rtl-safe">
-                <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() if csrf_token is defined else '' }}">
                 <div class="mb-3">
                   <label class="form-label" for="translation-locale">Locale</label>
                   <select id="translation-locale" name="locale" class="form-select">
@@ -188,7 +188,7 @@
                       <td>
                         {% if current_role in ("staff", "admin") %}
                         <form class="decision-form rtl-safe" data-review-id="{{ review.id }}">
-                          <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token() if csrf_token is defined else '' }}">
                           <div class="mb-2">
                             <select class="form-select form-select-sm" name="status" aria-label="Review decision" {{ "disabled" if review.status != "pending" }}>
                               <option value="approved">Approve</option>

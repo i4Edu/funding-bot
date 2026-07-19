@@ -6,6 +6,8 @@ from unittest import mock
 
 import requests
 
+import funding_bot
+from cache_manager import CacheManager
 from funding_bot import (
     CSRNetworkConnector,
     CredentialNotFoundError,
@@ -72,26 +74,36 @@ class NoDemoConnector(_BasePortalConnector):
 
 
 class ConnectorCoverageTests(unittest.TestCase):
+    def setUp(self):
+        funding_bot._DEFAULT_CACHE_MANAGER = CacheManager()
+        funding_bot._DEFAULT_CONNECTORS = None
+
     def test_demo_connectors_expand_keywords_and_return_expected_records(self):
         self.assertEqual(
             "Education Innovation Grant",
-            GrantsPortalConnector().fetch_opportunities(["learning"])[0]["title"],
+            GrantsPortalConnector(cache_manager=CacheManager()).fetch_opportunities(["learning"])[0][
+                "title"
+            ],
         )
         self.assertEqual(
             "CSR Digital Learning Fund",
-            CSRNetworkConnector().fetch_opportunities(["edtech"])[0]["title"],
+            CSRNetworkConnector(cache_manager=CacheManager()).fetch_opportunities(["edtech"])[0]["title"],
         )
         self.assertEqual(
             "Community Literacy Matching Grant",
-            NGODirectoryConnector().fetch_opportunities(["community engagement"])[0]["title"],
+            NGODirectoryConnector(cache_manager=CacheManager()).fetch_opportunities(
+                ["community engagement"]
+            )[0]["title"],
         )
         self.assertEqual(
             "Community STEM Lab Campaign",
-            GlobalGivingConnector().fetch_opportunities(["stem"])[0]["title"],
+            GlobalGivingConnector(cache_manager=CacheManager()).fetch_opportunities(["stem"])[0]["title"],
         )
         self.assertEqual(
             "Assistive Tech Makerspace Project",
-            KickstarterForGoodConnector().fetch_opportunities(["assistive tech"])[0]["title"],
+            KickstarterForGoodConnector(cache_manager=CacheManager()).fetch_opportunities(
+                ["assistive tech"]
+            )[0]["title"],
         )
 
     def test_fetch_result_uses_cache_and_supports_manual_invalidation(self):
@@ -114,7 +126,12 @@ class ConnectorCoverageTests(unittest.TestCase):
                 ],
             }
 
-        connector = MinimalConnector(http_client=fake_http_client, transport="http", page_size=3)
+        connector = MinimalConnector(
+            http_client=fake_http_client,
+            transport="http",
+            page_size=3,
+            cache_manager=CacheManager(),
+        )
 
         first = connector.fetch_result(["education"])
         second = connector.fetch_result(["education"])
@@ -197,6 +214,7 @@ class ConnectorCoverageTests(unittest.TestCase):
             ),
             transport="http",
             max_retries=0,
+            cache_manager=CacheManager(),
         )
 
         result = connector.fetch_result(["education"])
@@ -207,13 +225,14 @@ class ConnectorCoverageTests(unittest.TestCase):
         self.assertEqual("connector offline", result["metadata"]["last_error"])
 
     def test_validate_connectivity_reports_ok_degraded_and_error_states(self):
-        ok = create_connector("csr-network").validate_connectivity(["edtech"])
+        ok = CSRNetworkConnector(cache_manager=CacheManager()).validate_connectivity(["edtech"])
 
         degraded_connector = GrantsPortalConnector(
             http_client=lambda _url, _payload, _credentials=None: (_ for _ in ()).throw(
                 TimeoutError("temporary timeout")
             ),
             max_retries=0,
+            cache_manager=CacheManager(),
         )
         degraded = degraded_connector.validate_connectivity(["education"])
         failed = BrokenValidationConnector().validate_connectivity(["education"])
@@ -292,6 +311,7 @@ class ConnectorCoverageTests(unittest.TestCase):
             transport="http",
             page_size=2,
             max_retries=0,
+            cache_manager=CacheManager(),
         )
         result = connector._fetch_remote_result(["education"])
 
@@ -592,6 +612,7 @@ class ConnectorCoverageTests(unittest.TestCase):
             retry_backoff_factor=2.0,
             sleep_func=clock.sleep,
             time_func=clock.monotonic,
+            cache_manager=CacheManager(),
         )
 
         rows = connector.fetch_opportunities(["education"])
@@ -615,6 +636,7 @@ class ConnectorCoverageTests(unittest.TestCase):
             circuit_recovery_timeout=5.0,
             sleep_func=clock.sleep,
             time_func=clock.monotonic,
+            cache_manager=CacheManager(),
         )
 
         first = connector.fetch_result(["education"])
@@ -643,6 +665,7 @@ class ConnectorCoverageTests(unittest.TestCase):
             time_func=rate_clock.monotonic,
             rate_limit_config={"capacity": 1.0, "refill_rate": 0.0},
             rate_limiter=AlwaysLimitedRateLimiter(),
+            cache_manager=CacheManager(),
         )
         rate_limited = limited.fetch_result(["education"])
 
@@ -678,6 +701,7 @@ class ConnectorCoverageTests(unittest.TestCase):
                     ]
                 }
             },
+            cache_manager=CacheManager(),
         )
 
         rows = connector.fetch_opportunities(["stem"])
@@ -718,6 +742,7 @@ class ConnectorCoverageTests(unittest.TestCase):
                     "summary": "Community makerspace",
                 }
             ],
+            cache_manager=CacheManager(),
         )
 
         rows = connector.fetch_opportunities(["community"])

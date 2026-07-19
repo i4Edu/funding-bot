@@ -487,7 +487,7 @@ def _task_scope_for_role(role: str | None) -> str | None:
 
 
 def _group_tasks_by_status(tasks: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-    grouped = {status: [] for status in FundingBot.TASK_STATUSES}
+    grouped: dict[str, list[dict[str, Any]]] = {status: [] for status in FundingBot.TASK_STATUSES}
     for task in tasks:
         grouped.setdefault(task["status"], []).append(task)
     return grouped
@@ -1714,7 +1714,7 @@ def metrics() -> Response:
     tasks_total = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
     uptime_seconds = time.time() - _APP_START_TIME
     task_counts = _mapping_or_default(bot.get_task_status_counts(), {})
-    raw_queue_metrics = getattr(bot, "get_queue_metrics", lambda: {})()
+    raw_queue_metrics: dict[str, Any] = getattr(bot, "get_queue_metrics", lambda: {})()
     database_metrics = _mapping_or_default(
         getattr(bot, "get_database_pool_metrics", lambda: {})(),
         {

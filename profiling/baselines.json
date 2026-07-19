@@ -1,0 +1,22 @@
+{
+  "generated_at": "2026-07-19T00:00:00+00:00",
+  "operations": {
+    "connector_calls": {
+      "allowed_overhead_seconds": 0.04,
+      "baseline_seconds": 0.03,
+      "max_regression_factor": 3.0
+    },
+    "dashboard_queries": {
+      "allowed_overhead_seconds": 0.2,
+      "baseline_seconds": 0.18,
+      "max_regression_factor": 3.0
+    },
+    "deduplication": {
+      "allowed_overhead_seconds": 0.1,
+      "baseline_seconds": 0.14,
+      "max_regression_factor": 3.0
+    }
+  },
+  "tool": "scripts/profile_operations.py",
+  "version": 1
+}
