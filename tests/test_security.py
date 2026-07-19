@@ -78,7 +78,7 @@ class ConnectorTLSSecurityTests(unittest.TestCase):
 
 class DashboardSessionSecurityTests(unittest.TestCase):
     def setUp(self):
-        self.db_path = Path(".test_security_web.db")
+        self.db_path = Path(f".test_security_web_{self._testMethodName}.db")
         if self.db_path.exists():
             self.db_path.unlink()
         os.environ["BOT_DB_PATH"] = str(self.db_path)
@@ -189,15 +189,7 @@ class DashboardRateLimitAndCsrfTests(unittest.TestCase):
         )
         self.assertEqual(400, missing.status_code)
         self.assertIn("CSRF", missing.get_json()["error"])
-
-        invalid = self.client.post(
-            "/settings/organization",
-            json={"name": "i4Edu"},
-            headers={"X-CSRF-Token": "invalid-token"},
-            base_url="https://localhost",
-        )
-        self.assertEqual(400, invalid.status_code)
-        self.assertIn("csrf_token", invalid.get_json())
+        csrf_token = missing.get_json()["csrf_token"]
 
         valid = self.client.post(
             "/settings/organization",
@@ -207,6 +199,15 @@ class DashboardRateLimitAndCsrfTests(unittest.TestCase):
         )
         self.assertEqual(200, valid.status_code)
         self.assertEqual("i4Edu", valid.get_json()["organization_profile"]["name"])
+
+        invalid = self.client.post(
+            "/settings/organization",
+            json={"name": "i4Edu"},
+            headers={"X-CSRF-Token": "invalid-token"},
+            base_url="https://localhost",
+        )
+        self.assertEqual(400, invalid.status_code)
+        self.assertIn("csrf_token", invalid.get_json())
 
     def test_basic_auth_api_clients_can_post_without_csrf_token(self):
         response = self.client.post(

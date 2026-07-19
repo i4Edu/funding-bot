@@ -276,6 +276,19 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertEqual("ok", payload["status"])
         self.assertEqual("cron", payload["queue"]["mode"])
         self.assertFalse(payload["queue"]["queue_enabled"])
+        self.assertIn("database", payload)
+        self.assertIn("cache", payload)
+        self.assertIn("backend", payload["database"])
+        self.assertIn("reachable", payload["cache"])
+
+    def test_database_and_cache_health_endpoints_return_monitoring_payloads(self):
+        database_response = self.client.get("/health/database")
+        cache_response = self.client.get("/health/cache")
+
+        self.assertEqual(200, database_response.status_code)
+        self.assertEqual(200, cache_response.status_code)
+        self.assertIn("pool_class", database_response.get_json())
+        self.assertIn("backend", cache_response.get_json())
 
     def test_queue_health_endpoint_reports_disabled_queue_mode(self):
         response = self.client.get("/health/queue")
@@ -374,6 +387,8 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn("funding_bot_queue_task_runs_failed 1", body)
         self.assertIn("funding_bot_queue_task_retries_total 1", body)
         self.assertIn("funding_bot_dead_letter_queue_total 1", body)
+        self.assertIn("funding_bot_db_pool_size", body)
+        self.assertIn('funding_bot_cache_hits_total{cache="donor-records"', body)
 
     def test_metrics_include_connector_request_error_and_latency_series(self):
         discover = self.client.post(

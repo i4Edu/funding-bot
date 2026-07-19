@@ -1,1 +1,2 @@
 -r web/requirements.txt
+py-spy==0.4.1

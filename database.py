@@ -166,7 +166,11 @@ class DatabaseManager:
         if self._enabled:
             self._initialize_sqlalchemy_connection()
         else:  # pragma: no cover - fallback only for environments missing SQLAlchemy
-            connection = sqlite3.connect(self.db_path, check_same_thread=False)
+            connection = sqlite3.connect(
+                self.db_path,
+                check_same_thread=False,
+                uri=self._uses_sqlite_uri(self.db_path),
+            )
             connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA busy_timeout = 5000")
             connection.row_factory = sqlite3.Row
@@ -175,13 +179,19 @@ class DatabaseManager:
     def _initialize_sqlalchemy_connection(self) -> None:
         assert create_engine is not None
         assert StaticPool is not None
-        is_memory = self.db_path == ":memory:" or self.db_path.startswith("file::memory:")
-        if is_memory:
+        is_memory = self._is_in_memory_database(self.db_path)
+        uses_uri = self._uses_sqlite_uri(self.db_path)
+        if self.db_path == ":memory:":
             url = "sqlite:///:memory:"
+        elif uses_uri:
+            url = f"sqlite:///{self.db_path}"
         else:
             url = f"sqlite:///{Path(self.db_path).resolve()}"
         engine_kwargs: dict[str, Any] = {
-            "connect_args": {"check_same_thread": False},
+            "connect_args": {
+                "check_same_thread": False,
+                **({"uri": True} if uses_uri else {}),
+            },
             "future": True,
             "pool_pre_ping": self.config.pre_ping,
         }
@@ -206,6 +216,18 @@ class DatabaseManager:
         sqlite_connection.execute("PRAGMA busy_timeout = 5000")
         sqlite_connection.row_factory = sqlite3.Row
         self._backend = "sqlalchemy"
+
+    @staticmethod
+    def _uses_sqlite_uri(db_path: str) -> bool:
+        return db_path.startswith("file:")
+
+    @classmethod
+    def _is_in_memory_database(cls, db_path: str) -> bool:
+        if db_path == ":memory:":
+            return True
+        if not cls._uses_sqlite_uri(db_path):
+            return False
+        return "mode=memory" in db_path
 
     @property
     def driver_connection(self) -> sqlite3.Connection:

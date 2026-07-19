@@ -1118,6 +1118,17 @@ Celery is the preferred replacement for cron for new asynchronous work in this r
 | `CELERY_QUEUE_NAME` | `funding-bot` | Default queue name for funding bot workers. |
 | `CELERY_HEALTH_TIMEOUT_SECONDS` | `2.0` in `.env.example` | Timeout for `/health/queue` broker and worker checks. |
 | `CELERY_TASK_ALWAYS_EAGER` | `0` | Execute queued work inline for tests and local debugging. |
+| `FLOWER_BASIC_AUTH` | *(empty)* | Optional `user:password` pair for protecting the Flower UI. |
+
+Queue task execution metadata is stored in SQLite (`task_runs` and `task_history`), including:
+
+- `idempotency_key` for duplicate prevention
+- `duplicate_requests` to count prevented replays
+- `shutdown_requested` to track cooperative SIGTERM/SIGINT drains
+
+Workers install graceful shutdown handlers and Docker Compose now gives them a `45s`
+`stop_grace_period`, allowing in-flight tasks to checkpoint, mark themselves
+cancelled, and avoid duplicate re-execution on restart.
 
 RabbitMQ broker example:
 
@@ -1145,6 +1156,10 @@ Start the stack with:
 ```bash
 docker compose --profile queue up --build
 ```
+
+Flower can be protected with `FLOWER_BASIC_AUTH=user:password` in `.env`. The
+worker service uses `SIGTERM` plus a 45-second grace window so queue tasks can
+persist shutdown state before containers stop.
 
 ### Legacy cron fallback
 

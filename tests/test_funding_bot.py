@@ -105,6 +105,14 @@ class FundingBotTests(unittest.TestCase):
             rmtree(self.output_dir)
         os.environ.pop("PORTAL_CREDENTIALS", None)
 
+    def test_database_pool_metrics_are_exposed(self):
+        metrics = self.bot.get_database_pool_metrics()
+
+        self.assertIn(metrics["backend"], {"sqlalchemy", "sqlite3"})
+        self.assertIn("checkouts", metrics)
+        self.assertIn("checked_out", metrics)
+        self.assertIn("pool_class", metrics)
+
     def _discover_sample_opportunity(self):
         found = self.bot.discover_opportunities(
             [
@@ -2358,6 +2366,19 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
             json.loads(stored["field_classifications_json"])["tax_id"],
         )
         self.assertEqual("SECRET-TAX-ID", self.bot.load_organization_profile()["tax_id"])
+
+    def test_deduped_profile_cache_tracks_hits_and_invalidates_on_profile_updates(self):
+        self.bot.store_organization_profile({"name": "i4Edu", "mission": "First"})
+
+        self.assertEqual("First", self.bot.load_organization_profile()["mission"])
+        self.assertEqual("First", self.bot.load_organization_profile()["mission"])
+
+        metrics = self.bot.get_cache_metrics()["namespaces"]["deduped-profiles"]
+        self.assertGreaterEqual(metrics["hits"], 1)
+        self.assertGreaterEqual(metrics["misses"], 1)
+
+        self.bot.store_organization_profile({"name": "i4Edu", "mission": "Updated"})
+        self.assertEqual("Updated", self.bot.load_organization_profile()["mission"])
 
         self.bot.store_setting(
             "profile",

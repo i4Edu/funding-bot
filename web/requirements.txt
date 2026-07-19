@@ -7,3 +7,4 @@ watchdog==6.0.0
 SQLAlchemy>=2.0.36,<2.1
 Babel>=2.14.0,<4
 requests>=2.32.3,<3
+jsonschema>=4.23.0,<5

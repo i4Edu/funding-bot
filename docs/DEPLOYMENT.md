@@ -139,6 +139,21 @@ Flower should be protected behind authentication or a private network boundary. 
 - monitor retry spikes or stuck tasks
 - watch queue depth during traffic bursts
 
+When running via Docker Compose, set `FLOWER_BASIC_AUTH=user:password` in `.env`
+to require login for the Flower UI.
+
+### Graceful shutdown and idempotency
+
+- Workers receive `SIGTERM` with a 45-second Docker stop grace period.
+- In-flight queue tasks persist `shutdown_requested=1` in `task_runs` before
+  exiting, so operators can distinguish clean drains from crashes.
+- Every queued workflow stores an `idempotency_key` plus `duplicate_requests`
+  in SQLite to prevent duplicate execution during retries, restarts, or repeat
+  enqueue requests.
+- Monitor `funding_bot_queue_duplicate_preventions_total`,
+  `funding_bot_queue_task_runs_cancelled`, and `funding_bot_dead_letter_queue_total`
+  to confirm shutdowns and retries are behaving as expected.
+
 ### Metrics and alerts
 
 The `/metrics` endpoint exports queue metrics alongside app metrics, SQLAlchemy pool counters, and cache hit/miss/set/invalidation metrics. Alert on:

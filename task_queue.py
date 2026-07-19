@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import os
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -81,7 +81,8 @@ def load_queue_config() -> QueueConfig:
         broker_url=os.environ.get("CELERY_BROKER_URL", DEFAULT_BROKER_URL),
         result_backend=os.environ.get("CELERY_RESULT_BACKEND", DEFAULT_RESULT_BACKEND),
         task_always_eager=_coerce_bool(os.environ.get("CELERY_TASK_ALWAYS_EAGER"), default=False),
-        queue_name=os.environ.get("CELERY_QUEUE_NAME", DEFAULT_QUEUE_NAME).strip() or DEFAULT_QUEUE_NAME,
+        queue_name=os.environ.get("CELERY_QUEUE_NAME", DEFAULT_QUEUE_NAME).strip()
+        or DEFAULT_QUEUE_NAME,
         inspect_timeout_seconds=float(os.environ.get("CELERY_INSPECT_TIMEOUT_SECONDS", "1.0")),
     )
 
@@ -175,7 +176,9 @@ class _FallbackCelery:
         self.tasks: dict[str, Any] = {}
         self.control = _FallbackControl()
 
-    def task(self, *decorator_args: Any, **decorator_kwargs: Any) -> Callable[[Callable[..., Any]], Any]:
+    def task(
+        self, *decorator_args: Any, **decorator_kwargs: Any
+    ) -> Callable[[Callable[..., Any]], Any]:
         name = decorator_kwargs.get("name")
         queue = decorator_kwargs.get("queue", DEFAULT_QUEUE_NAME)
         bind = bool(decorator_kwargs.get("bind", False))
@@ -237,8 +240,14 @@ def create_celery_app(config: QueueConfig | None = None) -> Any:
         "daily-summary": {
             "task": "funding_bot.send_daily_summary",
             "schedule": crontab(
-                minute=int(os.environ.get("DAILY_SUMMARY_SCHEDULE_MINUTE", str(DEFAULT_DAILY_SUMMARY_MINUTE))),
-                hour=int(os.environ.get("DAILY_SUMMARY_SCHEDULE_HOUR", str(DEFAULT_DAILY_SUMMARY_HOUR))),
+                minute=int(
+                    os.environ.get(
+                        "DAILY_SUMMARY_SCHEDULE_MINUTE", str(DEFAULT_DAILY_SUMMARY_MINUTE)
+                    )
+                ),
+                hour=int(
+                    os.environ.get("DAILY_SUMMARY_SCHEDULE_HOUR", str(DEFAULT_DAILY_SUMMARY_HOUR))
+                ),
             ),
             "kwargs": {
                 "recipient": os.environ.get("DAILY_SUMMARY_RECIPIENT", "lupael@i4e.com.bd"),
@@ -261,7 +270,9 @@ def _with_bot(db_path: str | None, callback: Callable[[FundingBot], Any]) -> Any
         bot.close()
 
 
-def _queue_result_payload(task_run: dict[str, Any], *, mode: str = "queue", **extra: Any) -> dict[str, Any]:
+def _queue_result_payload(
+    task_run: dict[str, Any], *, mode: str = "queue", **extra: Any
+) -> dict[str, Any]:
     payload = dict(task_run.get("result") or {})
     payload.update(extra)
     payload["mode"] = mode
@@ -306,7 +317,9 @@ def discover_opportunities_task(
                 keywords=task_payload.get("keywords") or None,
                 trusted_sources=task_payload.get("trusted_sources") or None,
             )
-            context.update_progress(90, "Persisted discovery results.", callback_payload={"count": len(found)})
+            context.update_progress(
+                90, "Persisted discovery results.", callback_payload={"count": len(found)}
+            )
             context.checkpoint("Shutdown requested after discovery completed.")
             return {
                 "count": len(found),
@@ -354,7 +367,10 @@ def send_outreach_task(
             context.checkpoint("Shutdown requested before donor outreach started.")
             sender = None if task_payload.get("dry_run", True) else SMTPEmailSender.from_env()
             resolved_locale = task_payload.get("locale")
-            if task_payload.get("subject_template") is None and task_payload.get("body_template") is None:
+            if (
+                task_payload.get("subject_template") is None
+                and task_payload.get("body_template") is None
+            ):
                 if resolved_locale is not None:
                     context.bot.upsert_donor(
                         email=str(task_payload["donor_email"]),

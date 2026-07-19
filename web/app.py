@@ -88,7 +88,9 @@ def _env_flag(name: str, *, default: bool) -> bool:
 
 
 def _read_session_timeout_minutes() -> int:
-    raw_value = os.environ.get("DASHBOARD_SESSION_TIMEOUT_MINUTES", str(DEFAULT_SESSION_TIMEOUT_MINUTES))
+    raw_value = os.environ.get(
+        "DASHBOARD_SESSION_TIMEOUT_MINUTES", str(DEFAULT_SESSION_TIMEOUT_MINUTES)
+    )
     try:
         parsed = int(raw_value)
     except ValueError:
@@ -233,7 +235,9 @@ def _mapping_or_default(value: Any, default: dict[str, Any]) -> dict[str, Any]:
     return value if isinstance(value, dict) else dict(default)
 
 
-def _json_error(message: str, status_code: int, *, headers: dict[str, str] | None = None) -> Response:
+def _json_error(
+    message: str, status_code: int, *, headers: dict[str, str] | None = None
+) -> Response:
     return _build_json_response({"error": message}, status_code, headers=headers)
 
 
@@ -246,8 +250,14 @@ def _auth_challenge(message: str = "Authentication required") -> Response:
 
 
 def _session_timeout() -> timedelta:
-    configured = app.config.get("PERMANENT_SESSION_LIFETIME", timedelta(minutes=DEFAULT_SESSION_TIMEOUT_MINUTES))
-    return configured if isinstance(configured, timedelta) else timedelta(minutes=DEFAULT_SESSION_TIMEOUT_MINUTES)
+    configured = app.config.get(
+        "PERMANENT_SESSION_LIFETIME", timedelta(minutes=DEFAULT_SESSION_TIMEOUT_MINUTES)
+    )
+    return (
+        configured
+        if isinstance(configured, timedelta)
+        else timedelta(minutes=DEFAULT_SESSION_TIMEOUT_MINUTES)
+    )
 
 
 def _parse_session_timestamp(value: Any) -> datetime | None:
@@ -431,9 +441,7 @@ def _serialize_donor(row: Any) -> dict[str, Any]:
     data = dict(row)
     data["opted_out"] = bool(data["opted_out"])
     data["preferences"] = _parse_json_column(data.pop("preferences_json", "{}"))
-    data["field_classifications"] = _parse_json_column(
-        data.pop("field_classifications_json", "{}")
-    )
+    data["field_classifications"] = _parse_json_column(data.pop("field_classifications_json", "{}"))
     return data
 
 
@@ -501,10 +509,14 @@ def _serialize_translation_review(review: Any) -> dict[str, Any]:
 
 
 def _fetch_opportunity(signature: str) -> dict[str, Any]:
-    row = _bot().connection.execute(
-        "SELECT * FROM opportunities WHERE signature = ?",
-        (signature,),
-    ).fetchone()
+    row = (
+        _bot()
+        .connection.execute(
+            "SELECT * FROM opportunities WHERE signature = ?",
+            (signature,),
+        )
+        .fetchone()
+    )
     if not row:
         raise OpportunityNotFoundError(f"Unknown opportunity {signature!r}.")
     return _serialize_opportunity(row)
@@ -560,14 +572,18 @@ def _task_status_counts(tasks: list[dict[str, Any]]) -> dict[str, int]:
 
 
 def _task_assignee_options() -> list[str]:
-    rows = _bot().connection.execute(
-        """
+    rows = (
+        _bot()
+        .connection.execute(
+            """
         SELECT DISTINCT COALESCE(assignee, assigned_to) AS assignee
         FROM tasks
         WHERE COALESCE(assignee, assigned_to) != ''
         ORDER BY COALESCE(assignee, assigned_to) COLLATE NOCASE ASC
         """
-    ).fetchall()
+        )
+        .fetchall()
+    )
     return [str(row["assignee"]) for row in rows]
 
 
@@ -585,32 +601,53 @@ def _dashboard_context() -> dict[str, Any]:
     current_role = getattr(g, "current_role", None)
     task_scope = _task_scope_for_role(current_role)
 
-    new_opportunities_count = _bot().connection.execute(
-        "SELECT COUNT(*) FROM opportunities WHERE discovered_at >= ?",
-        (recent_cutoff,),
-    ).fetchone()[0]
-    applications_submitted_count = _bot().connection.execute(
-        "SELECT COUNT(*) FROM applications",
-    ).fetchone()[0]
-    pending_applications_count = _bot().connection.execute(
-        "SELECT COUNT(*) FROM applications WHERE status IN ('pending', 'submitted', 'in_review')",
-    ).fetchone()[0]
-    donor_communications_count = _bot().connection.execute(
-        "SELECT COUNT(*) FROM communications",
-    ).fetchone()[0]
-    pending_translation_reviews_count = _bot().connection.execute(
-        "SELECT COUNT(*) FROM translation_reviews WHERE status = 'pending'",
-    ).fetchone()[0]
+    new_opportunities_count = (
+        _bot()
+        .connection.execute(
+            "SELECT COUNT(*) FROM opportunities WHERE discovered_at >= ?",
+            (recent_cutoff,),
+        )
+        .fetchone()[0]
+    )
+    applications_submitted_count = (
+        _bot()
+        .connection.execute(
+            "SELECT COUNT(*) FROM applications",
+        )
+        .fetchone()[0]
+    )
+    pending_applications_count = (
+        _bot()
+        .connection.execute(
+            "SELECT COUNT(*) FROM applications WHERE status IN ('pending', 'submitted', 'in_review')",
+        )
+        .fetchone()[0]
+    )
+    donor_communications_count = (
+        _bot()
+        .connection.execute(
+            "SELECT COUNT(*) FROM communications",
+        )
+        .fetchone()[0]
+    )
+    pending_translation_reviews_count = (
+        _bot()
+        .connection.execute(
+            "SELECT COUNT(*) FROM translation_reviews WHERE status = 'pending'",
+        )
+        .fetchone()[0]
+    )
 
     recent_opportunities = [
         _serialize_opportunity(row)
-        for row in _bot().connection.execute(
-            "SELECT * FROM opportunities ORDER BY discovered_at DESC LIMIT 10"
-        ).fetchall()
+        for row in _bot()
+        .connection.execute("SELECT * FROM opportunities ORDER BY discovered_at DESC LIMIT 10")
+        .fetchall()
     ]
     recent_applications = [
         _serialize_application(row)
-        for row in _bot().connection.execute(
+        for row in _bot()
+        .connection.execute(
             """
             SELECT
                 applications.opportunity_signature,
@@ -626,7 +663,8 @@ def _dashboard_context() -> dict[str, Any]:
             ORDER BY applications.submitted_at DESC
             LIMIT 10
             """
-        ).fetchall()
+        )
+        .fetchall()
     ]
     my_task_counts = _bot().get_task_status_counts(assigned_to=task_scope) if current_role else {}
     overdue_tasks = [
@@ -693,7 +731,9 @@ def _task_dashboard_context(filters: dict[str, str | None]) -> dict[str, Any]:
 def _queue_health_timeout_seconds() -> float:
     configured = os.environ.get(
         "CELERY_HEALTH_TIMEOUT_SECONDS",
-        os.environ.get("CELERY_INSPECT_TIMEOUT_SECONDS", str(DEFAULT_CELERY_HEALTH_TIMEOUT_SECONDS)),
+        os.environ.get(
+            "CELERY_INSPECT_TIMEOUT_SECONDS", str(DEFAULT_CELERY_HEALTH_TIMEOUT_SECONDS)
+        ),
     )
     try:
         timeout = float(configured)
@@ -734,7 +774,9 @@ def _fetch_celery_queue_snapshot() -> dict[str, Any]:
     stats = inspect.stats() or {}
     ping = inspect.ping() or {}
 
-    worker_names = sorted({*active.keys(), *reserved.keys(), *scheduled.keys(), *stats.keys(), *ping.keys()})
+    worker_names = sorted(
+        {*active.keys(), *reserved.keys(), *scheduled.keys(), *stats.keys(), *ping.keys()}
+    )
     workers = []
     for worker_name in worker_names:
         worker_active = active.get(worker_name, []) if isinstance(active, dict) else []
@@ -746,7 +788,9 @@ def _fetch_celery_queue_snapshot() -> dict[str, Any]:
                 "status": "online" if worker_name in ping else "unreachable",
                 "active_tasks": len(worker_active) if isinstance(worker_active, list) else 0,
                 "reserved_tasks": len(worker_reserved) if isinstance(worker_reserved, list) else 0,
-                "scheduled_tasks": len(worker_scheduled) if isinstance(worker_scheduled, list) else 0,
+                "scheduled_tasks": len(worker_scheduled)
+                if isinstance(worker_scheduled, list)
+                else 0,
             }
         )
 
@@ -862,7 +906,10 @@ def handle_not_found(_: Any) -> Response:
 
 
 @app.errorhandler(429)
-def handle_rate_limited(_: Any) -> Response:
+def handle_rate_limited(exc: Any) -> Response:
+    existing_response = getattr(exc, "get_response", lambda: None)()
+    if isinstance(existing_response, Response):
+        return existing_response
     return _build_json_response(
         {"error": "Rate limit exceeded. Retry the request after the limit window resets."},
         429,
@@ -939,13 +986,17 @@ def dashboard_tasks() -> Response | str:
         return _json_error("Forbidden", 403)
     return render_template("tasks.html", **_task_dashboard_context(filters))
 
+
 @app.get("/opportunities")
 @api_rate_limit
 @require_role("staff", "admin", "auditor")
 def list_opportunities() -> Response:
-    opportunities = [_serialize_opportunity(row) for row in _bot().connection.execute(
-        "SELECT * FROM opportunities ORDER BY discovered_at DESC"
-    ).fetchall()]
+    opportunities = [
+        _serialize_opportunity(row)
+        for row in _bot()
+        .connection.execute("SELECT * FROM opportunities ORDER BY discovered_at DESC")
+        .fetchall()
+    ]
     return jsonify(opportunities)
 
 
@@ -954,13 +1005,18 @@ def list_opportunities() -> Response:
 @require_role("staff", "admin", "auditor")
 def get_opportunity(signature: str) -> Response:
     opportunity = _fetch_opportunity(signature)
-    application_row = _bot().connection.execute(
-        "SELECT * FROM applications WHERE opportunity_signature = ?",
-        (signature,),
-    ).fetchone()
+    application_row = (
+        _bot()
+        .connection.execute(
+            "SELECT * FROM applications WHERE opportunity_signature = ?",
+            (signature,),
+        )
+        .fetchone()
+    )
     attempts = [
         _serialize_submission_attempt(row)
-        for row in _bot().connection.execute(
+        for row in _bot()
+        .connection.execute(
             """
             SELECT attempt_number, succeeded, error_message, happened_at
             FROM submission_attempts
@@ -968,7 +1024,8 @@ def get_opportunity(signature: str) -> Response:
             ORDER BY attempt_number ASC
             """,
             (signature,),
-        ).fetchall()
+        )
+        .fetchall()
     ]
     response = {
         "opportunity": opportunity,
@@ -1076,14 +1133,19 @@ def get_analytics() -> Response:
 @api_rate_limit
 @require_role("admin", "auditor")
 def audit_log() -> Response:
-    logs = [_serialize_audit_log(row) for row in _bot().connection.execute(
-        """
+    logs = [
+        _serialize_audit_log(row)
+        for row in _bot()
+        .connection.execute(
+            """
         SELECT id, happened_at, action, details_json
         FROM audit_logs
         ORDER BY happened_at DESC, id DESC
         LIMIT 100
         """
-    ).fetchall()]
+        )
+        .fetchall()
+    ]
     return jsonify(logs)
 
 
@@ -1276,7 +1338,9 @@ def run_discovery_now() -> Response:
 def generate_privacy_policy() -> Response:
     payload = _get_request_json()
     output_dir = str(
-        payload.get("output_dir", os.environ.get("PRIVACY_POLICY_OUTPUT_DIR", "generated/privacy_policies"))
+        payload.get(
+            "output_dir", os.environ.get("PRIVACY_POLICY_OUTPUT_DIR", "generated/privacy_policies")
+        )
     ).strip()
     if not output_dir:
         raise ValueError("Field 'output_dir' must not be empty.")
@@ -1508,9 +1572,7 @@ def assign_task_route(task_id: int) -> Response:
     if not assigned_to:
         raise ValueError("Field 'assigned_to' is required.")
     if assigned_to not in ROLE_PASSWORD_ENV_VARS:
-        raise ValueError(
-            f"Field 'assigned_to' must be one of {sorted(ROLE_PASSWORD_ENV_VARS)}."
-        )
+        raise ValueError(f"Field 'assigned_to' must be one of {sorted(ROLE_PASSWORD_ENV_VARS)}.")
     task = _bot().update_task_assignment(
         task_id,
         assigned_to=assigned_to,
@@ -1885,9 +1947,7 @@ def submit_feedback() -> Response:
 
     allowed_categories = {"feature_request", "bug_report", "general"}
     if category not in allowed_categories:
-        raise ValueError(
-            f"Field 'category' must be one of {sorted(allowed_categories)}."
-        )
+        raise ValueError(f"Field 'category' must be one of {sorted(allowed_categories)}.")
     if not message:
         raise ValueError("Field 'message' is required.")
     if len(message) > MAX_FEEDBACK_MESSAGE_LENGTH:

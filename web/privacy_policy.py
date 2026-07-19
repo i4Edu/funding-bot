@@ -28,7 +28,10 @@ JURISDICTION_DETAILS: dict[str, dict[str, Any]] = {
     },
     "EU": {
         "title": "European Union Privacy Notice",
-        "regulations": ["General Data Protection Regulation (GDPR)", "Applicable local member-state privacy rules"],
+        "regulations": [
+            "General Data Protection Regulation (GDPR)",
+            "Applicable local member-state privacy rules",
+        ],
         "rights": [
             "Access, rectify, erase, or restrict processing of your personal data.",
             "Object to processing based on legitimate interests and request data portability where applicable.",
@@ -39,7 +42,9 @@ JURISDICTION_DETAILS: dict[str, dict[str, Any]] = {
     },
     "ASIA": {
         "title": "Asia-Pacific Privacy Notice",
-        "regulations": ["Applicable Asia-Pacific privacy and data protection laws in the jurisdictions where we operate"],
+        "regulations": [
+            "Applicable Asia-Pacific privacy and data protection laws in the jurisdictions where we operate"
+        ],
         "rights": [
             "Request access to or correction of your personal information.",
             "Withdraw consent or request deletion where local law grants that right.",
@@ -64,17 +69,24 @@ def _normalize_profile(profile: dict[str, Any]) -> dict[str, Any]:
         "mission": profile.get("mission") or "supporting mission-driven programs",
         "registration_number": profile.get("registration_number") or "Not provided",
         "website": profile.get("website") or "https://example.org",
-        "contact_email": profile.get("contact_email") or profile.get("privacy_email") or "privacy@example.org",
-        "privacy_email": profile.get("privacy_email") or profile.get("contact_email") or "privacy@example.org",
+        "contact_email": profile.get("contact_email")
+        or profile.get("privacy_email")
+        or "privacy@example.org",
+        "privacy_email": profile.get("privacy_email")
+        or profile.get("contact_email")
+        or "privacy@example.org",
         "address": profile.get("address") or "Address not provided",
-        "data_categories": profile.get("data_categories") or [
+        "data_categories": profile.get("data_categories")
+        or [
             "contact details",
             "donation history",
             "communication preferences",
             "application and operational records",
         ],
-        "subprocessors": profile.get("subprocessors") or ["managed hosting providers", "email delivery services"],
-        "retention_summary": profile.get("retention_summary") or "We retain data only as long as needed for nonprofit operations, legal obligations, and donor stewardship.",
+        "subprocessors": profile.get("subprocessors")
+        or ["managed hosting providers", "email delivery services"],
+        "retention_summary": profile.get("retention_summary")
+        or "We retain data only as long as needed for nonprofit operations, legal obligations, and donor stewardship.",
     }
 
 

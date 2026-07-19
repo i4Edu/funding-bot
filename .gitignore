@@ -6,3 +6,6 @@ generated/
 node_modules/
 .celery-broker/
 .test-artifacts/
+mutants/
+playwright-report/
+test-results/

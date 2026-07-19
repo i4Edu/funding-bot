@@ -279,6 +279,114 @@ def _build_tls_http_session() -> requests.Session:
     return session
 
 
+def _run_async(coroutine: Any) -> Any:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coroutine)
+
+    result: dict[str, Any] = {}
+    error: dict[str, BaseException] = {}
+
+    def _runner() -> None:
+        try:
+            result["value"] = asyncio.run(coroutine)
+        except BaseException as exc:  # pragma: no cover - defensive thread bridge
+            error["exc"] = exc
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    thread.join()
+    if "exc" in error:
+        raise error["exc"]
+    return result.get("value")
+
+
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
+
+
+@asynccontextmanager
+async def _reuse_or_create_aiohttp_session(
+    session: Any | None = None,
+    *,
+    timeout: float = 10.0,
+):
+    if session is not None:
+        yield session
+        return
+    if aiohttp is None:
+        yield None
+        return
+    connector = aiohttp.TCPConnector(ssl=_build_tls_ssl_context())
+    client_timeout = aiohttp.ClientTimeout(total=timeout)
+    async with aiohttp.ClientSession(connector=connector, timeout=client_timeout) as created_session:
+        yield created_session
+
+
+class AsyncDatabaseSession:
+    """Serialize SQLite access behind an async context manager."""
+
+    _WRITE_PREFIXES = (
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "CREATE",
+        "ALTER",
+        "DROP",
+        "REPLACE",
+        "PRAGMA",
+    )
+
+    def __init__(self, connection: sqlite3.Connection, lock: threading.RLock) -> None:
+        self._connection = connection
+        self._lock = lock
+        self._dirty = False
+
+    async def __aenter__(self) -> "AsyncDatabaseSession":
+        await asyncio.to_thread(self._lock.acquire)
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, _tb: Any) -> None:
+        try:
+            if self._dirty:
+                if exc_type is None:
+                    await asyncio.to_thread(self._connection.commit)
+                else:
+                    await asyncio.to_thread(self._connection.rollback)
+        finally:
+            self._lock.release()
+
+    async def execute(
+        self,
+        query: str,
+        parameters: tuple[Any, ...] = (),
+    ) -> sqlite3.Cursor:
+        if query.lstrip().upper().startswith(self._WRITE_PREFIXES):
+            self._dirty = True
+        return await asyncio.to_thread(self._connection.execute, query, parameters)
+
+    async def fetchone(
+        self,
+        query: str,
+        parameters: tuple[Any, ...] = (),
+    ) -> sqlite3.Row | None:
+        return await asyncio.to_thread(
+            lambda: self._connection.execute(query, parameters).fetchone()
+        )
+
+    async def fetchall(
+        self,
+        query: str,
+        parameters: tuple[Any, ...] = (),
+    ) -> list[sqlite3.Row]:
+        return await asyncio.to_thread(
+            lambda: self._connection.execute(query, parameters).fetchall()
+        )
+
+
 class _TTLCache:
     """A minimal thread-unsafe TTL cache keyed by arbitrary hashable keys."""
 
@@ -507,6 +615,84 @@ class ConnectorMetricsRegistry:
 
 
 _CONNECTOR_METRICS = ConnectorMetricsRegistry()
+
+
+class BatchProcessingMetricsRegistry:
+    """Track connector batching, coalescing, and runtime characteristics."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.reset()
+
+    def record_scheduled(self, *, coalesced: bool) -> None:
+        with self._lock:
+            self._metrics["scheduled_requests"] += 1
+            if coalesced:
+                self._metrics["coalesced_requests"] += 1
+
+    def record_batch(self, *, batch_size: int, duration_seconds: float, failed: bool) -> None:
+        with self._lock:
+            self._metrics["batches_total"] += 1
+            self._metrics["batched_requests"] += max(0, batch_size)
+            self._metrics["batch_size_sum"] += max(0, batch_size)
+            self._metrics["batch_duration_seconds_sum"] += max(0.0, duration_seconds)
+            self._metrics["last_batch_size"] = max(0, batch_size)
+            self._metrics["max_batch_size"] = max(self._metrics["max_batch_size"], max(0, batch_size))
+            if failed:
+                self._metrics["failed_batches"] += 1
+
+    def snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            metrics = dict(self._metrics)
+        batches = metrics["batches_total"]
+        metrics["average_batch_size"] = metrics["batch_size_sum"] / batches if batches else 0.0
+        metrics["average_batch_duration_seconds"] = (
+            metrics["batch_duration_seconds_sum"] / batches if batches else 0.0
+        )
+        return metrics
+
+    def reset(self) -> None:
+        with self._lock:
+            self._metrics = {
+                "scheduled_requests": 0,
+                "coalesced_requests": 0,
+                "batched_requests": 0,
+                "batches_total": 0,
+                "failed_batches": 0,
+                "batch_size_sum": 0,
+                "batch_duration_seconds_sum": 0.0,
+                "last_batch_size": 0,
+                "max_batch_size": 0,
+            }
+
+    def render_prometheus(self) -> list[str]:
+        metrics = self.snapshot()
+        return [
+            "# HELP funding_bot_connector_batch_requests_total Connector requests scheduled for batching",
+            "# TYPE funding_bot_connector_batch_requests_total counter",
+            f"funding_bot_connector_batch_requests_total {metrics['scheduled_requests']}",
+            "# HELP funding_bot_connector_batch_coalesced_total Connector requests merged into in-flight batches",
+            "# TYPE funding_bot_connector_batch_coalesced_total counter",
+            f"funding_bot_connector_batch_coalesced_total {metrics['coalesced_requests']}",
+            "# HELP funding_bot_connector_batches_total Connector request batches executed",
+            "# TYPE funding_bot_connector_batches_total counter",
+            f"funding_bot_connector_batches_total {metrics['batches_total']}",
+            "# HELP funding_bot_connector_failed_batches_total Connector request batches that failed",
+            "# TYPE funding_bot_connector_failed_batches_total counter",
+            f"funding_bot_connector_failed_batches_total {metrics['failed_batches']}",
+            "# HELP funding_bot_connector_batch_size_average Average connector batch size",
+            "# TYPE funding_bot_connector_batch_size_average gauge",
+            f"funding_bot_connector_batch_size_average {metrics['average_batch_size']:.6f}",
+            "# HELP funding_bot_connector_batch_duration_seconds_average Average connector batch runtime in seconds",
+            "# TYPE funding_bot_connector_batch_duration_seconds_average gauge",
+            f"funding_bot_connector_batch_duration_seconds_average {metrics['average_batch_duration_seconds']:.6f}",
+            "# HELP funding_bot_connector_batch_size_max Largest connector batch observed",
+            "# TYPE funding_bot_connector_batch_size_max gauge",
+            f"funding_bot_connector_batch_size_max {metrics['max_batch_size']}",
+        ]
+
+
+_BATCH_METRICS = BatchProcessingMetricsRegistry()
 
 
 class FundingBotError(Exception):
@@ -6431,7 +6617,7 @@ class FundingBot:
         self._invalidate_donor_cache(normalized_email)
         self._log_action("donor_opt_out_updated", email=normalized_email, opted_out=opted_out)
 
-    def discover_opportunities(
+    def deduplicate(
         self,
         opportunities: Iterable[dict[str, Any]],
         *,
@@ -6439,6 +6625,7 @@ class FundingBot:
         trusted_sources: Iterable[str] | None = None,
         discovered_at: datetime | None = None,
     ) -> list[dict[str, Any]]:
+        """Filter, deduplicate, and persist opportunity records."""
         keyword_list = [keyword.lower() for keyword in (keywords or [])]
         allowed_sources = {
             source.lower() for source in (trusted_sources or self.trusted_sources or [])
@@ -6505,6 +6692,21 @@ class FundingBot:
         self.connection.commit()
         self._log_action("opportunities_discovered", count=len(found), keywords=keyword_list)
         return found
+
+    def discover_opportunities(
+        self,
+        opportunities: Iterable[dict[str, Any]],
+        *,
+        keywords: Iterable[str] | None = None,
+        trusted_sources: Iterable[str] | None = None,
+        discovered_at: datetime | None = None,
+    ) -> list[dict[str, Any]]:
+        return self.deduplicate(
+            opportunities,
+            keywords=keywords,
+            trusted_sources=trusted_sources,
+            discovered_at=discovered_at,
+        )
 
     def run_discovery(
         self,
@@ -9987,30 +10189,36 @@ def main(argv: list[str] | None = None) -> None:
     args = _prompt_for_missing_cli_args(parser, args)
     logging.getLogger(__name__).info("Running CLI command %s", args.command)
 
-    bot = FundingBot(db_path=args.db)
+    bot: FundingBot | None = None
+
+    def get_bot() -> FundingBot:
+        nonlocal bot
+        if bot is None:
+            bot = FundingBot(db_path=args.db)
+        return bot
+
     try:
         try:
             if args.command == "send-daily-summary":
                 from tasks.celery_tasks import send_daily_summary_task
 
-                payload = _cli_payload(
+                queued = _queue_async_task(
                     "send-daily-summary",
-                    **_queue_async_task(
-                        "send-daily-summary",
-                        send_daily_summary_task,
-                        task_kwargs={
-                            "db_path": args.db,
-                            "recipient": args.recipient,
-                            "dry_run": args.dry_run,
-                        },
-                    ),
+                    send_daily_summary_task,
+                    task_kwargs={
+                        "db_path": args.db,
+                        "recipient": args.recipient,
+                        "dry_run": args.dry_run,
+                    },
                 )
-                if args.json_output:
-                    _emit_cli_json(payload)
-                else:
-                    _print_queued_task(payload, ready_renderer=_render_daily_summary_task_result_text)
+                if isinstance(queued, dict):
+                    payload = _cli_payload("send-daily-summary", **queued)
+                    if args.json_output:
+                        _emit_cli_json(payload)
+                    else:
+                        _print_queued_task(payload, ready_renderer=_render_daily_summary_task_result_text)
             elif args.command == "list-opportunities":
-                rows = bot.list_opportunities(status=args.status)
+                rows = get_bot().list_opportunities(status=args.status)
                 if args.limit is not None:
                     rows = rows[: args.limit]
                 columns = ["signature", "source", "donor_name", "title", "status", "discovered_at"]
@@ -10025,7 +10233,7 @@ def main(argv: list[str] | None = None) -> None:
                 else:
                     _print_rows(rows, columns)
             elif args.command == "audit-log":
-                rows = bot.list_audit_logs(limit=args.limit, action=args.action)
+                rows = get_bot().list_audit_logs(limit=args.limit, action=args.action)
                 columns = ["happened_at", "action", "details_json"]
                 payload = _cli_payload("audit-log", count=len(rows), columns=columns, rows=rows)
                 if args.json_output:
@@ -10033,7 +10241,7 @@ def main(argv: list[str] | None = None) -> None:
                 else:
                     _print_rows(rows, columns)
             elif args.command == "list-donors":
-                rows = bot.list_donors(segment=args.segment)
+                rows = get_bot().list_donors(segment=args.segment)
                 columns = ["email", "name", "segment", "locale", "opted_out", "last_contact_at"]
                 payload = _cli_payload("list-donors", count=len(rows), columns=columns, rows=rows)
                 if args.json_output:
@@ -10041,7 +10249,7 @@ def main(argv: list[str] | None = None) -> None:
                 else:
                     _print_rows(rows, columns)
             elif args.command == "monthly-audit-report":
-                report = bot.build_monthly_audit_report(year=args.year, month=args.month)
+                report = get_bot().build_monthly_audit_report(year=args.year, month=args.month)
                 payload = _cli_payload(
                     "monthly-audit-report",
                     report=report,
@@ -10063,7 +10271,7 @@ def main(argv: list[str] | None = None) -> None:
                     "submission_attempts_days": args.submission_attempts_days,
                     "completed_tasks_days": args.completed_tasks_days,
                 }
-                policy = bot.store_data_retention_policy(
+                policy = get_bot().store_data_retention_policy(
                     {key: value for key, value in policy_updates.items() if value is not None}
                 )
                 payload = _cli_payload("set-data-retention-policy", policy=policy)
@@ -10073,14 +10281,14 @@ def main(argv: list[str] | None = None) -> None:
                     print(_json_dumps(policy))
             elif args.command == "enforce-data-retention":
                 as_of = datetime.fromisoformat(args.as_of) if args.as_of else None
-                report = bot.enforce_data_retention(now=as_of, dry_run=args.dry_run)
+                report = get_bot().enforce_data_retention(now=as_of, dry_run=args.dry_run)
                 payload = _cli_payload("enforce-data-retention", report=report)
                 if args.json_output:
                     _emit_cli_json(payload)
                 else:
                     print(_json_dumps(report))
             elif args.command == "gdpr-self-check-report":
-                report = bot.build_gdpr_compliance_report(cadence=args.cadence)
+                report = get_bot().build_gdpr_compliance_report(cadence=args.cadence)
                 payload = _cli_payload(
                     "gdpr-self-check-report",
                     report=report,
@@ -10097,22 +10305,21 @@ def main(argv: list[str] | None = None) -> None:
             elif args.command == "discover":
                 from tasks.celery_tasks import discover_task
 
-                payload = _cli_payload(
+                queued = _queue_async_task(
                     "discover",
-                    **_queue_async_task(
-                        "discover",
-                        discover_task,
-                        task_kwargs={
-                            "db_path": args.db,
-                            "keywords": _parse_csv_argument(args.keywords),
-                            "trusted_sources": _parse_csv_argument(args.trusted_sources),
-                        },
-                    ),
+                    discover_task,
+                    task_kwargs={
+                        "db_path": args.db,
+                        "keywords": _parse_csv_argument(args.keywords),
+                        "trusted_sources": _parse_csv_argument(args.trusted_sources),
+                    },
                 )
-                if args.json_output:
-                    _emit_cli_json(payload)
-                else:
-                    _print_queued_task(payload, ready_renderer=_render_discover_task_result_text)
+                if isinstance(queued, dict):
+                    payload = _cli_payload("discover", **queued)
+                    if args.json_output:
+                        _emit_cli_json(payload)
+                    else:
+                        _print_queued_task(payload, ready_renderer=_render_discover_task_result_text)
             elif args.command == "test-connector":
                 connector = create_connector(args.connector)
                 validation = connector.validate_connectivity(
@@ -10127,27 +10334,26 @@ def main(argv: list[str] | None = None) -> None:
             elif args.command == "send-outreach":
                 from tasks.celery_tasks import send_outreach_task
 
-                payload = _cli_payload(
+                queued = _queue_async_task(
                     "send-outreach",
-                    **_queue_async_task(
-                        "send-outreach",
-                        send_outreach_task,
-                        task_kwargs={
-                            "db_path": args.db,
-                            "donor_email": args.email,
-                            "donor_name": args.name,
-                            "template_name": args.template_name,
-                            "subject_template": args.subject,
-                            "body_template": args.body,
-                            "locale": args.locale,
-                            "dry_run": args.dry_run,
-                        },
-                    ),
+                    send_outreach_task,
+                    task_kwargs={
+                        "db_path": args.db,
+                        "donor_email": args.email,
+                        "donor_name": args.name,
+                        "template_name": args.template_name,
+                        "subject_template": args.subject,
+                        "body_template": args.body,
+                        "locale": args.locale,
+                        "dry_run": args.dry_run,
+                    },
                 )
-                if args.json_output:
-                    _emit_cli_json(payload)
-                else:
-                    _print_queued_task(payload, ready_renderer=_render_outreach_task_result_text)
+                if isinstance(queued, dict):
+                    payload = _cli_payload("send-outreach", **queued)
+                    if args.json_output:
+                        _emit_cli_json(payload)
+                    else:
+                        _print_queued_task(payload, ready_renderer=_render_outreach_task_result_text)
             elif args.command == "set-organization-profile":
                 try:
                     raw_json = (
@@ -10158,7 +10364,7 @@ def main(argv: list[str] | None = None) -> None:
                 profile = json.loads(raw_json)
                 if not isinstance(profile, dict):
                     raise ValueError("Organization profile JSON must be an object.")
-                bot.store_organization_profile(profile)
+                get_bot().store_organization_profile(profile)
                 payload = _cli_payload(
                     "set-organization-profile",
                     updated=True,
@@ -10170,7 +10376,7 @@ def main(argv: list[str] | None = None) -> None:
                 else:
                     print("Organization profile updated.")
             elif args.command == "register-credential":
-                payload = _run_register_credential(bot, args)
+                payload = _run_register_credential(get_bot(), args)
                 if args.json_output:
                     _emit_cli_json(payload)
                 else:
@@ -10192,9 +10398,9 @@ def main(argv: list[str] | None = None) -> None:
                 else:
                     _print_doctor_report(payload)
             elif args.command == "show-settings":
-                _run_show_settings(bot, json_output=args.json_output)
+                _run_show_settings(get_bot(), json_output=args.json_output)
                 if not args.json_output:
-                    _print_credential_aliases(bot)
+                    _print_credential_aliases(get_bot())
         except Exception as exc:
             if args.json_output:
                 _emit_cli_json(
@@ -10210,7 +10416,8 @@ def main(argv: list[str] | None = None) -> None:
                 raise SystemExit(1) from exc
             raise
     finally:
-        bot.close()
+        if bot is not None:
+            bot.close()
 
 
 if __name__ == "__main__":
