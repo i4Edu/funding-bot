@@ -1,3 +1,4 @@
+import asyncio
 import json
 import os
 import unittest
@@ -555,6 +556,54 @@ class ConnectorCoverageTests(unittest.TestCase):
         self.assertEqual("B90", result["opportunities"][0]["category"])
         self.assertIn("501(c)(3) organization", result["opportunities"][0]["summary"])
         self.assertIn("987654321", result["opportunities"][1]["portal_url"])
+
+    def test_async_live_directory_connectors_normalize_results(self):
+        ngo_connector = NGODirectoryConnector()
+
+        async def ngo_response(_url, _params, headers=None, shared_session=None):
+            return {
+                "organizations": [
+                    {
+                        "name": "Readers United",
+                        "ein": "123456789",
+                        "city": "Boston",
+                        "state": "MA",
+                    }
+                ],
+                "total_results": 1,
+                "per_page": 25,
+            }
+
+        ngo_connector._fetch_remote_json_async = ngo_response
+        ngo_result = asyncio.run(
+            ngo_connector._fetch_remote_result_async(["literacy"], shared_session="session")
+        )
+
+        foundation_connector = FoundationDirectoryConnector(credentials={"api_key": "fd-key"})
+
+        async def foundation_response(_url, _params, headers=None, shared_session=None):
+            return {
+                "opportunities": [
+                    {
+                        "grantmaker_name": "Heritage Foundation",
+                        "program_name": "Education Access",
+                        "links": {"self": "https://foundation.example.org/grant/1"},
+                    }
+                ],
+                "next_page": None,
+            }
+
+        foundation_connector._fetch_remote_json_async = foundation_response
+        foundation_result = asyncio.run(
+            foundation_connector._fetch_remote_result_async(
+                ["foundation"], shared_session="session"
+            )
+        )
+
+        self.assertEqual("Readers United", ngo_result["opportunities"][0]["donor_name"])
+        self.assertEqual(1, ngo_result["metadata"]["pages_fetched"])
+        self.assertEqual("Heritage Foundation", foundation_result["opportunities"][0]["donor_name"])
+        self.assertEqual(1, foundation_result["metadata"]["pages_fetched"])
 
     def test_foundation_directory_connector_requires_api_key_and_normalizes_rows(self):
         class EmptyVault:
