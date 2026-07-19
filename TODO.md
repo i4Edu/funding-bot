@@ -204,8 +204,8 @@ _A prioritized backlog of 200 actionable tasks expanding on the open items in `r
 
 ### Task Queue & Scheduling
 
-21. [ ] Evaluate Celery vs RQ for the task queue replacing cron
-22. [ ] Add a Celery app configuration with Redis/RabbitMQ broker
+21. [x] Evaluate Celery vs RQ for the task queue replacing cron
+22. [x] Add a Celery app configuration with Redis/RabbitMQ broker
 23. [ ] Convert `discover` CLI command into an async Celery task
 24. [ ] Convert `send-outreach` CLI command into an async Celery task
 25. [ ] Convert daily summary generation into a scheduled Celery beat task
@@ -231,7 +231,7 @@ _A prioritized backlog of 200 actionable tasks expanding on the open items in `r
 42. [ ] Add locale field to donor profile schema
 43. [ ] Add CLI option to preview outreach templates in a given locale
 44. [ ] Add automated tests validating all templates render for every supported locale
-45. [ ] Document the process for contributing new language templates
+45. [x] Document the process for contributing new language templates
 
 ### Collaboration Tools
 

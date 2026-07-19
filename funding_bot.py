@@ -1,25 +1,104 @@
 from __future__ import annotations
 
+import base64
+import csv
 import hashlib
+import io
 import json
+import logging
 import os
 import re
+import signal
 import smtplib
 import sqlite3
 import sys
+import threading
 import time
+import urllib.parse
+import urllib.request
+import urllib.error
+import urllib.request
 import zipfile
-from datetime import datetime, timedelta, timezone
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from email.mime.text import MIMEText
+from numbers import Number
 from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
 from xml.sax.saxutils import escape
+
+from jsonschema import ValidationError, validate
+
+try:
+    from babel.dates import format_date as babel_format_date
+    from babel.dates import format_datetime as babel_format_datetime
+    from babel.numbers import format_decimal as babel_format_decimal
+except ImportError:  # pragma: no cover - exercised in environments without Babel
+    babel_format_date = None
+    babel_format_datetime = None
+    babel_format_decimal = None
 
 # ---------------------------------------------------------------------------
 # Simple TTL cache for repeated portal queries
 # ---------------------------------------------------------------------------
 
 _EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+_UNSET = object()
+_TRANSIENT_CONNECTOR_ERRORS = (TimeoutError, ConnectionError, OSError)
+_DOCUMENT_LOCALE_CONFIG = {
+    "en": {
+        "babel_locale": "en_US",
+        "date_format": "MM/dd/yyyy",
+        "datetime_format": "MM/dd/yyyy HH:mm",
+    },
+    "bn": {
+        "babel_locale": "bn_BD",
+        "date_format": "dd/MM/yyyy",
+        "datetime_format": "dd/MM/yyyy HH:mm",
+    },
+}
+_DOCUMENT_LOCALE_ALIASES = {
+    "en": "en",
+    "en_us": "en",
+    "en-us": "en",
+    "bn": "bn",
+    "bn_bd": "bn",
+    "bn-bd": "bn",
+}
+DEFAULT_LOCALE_CODE = "en"
+TRANSLATION_REVIEW_STATUSES = frozenset({"pending", "approved", "rejected"})
+SUPPORTED_UI_LOCALES: dict[str, dict[str, Any]] = {
+    "en": {
+        "code": "en",
+        "display_name": "English",
+        "native_name": "English",
+        "direction": "ltr",
+        "is_rtl": False,
+    },
+    "bn": {
+        "code": "bn",
+        "display_name": "Bengali",
+        "native_name": "বাংলা",
+        "direction": "ltr",
+        "is_rtl": False,
+    },
+    "ar": {
+        "code": "ar",
+        "display_name": "Arabic",
+        "native_name": "العربية",
+        "direction": "rtl",
+        "is_rtl": True,
+    },
+    "ur": {
+        "code": "ur",
+        "display_name": "Urdu",
+        "native_name": "اردو",
+        "direction": "rtl",
+        "is_rtl": True,
+    },
+}
+_CONNECTOR_RESULT_SCHEMA_VERSION = 2
 
 
 def _validate_email(email: str) -> str:
@@ -42,21 +121,42 @@ def _extract_dict_keys(value: Any) -> list[str]:
     return sorted(str(field) for field in value)
 
 
+def _normalize_text_list(values: Iterable[Any] | None) -> list[str]:
+    """Normalize strings while preserving first-seen order."""
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values or []:
+        item = str(value).strip()
+        if not item:
+            continue
+        lowered = item.lower()
+        if lowered in seen:
+            continue
+        normalized.append(item)
+        seen.add(lowered)
+    return normalized
+
+
 class _TTLCache:
     """A minimal thread-unsafe TTL cache keyed by arbitrary hashable keys."""
 
     def __init__(self, ttl_seconds: float = 300) -> None:
         self._ttl = ttl_seconds
         self._store: dict[Any, tuple[Any, float]] = {}
+        self._hits = 0
+        self._misses = 0
 
     def get(self, key: Any) -> tuple[bool, Any]:
         entry = self._store.get(key)
         if entry is None:
+            self._misses += 1
             return False, None
         value, expires_at = entry
         if time.monotonic() > expires_at:
             del self._store[key]
+            self._misses += 1
             return False, None
+        self._hits += 1
         return True, value
 
     def set(self, key: Any, value: Any) -> None:
@@ -67,6 +167,119 @@ class _TTLCache:
 
     def clear(self) -> None:
         self._store.clear()
+
+    def stats(self) -> dict[str, float | int]:
+        return {
+            "hits": self._hits,
+            "misses": self._misses,
+            "size": len(self._store),
+            "ttl_seconds": self._ttl,
+        }
+
+
+def _parse_secret_payload(raw_value: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(raw_value)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+    return {"secret": raw_value}
+
+
+def _prometheus_label_value(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'"{escaped}"'
+
+
+class ConnectorMetricsRegistry:
+    """Collect connector request/error/latency metrics across connector instances."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._metrics: dict[tuple[str, str], dict[str, float]] = {}
+
+    def ensure_connector(self, connector_name: str, connector_type: str) -> None:
+        with self._lock:
+            self._metrics.setdefault(
+                (connector_name, connector_type),
+                {
+                    "requests_total": 0.0,
+                    "errors_total": 0.0,
+                    "latency_seconds_sum": 0.0,
+                    "latency_seconds_count": 0.0,
+                },
+            )
+
+    def record(
+        self,
+        *,
+        connector_name: str,
+        connector_type: str,
+        latency_seconds: float,
+        errored: bool,
+    ) -> None:
+        with self._lock:
+            bucket = self._metrics.setdefault(
+                (connector_name, connector_type),
+                {
+                    "requests_total": 0.0,
+                    "errors_total": 0.0,
+                    "latency_seconds_sum": 0.0,
+                    "latency_seconds_count": 0.0,
+                },
+            )
+            bucket["requests_total"] += 1
+            bucket["latency_seconds_sum"] += max(latency_seconds, 0.0)
+            bucket["latency_seconds_count"] += 1
+            if errored:
+                bucket["errors_total"] += 1
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows: list[dict[str, Any]] = []
+            for (connector_name, connector_type), metrics in sorted(self._metrics.items()):
+                rows.append(
+                    {
+                        "connector_name": connector_name,
+                        "connector_type": connector_type,
+                        **metrics,
+                    }
+                )
+            return rows
+
+    def reset(self) -> None:
+        with self._lock:
+            self._metrics.clear()
+
+    def render_prometheus(self) -> list[str]:
+        lines = [
+            "# HELP funding_bot_connector_requests_total Total connector fetch requests",
+            "# TYPE funding_bot_connector_requests_total counter",
+            "# HELP funding_bot_connector_errors_total Total connector fetch errors",
+            "# TYPE funding_bot_connector_errors_total counter",
+            "# HELP funding_bot_connector_latency_seconds_sum Total connector fetch latency in seconds",
+            "# TYPE funding_bot_connector_latency_seconds_sum counter",
+            "# HELP funding_bot_connector_latency_seconds_count Total connector fetch latency observations",
+            "# TYPE funding_bot_connector_latency_seconds_count counter",
+        ]
+        for row in self.snapshot():
+            labels = (
+                f'connector_name={_prometheus_label_value(str(row["connector_name"]))},'
+                f'connector_type={_prometheus_label_value(str(row["connector_type"]))}'
+            )
+            lines.extend(
+                [
+                    f'funding_bot_connector_requests_total{{{labels}}} {int(row["requests_total"])}',
+                    f'funding_bot_connector_errors_total{{{labels}}} {int(row["errors_total"])}',
+                    f'funding_bot_connector_latency_seconds_sum{{{labels}}} {row["latency_seconds_sum"]:.6f}',
+                    f'funding_bot_connector_latency_seconds_count{{{labels}}} {int(row["latency_seconds_count"])}',
+                ]
+            )
+        return lines
+
+
+_CONNECTOR_METRICS = ConnectorMetricsRegistry()
 
 
 class FundingBotError(Exception):
@@ -85,12 +298,134 @@ class CredentialNotFoundError(FundingBotError):
     """Raised when a credential alias cannot be resolved."""
 
 
+class ConnectorConfigError(FundingBotError):
+    """Raised when connector configuration or credentials are invalid."""
+
+
 class OutreachThrottledError(FundingBotError):
     """Raised when an outreach email exceeds the allowed cadence."""
 
 
 class OptOutError(FundingBotError):
     """Raised when a donor has opted out of outreach."""
+
+
+@dataclass(frozen=True)
+class ConsentRecord:
+    """Immutable donor communication consent event."""
+
+    donor_email: str
+    channel: str
+    status: str
+    consented_at: str
+    source: str
+    recorded_at: str
+    id: int | None = None
+    withdrawn_at: str | None = None
+    proof: str | None = None
+    notes: str | None = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row | None) -> "ConsentRecord | None":
+        if row is None:
+            return None
+        return cls(
+            id=row["id"],
+            donor_email=row["donor_email"],
+            channel=row["channel"],
+            status=row["status"],
+            consented_at=row["consented_at"],
+            withdrawn_at=row["withdrawn_at"],
+            source=row["source"],
+            proof=row["proof"],
+            notes=row["notes"],
+            recorded_at=row["recorded_at"],
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "donor_email": self.donor_email,
+            "channel": self.channel,
+            "status": self.status,
+            "consented_at": self.consented_at,
+            "withdrawn_at": self.withdrawn_at,
+            "source": self.source,
+            "proof": self.proof,
+            "notes": self.notes,
+            "recorded_at": self.recorded_at,
+        }
+
+
+class TaskTransitionError(FundingBotError):
+    """Raised when a task status change violates the workflow state machine."""
+
+
+class TaskNotFoundError(FundingBotError):
+    """Raised when a task cannot be found."""
+
+
+class TaskCommentNotFoundError(FundingBotError):
+    """Raised when a task comment cannot be found."""
+
+
+class GracefulShutdownRequested(FundingBotError):
+    """Raised when an in-flight queue task is asked to stop cleanly."""
+
+
+class GracefulShutdownController:
+    """Cooperative SIGTERM/SIGINT shutdown controller for queue workers."""
+
+    def __init__(self, on_shutdown: Callable[[int], None] | None = None) -> None:
+        self._shutdown_event = threading.Event()
+        self._on_shutdown = on_shutdown
+        self._original_handlers: dict[int, Any] = {}
+        self.received_signals: list[int] = []
+
+    def install(self) -> "GracefulShutdownController":
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            self._original_handlers[sig] = signal.getsignal(sig)
+            signal.signal(sig, self._handle_signal)
+        return self
+
+    def restore(self) -> None:
+        for sig, handler in self._original_handlers.items():
+            signal.signal(sig, handler)
+        self._original_handlers.clear()
+
+    def shutdown_requested(self) -> bool:
+        return self._shutdown_event.is_set()
+
+    def raise_if_shutdown_requested(self, *, reason: str | None = None) -> None:
+        if self.shutdown_requested():
+            raise GracefulShutdownRequested(reason or "Shutdown requested for in-flight queue task.")
+
+    def _handle_signal(self, signum: int, _frame: Any) -> None:
+        self.received_signals.append(signum)
+        self._shutdown_event.set()
+        if self._on_shutdown is not None:
+            self._on_shutdown(signum)
+
+
+class QueueTaskContext:
+    """Runtime state exposed to cooperative queue tasks."""
+
+    def __init__(
+        self,
+        *,
+        bot: "FundingBot",
+        idempotency_key: str,
+        controller: GracefulShutdownController,
+    ) -> None:
+        self.bot = bot
+        self.idempotency_key = idempotency_key
+        self._controller = controller
+
+    def shutdown_requested(self) -> bool:
+        return self._controller.shutdown_requested()
+
+    def checkpoint(self, reason: str | None = None) -> None:
+        self._controller.raise_if_shutdown_requested(reason=reason)
 
 
 class BrowserClient(Protocol):
@@ -107,6 +442,18 @@ class BrowserClient(Protocol):
 class PortalConnector(Protocol):
     def fetch_opportunities(self, keywords: Iterable[str]) -> list[dict[str, Any]]:
         """Fetch opportunities from an external portal."""
+
+    def invalidate_cache(self, keywords: Iterable[str] | None = None) -> None:
+        """Invalidate all cached results or only those matching ``keywords``."""
+
+    def cache_metrics(self) -> dict[str, Any]:
+        """Return connector cache usage metrics."""
+
+    def check_health(self) -> dict[str, Any]:
+        """Return the current connector health state."""
+
+    def get_failure_metrics(self) -> dict[str, Any]:
+        """Return connector resilience metrics."""
 
 
 class CredentialVault(Protocol):
@@ -145,39 +492,154 @@ class FileVault:
 class _BasePortalConnector:
     """Common behavior for demo portal connectors."""
 
+    connector_slug = "portal"
     source_name = "Portal"
     base_url = "https://example.org"
+    result_schema_version = _CONNECTOR_RESULT_SCHEMA_VERSION
+    keyword_category_mappings: dict[str, dict[str, tuple[str, ...]]] = {}
+    default_page_size = 100
 
     def __init__(
         self,
         http_client: Callable[..., Any] | None = None,
         *,
         cache_ttl: float | None = None,
+        page_size: int | None = None,
+        max_retries: int = 2,
+        retry_backoff_base: float = 0.25,
+        retry_backoff_factor: float = 2.0,
+        circuit_failure_threshold: int = 3,
+        circuit_recovery_timeout: float = 30.0,
+        sleep_func: Callable[[float], None] | None = None,
+        time_func: Callable[[], float] | None = None,
     ) -> None:
         self.http_client = http_client
-        if cache_ttl is None:
-            raw_ttl = os.environ.get("PORTAL_CACHE_TTL", "300")
-            try:
-                cache_ttl = float(raw_ttl)
-            except ValueError:
-                cache_ttl = 300
-            if cache_ttl <= 0:
-                cache_ttl = 300
+        self.page_size = self._resolve_page_size(page_size)
+        cache_ttl = self._resolve_cache_ttl(cache_ttl)
         self._cache = _TTLCache(ttl_seconds=cache_ttl)
+        self.max_retries = max(0, max_retries)
+        self.retry_backoff_base = max(0.0, retry_backoff_base)
+        self.retry_backoff_factor = max(1.0, retry_backoff_factor)
+        self.circuit_failure_threshold = max(1, circuit_failure_threshold)
+        self.circuit_recovery_timeout = max(0.0, circuit_recovery_timeout)
+        self._sleep = sleep_func or time.sleep
+        self._time = time_func or time.monotonic
+        self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        self._circuit_state = "closed"
+        self._opened_at: float | None = None
+        self._last_error: str | None = None
+        self._metrics: dict[str, Any] = {
+            "requests": 0,
+            "successful_requests": 0,
+            "failed_requests": 0,
+            "retry_attempts": 0,
+            "health_checks": 0,
+            "short_circuits": 0,
+            "consecutive_failures": 0,
+            "state_transitions": 0,
+        }
 
     def fetch_opportunities(self, keywords: Iterable[str]) -> list[dict[str, Any]]:
-        keyword_list = [keyword.lower() for keyword in (keywords or [])]
+        return list(self.fetch_result(keywords)["opportunities"])
+
+    def fetch_result(self, keywords: Iterable[str]) -> dict[str, Any]:
+        keyword_list = self._expand_keywords(keywords)
         cache_key = (self.base_url, tuple(sorted(keyword_list)))
         if self._cache is not None:
             hit, cached = self._cache.get(cache_key)
             if hit:
-                return list(cached)
+                return {
+                    "schema_version": cached["schema_version"],
+                    "opportunities": [dict(item) for item in cached["opportunities"]],
+                    "metadata": dict(cached["metadata"]),
+                }
 
-        opportunities = self._fetch_remote(keyword_list) if self.http_client else self._demo_data()
+        if self._refresh_circuit_state() == "open":
+            self._metrics["short_circuits"] += 1
+            raise RuntimeError(f"{self.source_name} connector circuit breaker is open.")
+
+        if self.http_client:
+            result = self._fetch_remote_result(keyword_list)
+        else:
+            result = {
+                "schema_version": self.result_schema_version,
+                "opportunities": [dict(item) for item in self._demo_data()],
+                "metadata": {
+                    "connector_name": self.source_name,
+                    "source_status": "demo",
+                },
+            }
+
+        filtered = self._filter_opportunities(result["opportunities"], keyword_list)
+        payload = {
+            "schema_version": result["schema_version"],
+            "opportunities": filtered,
+            "metadata": {
+                **dict(result.get("metadata", {})),
+                "cache_key": self.build_cache_key(keyword_list),
+                "keyword_count": len(keyword_list),
+            },
+        }
         if self._cache is not None:
-            self._cache.set(cache_key, list(opportunities))
+            self._cache.set(
+                cache_key,
+                {
+                    "schema_version": payload["schema_version"],
+                    "opportunities": [dict(item) for item in payload["opportunities"]],
+                    "metadata": dict(payload["metadata"]),
+                },
+            )
+        return payload
+
+    def build_cache_key(self, keywords: Iterable[str]) -> str:
+        return json.dumps(
+            {
+                "base_url": self.base_url,
+                "keywords": sorted(keyword.lower() for keyword in _normalize_text_list(keywords)),
+            },
+            sort_keys=True,
+        )
+
+    def default_fallback_results(self, keywords: Iterable[str]) -> list[dict[str, Any]]:
+        return self._filter_opportunities(self._demo_data(), self._expand_keywords(keywords))
+
+    def get_keyword_category_mappings(self) -> dict[str, dict[str, list[str]]]:
+        mappings: dict[str, dict[str, list[str]]] = {}
+        for canonical_keyword, config in self.keyword_category_mappings.items():
+            keyword_values = _normalize_text_list(
+                [canonical_keyword, *config.get("keywords", ())]
+            )
+            category_values = _normalize_text_list(config.get("categories", ()))
+            mappings[canonical_keyword] = {
+                "keywords": keyword_values,
+                "categories": category_values,
+            }
+        return mappings
+
+    def _expand_keywords(self, keywords: Iterable[str] | None) -> list[str]:
+        requested_keywords = [keyword.lower() for keyword in _normalize_text_list(keywords)]
+        if not requested_keywords:
+            return []
+
+        expanded: set[str] = set(requested_keywords)
+        for canonical_keyword, config in self.get_keyword_category_mappings().items():
+            synonyms = {
+                canonical_keyword.lower(),
+                *(keyword.lower() for keyword in config.get("keywords", [])),
+                *(category.lower() for category in config.get("categories", [])),
+            }
+            if expanded.intersection(synonyms):
+                expanded.update(synonyms)
+        return sorted(expanded)
+
+    def _filter_opportunities(
+        self,
+        opportunities: Iterable[dict[str, Any]],
+        keywords: Iterable[str] | None,
+    ) -> list[dict[str, Any]]:
+        keyword_list = [keyword.lower() for keyword in (keywords or [])]
         if not keyword_list:
-            return opportunities
+            return [dict(item) for item in opportunities]
 
         filtered: list[dict[str, Any]] = []
         for opportunity in opportunities:
@@ -190,26 +652,250 @@ class _BasePortalConnector:
                 ]
             ).lower()
             if any(keyword in searchable for keyword in keyword_list):
-                filtered.append(opportunity)
+                filtered.append(dict(opportunity))
         return filtered
 
+    def validate_connectivity(
+        self,
+        keywords: Iterable[str] | None = None,
+        *,
+        sample_limit: int = 3,
+    ) -> dict[str, Any]:
+        requested_keywords = _normalize_text_list(keywords)
+        try:
+            sample_results = self.fetch_opportunities(requested_keywords)
+            trimmed_results = [
+                {
+                    "source": row.get("source"),
+                    "donor_name": row.get("donor_name"),
+                    "title": row.get("title"),
+                    "portal_url": row.get("portal_url"),
+                    "category": row.get("category"),
+                    "tags": row.get("tags", []),
+                }
+                for row in sample_results[: max(sample_limit, 0)]
+            ]
+            return {
+                "connector": self.connector_slug,
+                "source": self.source_name,
+                "base_url": self.base_url,
+                "status": "ok",
+                "connectivity_validated": True,
+                "mode": "remote" if self.http_client else "demo",
+                "requested_keywords": requested_keywords,
+                "expanded_keywords": self._expand_keywords(requested_keywords),
+                "sample_result_count": len(sample_results),
+                "sample_results": trimmed_results,
+                "keyword_mappings": self.get_keyword_category_mappings(),
+            }
+        except Exception as exc:
+            return {
+                "connector": self.connector_slug,
+                "source": self.source_name,
+                "base_url": self.base_url,
+                "status": "error",
+                "connectivity_validated": False,
+                "mode": "remote" if self.http_client else "demo",
+                "requested_keywords": requested_keywords,
+                "expanded_keywords": self._expand_keywords(requested_keywords),
+                "sample_result_count": 0,
+                "sample_results": [],
+                "keyword_mappings": self.get_keyword_category_mappings(),
+                "error": str(exc),
+            }
+
     def _fetch_remote(self, keywords: list[str]) -> list[dict[str, Any]]:
-        response = self.http_client(self.base_url, {"keywords": keywords})
+        return self._fetch_remote_result(keywords)["opportunities"]
+
+    def _fetch_remote_result(self, keywords: list[str]) -> dict[str, Any]:
+        response = self._call_with_retry(
+            lambda: self.http_client(
+                self.base_url,
+                {"keywords": keywords, "health_check": self._circuit_state == "half-open"},
+            )
+        )
         if isinstance(response, dict):
-            payload = response.get("opportunities", [])
+            payload = response.get("opportunities")
+            if payload is None:
+                payload = response.get("results")
+            if payload is None:
+                payload = response.get("items", [])
+            declared_version = response.get("schema_version", response.get("result_schema_version"))
+            response_keys = sorted(str(key) for key in response)
         else:
             payload = response
-        return [dict(item) for item in payload]
+            declared_version = None
+            response_keys = []
+        detected_version = self.detect_schema_version(payload, declared_version)
+        return {
+            "schema_version": self.result_schema_version,
+            "opportunities": self.migrate_result_payload(payload, detected_version),
+            "metadata": {
+                "connector_name": self.source_name,
+                "source_status": "remote",
+                "detected_schema_version": detected_version,
+                "upstream_schema_version": declared_version,
+                "response_keys": response_keys,
+            },
+        }
+
+    def detect_schema_version(self, payload: Any, declared_version: Any = None) -> int:
+        if declared_version is not None:
+            try:
+                return int(declared_version)
+            except (TypeError, ValueError):
+                pass
+        if isinstance(payload, list) and payload:
+            sample = payload[0]
+        else:
+            sample = payload
+        if isinstance(sample, dict):
+            if {"portal_url", "summary", "donor_name"}.issubset(sample):
+                return 2
+            if {"link", "description", "funder"} & set(sample):
+                return 1
+        return self.result_schema_version
+
+    def migrate_result_payload(self, payload: Any, schema_version: int) -> list[dict[str, Any]]:
+        rows = payload if isinstance(payload, list) else []
+        current_version = schema_version or self.result_schema_version
+        migrated_rows = [dict(item) for item in rows]
+        while current_version < self.result_schema_version:
+            migrator = getattr(self, f"_migrate_schema_v{current_version}_to_v{current_version + 1}", None)
+            if migrator is None:
+                break
+            migrated_rows = [dict(item) for item in migrator(migrated_rows)]
+            current_version += 1
+        return [self._normalize_current_record(item) for item in migrated_rows]
+
+    def _migrate_schema_v1_to_v2(self, rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+        migrated: list[dict[str, Any]] = []
+        for row in rows:
+            migrated.append(
+                {
+                    "source": row.get("source", self.source_name),
+                    "donor_name": row.get("donor_name", row.get("funder", "Unknown donor")),
+                    "title": row.get("title", "Untitled opportunity"),
+                    "portal_url": row.get("portal_url", row.get("link", "")),
+                    "summary": row.get("summary", row.get("description", "")),
+                    "category": row.get("category", row.get("type", "")),
+                    "tags": row.get("tags", row.get("topics", [])),
+                }
+            )
+        return migrated
+
+    def _normalize_current_record(self, row: dict[str, Any]) -> dict[str, Any]:
+        tags = row.get("tags", [])
+        if isinstance(tags, str):
+            tags = [part.strip() for part in tags.split(",") if part.strip()]
+        return {
+            "source": str(row.get("source", self.source_name)),
+            "donor_name": str(row.get("donor_name", row.get("funder", "Unknown donor"))),
+            "title": str(row.get("title", "Untitled opportunity")),
+            "portal_url": str(row.get("portal_url", row.get("link", ""))),
+            "summary": str(row.get("summary", row.get("description", ""))),
+            "category": str(row.get("category", row.get("type", ""))),
+            "tags": [str(tag) for tag in tags],
+        }
 
     def _demo_data(self) -> list[dict[str, Any]]:
         raise NotImplementedError
+
+    def check_health(self) -> dict[str, Any]:
+        state = self._refresh_circuit_state()
+        self._metrics["health_checks"] += 1
+        return {
+            "healthy": state != "open",
+            "state": state,
+            "last_error": self._last_error,
+            "metrics": self.get_failure_metrics(),
+        }
+
+    def get_failure_metrics(self) -> dict[str, Any]:
+        return {
+            **self._metrics,
+            "state": self._refresh_circuit_state(),
+            "last_error": self._last_error,
+            "opened_at": self._opened_at,
+        }
+
+    def _call_with_retry(self, operation: Callable[[], Any]) -> Any:
+        attempts = self.max_retries + 1
+        for attempt_number in range(1, attempts + 1):
+            self._metrics["requests"] += 1
+            try:
+                result = operation()
+            except Exception as exc:
+                if self._is_retryable(exc) and attempt_number < attempts:
+                    self._metrics["retry_attempts"] += 1
+                    self._sleep(self.retry_backoff_base * (self.retry_backoff_factor ** (attempt_number - 1)))
+                    continue
+                self._record_failure(exc)
+                raise
+            self._record_success()
+            return result
+        raise RuntimeError("Connector retry loop exhausted unexpectedly.")
+
+    @staticmethod
+    def _is_retryable(exc: Exception) -> bool:
+        return isinstance(exc, _TRANSIENT_CONNECTOR_ERRORS)
+
+    def _refresh_circuit_state(self) -> str:
+        if (
+            self._circuit_state == "open"
+            and self._opened_at is not None
+            and (self._time() - self._opened_at) >= self.circuit_recovery_timeout
+        ):
+            self._transition_circuit("half-open")
+        return self._circuit_state
+
+    def _record_success(self) -> None:
+        self._metrics["successful_requests"] += 1
+        self._metrics["consecutive_failures"] = 0
+        self._last_error = None
+        self._opened_at = None
+        if self._circuit_state != "closed":
+            self._transition_circuit("closed")
+
+    def _record_failure(self, exc: Exception) -> None:
+        self._metrics["failed_requests"] += 1
+        self._metrics["consecutive_failures"] += 1
+        self._last_error = str(exc)
+        if self._circuit_state == "half-open" or (
+            self._metrics["consecutive_failures"] >= self.circuit_failure_threshold
+        ):
+            self._opened_at = self._time()
+            self._transition_circuit("open")
+
+    def _transition_circuit(self, new_state: str) -> None:
+        if self._circuit_state == new_state:
+            return
+        self._logger.info(
+            "Connector %s circuit breaker transition: %s -> %s",
+            self.source_name,
+            self._circuit_state,
+            new_state,
+        )
+        self._circuit_state = new_state
+        self._metrics["state_transitions"] += 1
 
 
 class GrantsPortalConnector(_BasePortalConnector):
     """Stub connector for grants portals."""
 
+    connector_slug = "grants-portal"
     source_name = "Grants Portal"
     base_url = "https://grants.example.org/opportunities"
+    keyword_category_mappings = {
+        "education": {
+            "keywords": ("learning", "school improvement", "innovation grant"),
+            "categories": ("Education",),
+        },
+        "youth": {
+            "keywords": ("student success", "young learners"),
+            "categories": ("Education",),
+        },
+    }
 
     def _demo_data(self) -> list[dict[str, Any]]:
         return [
@@ -228,8 +914,19 @@ class GrantsPortalConnector(_BasePortalConnector):
 class CSRNetworkConnector(_BasePortalConnector):
     """Stub connector for CSR funding networks."""
 
+    connector_slug = "csr-network"
     source_name = "CSR Network"
     base_url = "https://csr.example.org/opportunities"
+    keyword_category_mappings = {
+        "csr": {
+            "keywords": ("corporate social responsibility", "corporate giving"),
+            "categories": ("Corporate Partnerships",),
+        },
+        "digital learning": {
+            "keywords": ("edtech", "technology training", "online learning"),
+            "categories": ("Corporate Partnerships",),
+        },
+    }
 
     def _demo_data(self) -> list[dict[str, Any]]:
         return [
@@ -248,8 +945,19 @@ class CSRNetworkConnector(_BasePortalConnector):
 class NGODirectoryConnector(_BasePortalConnector):
     """Stub connector for NGO funding directories."""
 
+    connector_slug = "ngo-directory"
     source_name = "NGO Directory"
     base_url = "https://directory.example.org/opportunities"
+    keyword_category_mappings = {
+        "literacy": {
+            "keywords": ("reading", "community engagement", "library support"),
+            "categories": ("Literacy",),
+        },
+        "institutional": {
+            "keywords": ("foundation grant", "capacity building"),
+            "categories": ("Literacy",),
+        },
+    }
 
     def _demo_data(self) -> list[dict[str, Any]]:
         return [
@@ -273,6 +981,92 @@ def default_connectors() -> list[PortalConnector]:
     the full search pipeline end-to-end.
     """
     return [GrantsPortalConnector(), CSRNetworkConnector(), NGODirectoryConnector()]
+
+
+def connector_registry() -> dict[str, type[_BasePortalConnector]]:
+    """Return built-in connectors keyed by their CLI slug."""
+    return {
+        GrantsPortalConnector.connector_slug: GrantsPortalConnector,
+        CSRNetworkConnector.connector_slug: CSRNetworkConnector,
+        NGODirectoryConnector.connector_slug: NGODirectoryConnector,
+    }
+
+
+def create_connector(connector_name: str, **kwargs: Any) -> _BasePortalConnector:
+    """Instantiate a built-in connector by slug."""
+    try:
+        connector_class = connector_registry()[connector_name]
+    except KeyError as exc:
+        raise FundingBotError(f"Unknown connector {connector_name!r}.") from exc
+    return connector_class(**kwargs)
+
+
+SUPPORTED_OUTREACH_LOCALES = ("en", "bn")
+DEFAULT_OUTREACH_LOCALE = "en"
+DEFAULT_OUTREACH_TEMPLATE_NAME = "thank-you"
+LOCALIZED_OUTREACH_TEMPLATES: dict[str, dict[str, dict[str, str]]] = {
+    "thank-you": {
+        "en": {
+            "subject": "Thank you for supporting {organization_name}",
+            "body": "Dear {donor_name},\n\nThank you for your continued interest in {organization_name}.",
+        },
+        "bn": {
+            "subject": "{organization_name}-কে সমর্থন করার জন্য ধন্যবাদ",
+            "body": "প্রিয় {donor_name},\n\n{organization_name}-এর প্রতি আপনার ধারাবাহিক আগ্রহের জন্য ধন্যবাদ।",
+        },
+    },
+    "impact-update": {
+        "en": {
+            "subject": "Latest impact update from {organization_name}",
+            "body": "Dear {donor_name},\n\nYour support helps advance our mission: {mission}",
+        },
+        "bn": {
+            "subject": "{organization_name}-এর সর্বশেষ প্রভাবের খবর",
+            "body": "প্রিয় {donor_name},\n\nআপনার সহায়তা আমাদের এই মিশন এগিয়ে নিতে সাহায্য করছে: {mission}",
+        },
+    },
+    "meeting-request": {
+        "en": {
+            "subject": "Could we schedule a conversation with {organization_name}?",
+            "body": "Dear {donor_name},\n\nWe would welcome the chance to discuss how {organization_name} can partner with you.",
+        },
+        "bn": {
+            "subject": "{organization_name}-এর সঙ্গে কি একটি আলোচনা নির্ধারণ করা যায়?",
+            "body": "প্রিয় {donor_name},\n\n{organization_name} কীভাবে আপনার সঙ্গে অংশীদারিত্ব করতে পারে তা নিয়ে আলোচনা করার সুযোগ পেলে আমরা আনন্দিত হব।",
+        },
+    },
+}
+
+
+def _validate_locale(locale: str | None) -> str:
+    normalized = (locale or DEFAULT_OUTREACH_LOCALE).strip().lower()
+    if normalized not in SUPPORTED_OUTREACH_LOCALES:
+        raise ValueError(
+            f"Invalid locale {locale!r}. Expected one of {list(SUPPORTED_OUTREACH_LOCALES)}."
+        )
+    return normalized
+
+
+def _validate_localized_outreach_templates(
+    catalog: dict[str, dict[str, dict[str, str]]],
+) -> None:
+    for template_name, localized_templates in catalog.items():
+        missing_locales = sorted(set(SUPPORTED_OUTREACH_LOCALES) - set(localized_templates))
+        if missing_locales:
+            raise ValueError(
+                f"Outreach template {template_name!r} is missing locales: {missing_locales}."
+            )
+        for locale_name in SUPPORTED_OUTREACH_LOCALES:
+            localized_template = localized_templates[locale_name]
+            subject = localized_template.get("subject", "").strip()
+            body = localized_template.get("body", "").strip()
+            if not subject or not body:
+                raise ValueError(
+                    f"Outreach template {template_name!r} for locale {locale_name!r} must define non-empty subject and body."
+                )
+
+
+_validate_localized_outreach_templates(LOCALIZED_OUTREACH_TEMPLATES)
 
 
 class SMTPEmailSender:
@@ -363,6 +1157,23 @@ class SMTPEmailSender:
 
 
 class FundingBot:
+    TASK_STATUSES = ("todo", "in-progress", "done", "blocked")
+    TASK_STATUS_TRANSITIONS = {
+        "todo": frozenset({"in-progress", "blocked"}),
+        "in-progress": frozenset({"todo", "done", "blocked"}),
+        "blocked": frozenset({"todo", "in-progress"}),
+        "done": frozenset(),
+    }
+    DEFAULT_QUEUE_RETRY_LIMIT = 3
+    DEFAULT_QUEUE_RETRY_BACKOFF_SECONDS = 5.0
+    DEFAULT_QUEUE_RETRY_BACKOFF_MAX_SECONDS = 300.0
+    SUPPORTED_TEMPLATE_LOCALES = frozenset({"en", "bn"})
+    DEFAULT_TEMPLATE_LOCALE = "en"
+    DEFAULT_OUTREACH_TEMPLATE = "default"
+    OUTREACH_TEMPLATE_CATALOG = (
+        Path(__file__).resolve().parent / "i18n" / "outreach_templates"
+    )
+
     def __init__(
         self,
         db_path: str | os.PathLike[str] = ":memory:",
@@ -433,7 +1244,8 @@ class FundingBot:
                 name TEXT NOT NULL,
                 opted_out INTEGER NOT NULL DEFAULT 0,
                 preferences_json TEXT NOT NULL DEFAULT '{}',
-                last_contact_at TEXT
+                last_contact_at TEXT,
+                locale TEXT NOT NULL DEFAULT 'en'
             );
 
             CREATE TABLE IF NOT EXISTS communications (
@@ -478,6 +1290,50 @@ class FundingBot:
                 FOREIGN KEY (communication_id) REFERENCES communications(id)
             );
 
+            CREATE TABLE IF NOT EXISTS task_runs (
+                task_id TEXT PRIMARY KEY,
+                task_name TEXT NOT NULL,
+                status TEXT NOT NULL,
+                progress INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT '',
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT,
+                error_message TEXT,
+                callback_name TEXT,
+                callback_payload_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                external_id TEXT UNIQUE,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                assigned_to TEXT NOT NULL,
+                status TEXT NOT NULL,
+                due_date TEXT,
+                source TEXT NOT NULL DEFAULT 'manual',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS translation_reviews (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                locale TEXT NOT NULL,
+                translation_key TEXT NOT NULL,
+                source_text TEXT NOT NULL,
+                translated_text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                submitter_notes TEXT,
+                submitted_by_role TEXT,
+                created_at TEXT NOT NULL,
+                reviewed_at TEXT,
+                reviewed_by_role TEXT,
+                reviewer_notes TEXT
+            );
+
             -- Performance indexes for v1.0
             CREATE INDEX IF NOT EXISTS idx_opportunities_discovered_at
                 ON opportunities(discovered_at DESC);
@@ -497,9 +1353,31 @@ class FundingBot:
                 ON communications(sent_at DESC);
             CREATE INDEX IF NOT EXISTS idx_outreach_events_communication_id
                 ON outreach_events(communication_id);
+            CREATE INDEX IF NOT EXISTS idx_task_runs_status
+                ON task_runs(status);
+            CREATE INDEX IF NOT EXISTS idx_task_runs_updated_at
+                ON task_runs(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_tasks_assigned_to
+                ON tasks(assigned_to);
+            CREATE INDEX IF NOT EXISTS idx_tasks_status
+                ON tasks(status);
+            CREATE INDEX IF NOT EXISTS idx_tasks_external_id
+                ON tasks(external_id);
+            CREATE INDEX IF NOT EXISTS idx_tasks_due_date
+                ON tasks(due_date);
+            CREATE INDEX IF NOT EXISTS idx_translation_reviews_status
+                ON translation_reviews(status);
+            CREATE INDEX IF NOT EXISTS idx_translation_reviews_locale
+                ON translation_reviews(locale);
+            CREATE INDEX IF NOT EXISTS idx_translation_reviews_created_at
+                ON translation_reviews(created_at DESC);
             """
         )
         self._ensure_column("donors", "segment", "TEXT NOT NULL DEFAULT 'unknown'")
+        self._ensure_column("donors", "locale", "TEXT NOT NULL DEFAULT 'en'")
+        self._ensure_column("tasks", "external_id", "TEXT")
+        self._ensure_column("tasks", "due_date", "TEXT")
+        self._ensure_column("tasks", "source", "TEXT NOT NULL DEFAULT 'manual'")
         # Index on donors.segment must be created after the column is guaranteed to exist.
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_donors_segment ON donors(segment)"
@@ -508,8 +1386,8 @@ class FundingBot:
 
     # Allowlist of table/column identifiers that _ensure_column is permitted to touch.
     # All calls are internal and use literals; the allowlist is an extra safety guard.
-    _ALLOWED_ALTER_TABLES = frozenset({"donors"})
-    _ALLOWED_ALTER_COLUMNS = frozenset({"segment"})
+    _ALLOWED_ALTER_TABLES = frozenset({"donors", "tasks"})
+    _ALLOWED_ALTER_COLUMNS = frozenset({"segment", "locale", "external_id", "due_date", "source"})
 
     def _ensure_column(self, table_name: str, column_name: str, definition: str) -> None:
         if table_name not in self._ALLOWED_ALTER_TABLES:
@@ -591,6 +1469,119 @@ class FundingBot:
             )
         return normalized
 
+    @staticmethod
+    def _validate_ui_locale(locale: str | None) -> str:
+        normalized = (locale or DEFAULT_LOCALE_CODE).strip().lower()
+        if normalized not in SUPPORTED_UI_LOCALES:
+            raise ValueError(
+                f"Unsupported locale {locale!r}. Expected one of {sorted(SUPPORTED_UI_LOCALES)}."
+            )
+        return normalized
+
+    @staticmethod
+    def _validate_translation_review_status(
+        status: str | None,
+        *,
+        allow_pending: bool = True,
+    ) -> str:
+        normalized = (status or "pending").strip().lower()
+        allowed = set(TRANSLATION_REVIEW_STATUSES)
+        if not allow_pending:
+            allowed.discard("pending")
+        if normalized not in allowed:
+            raise ValueError(
+                f"Invalid translation review status {status!r}. Expected one of {sorted(allowed)}."
+            )
+        return normalized
+
+    @classmethod
+    def _validate_locale(cls, locale: str | None) -> str:
+        normalized = (locale or cls.DEFAULT_TEMPLATE_LOCALE).strip().lower()
+        if normalized not in cls.SUPPORTED_TEMPLATE_LOCALES:
+            raise ValueError(
+                f"Invalid donor locale {locale!r}. Expected one of "
+                f"{sorted(cls.SUPPORTED_TEMPLATE_LOCALES)}."
+            )
+        return normalized
+
+    @classmethod
+    def _load_outreach_template_catalog(cls, locale: str) -> dict[str, Any]:
+        normalized_locale = cls._validate_locale(locale)
+        catalog_path = cls.OUTREACH_TEMPLATE_CATALOG / f"{normalized_locale}.json"
+        with catalog_path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        templates = data.get("templates")
+        if not isinstance(templates, dict):
+            raise FundingBotError(
+                f"Outreach template catalog {catalog_path} is missing a 'templates' object."
+            )
+        return templates
+
+    @classmethod
+    def _resolve_catalog_template(
+        cls,
+        template_name: str,
+        *,
+        segment: str,
+        locale: str,
+    ) -> tuple[str, str] | None:
+        locales_to_try = [cls._validate_locale(locale)]
+        if cls.DEFAULT_TEMPLATE_LOCALE not in locales_to_try:
+            locales_to_try.append(cls.DEFAULT_TEMPLATE_LOCALE)
+
+        for current_locale in locales_to_try:
+            templates = cls._load_outreach_template_catalog(current_locale)
+            template = templates.get(template_name)
+            if not isinstance(template, dict):
+                continue
+
+            variant: Any = template
+            segments = template.get("segments")
+            if (
+                isinstance(segments, dict)
+                and segment in segments
+                and isinstance(segments[segment], dict)
+            ):
+                variant = segments[segment]
+
+            subject = variant.get("subject")
+            body = variant.get("body")
+            if isinstance(subject, str) and isinstance(body, str):
+                return subject, body
+        return None
+
+    @classmethod
+    def _localized_opt_out_notice(cls, locale: str) -> str:
+        templates = cls._load_outreach_template_catalog(cls._validate_locale(locale))
+        default_template = templates.get(cls.DEFAULT_OUTREACH_TEMPLATE, {})
+        notice = default_template.get("opt_out_notice")
+        if isinstance(notice, str):
+            return notice
+        return "To opt out of future outreach, visit {opt_out_url}."
+
+    @classmethod
+    def _normalize_task_status(cls, status: str) -> str:
+        normalized = str(status).strip().lower().replace("_", "-")
+        if normalized not in cls.TASK_STATUSES:
+            raise ValueError(
+                f"Invalid task status {status!r}. Expected one of {list(cls.TASK_STATUSES)}."
+            )
+        return normalized
+
+    @staticmethod
+    def _serialize_task(row: sqlite3.Row) -> dict[str, Any]:
+        return dict(row)
+
+    @classmethod
+    def _validate_task_transition(cls, current_status: str, new_status: str) -> None:
+        if current_status == new_status:
+            return
+        allowed = cls.TASK_STATUS_TRANSITIONS[current_status]
+        if new_status not in allowed:
+            raise TaskTransitionError(
+                f"Task status cannot transition from {current_status!r} to {new_status!r}."
+            )
+
     def _log_action(self, action: str, **details: Any) -> None:
         self.connection.execute(
             "INSERT INTO audit_logs (happened_at, action, details_json) VALUES (?, ?, ?)",
@@ -656,6 +1647,15 @@ class FundingBot:
             "trusted_sources": settings.get("trusted_sources", []),
         }
 
+    def list_locale_definitions(self) -> list[dict[str, Any]]:
+        return [dict(definition) for definition in SUPPORTED_UI_LOCALES.values()]
+
+    def get_locale_definition(self, locale: str | None) -> dict[str, Any]:
+        return dict(SUPPORTED_UI_LOCALES[self._validate_ui_locale(locale)])
+
+    def is_rtl_locale(self, locale: str | None) -> bool:
+        return bool(self.get_locale_definition(locale)["is_rtl"])
+
     def list_credentials(self) -> list[dict[str, Any]]:
         """Return registered credential aliases (never the secret values)."""
         rows = self.connection.execute(
@@ -699,15 +1699,20 @@ class FundingBot:
         opted_out: bool = False,
         preferences: dict[str, Any] | None = None,
         segment: str | None = None,
+        locale: str | None = None,
     ) -> None:
         email = _validate_email(email)
         normalized_segment = self._validate_segment(segment) if segment is not None else None
+        normalized_locale = self._validate_locale(locale) if locale is not None else None
         self.connection.execute(
             """
-            INSERT INTO donors (email, name, opted_out, preferences_json, last_contact_at, segment)
+            INSERT INTO donors (
+                email, name, opted_out, preferences_json, last_contact_at, segment, locale
+            )
             VALUES (
                 ?, ?, ?, ?, COALESCE((SELECT last_contact_at FROM donors WHERE email = ?), NULL),
-                COALESCE((SELECT segment FROM donors WHERE email = ?), COALESCE(?, 'unknown'))
+                COALESCE((SELECT segment FROM donors WHERE email = ?), COALESCE(?, 'unknown')),
+                COALESCE((SELECT locale FROM donors WHERE email = ?), COALESCE(?, 'en'))
             )
             ON CONFLICT(email) DO UPDATE SET
                 name = excluded.name,
@@ -716,6 +1721,10 @@ class FundingBot:
                 segment = CASE
                     WHEN ? IS NULL THEN donors.segment
                     ELSE excluded.segment
+                END,
+                locale = CASE
+                    WHEN ? IS NULL THEN donors.locale
+                    ELSE excluded.locale
                 END
             """,
             (
@@ -726,19 +1735,23 @@ class FundingBot:
                 email,
                 email,
                 normalized_segment,
+                email,
+                normalized_locale,
                 normalized_segment,
+                normalized_locale,
             ),
         )
         self.connection.commit()
-        logged_segment = self.connection.execute(
-            "SELECT segment FROM donors WHERE email = ?",
+        logged_profile = self.connection.execute(
+            "SELECT segment, locale FROM donors WHERE email = ?",
             (email,),
-        ).fetchone()["segment"]
+        ).fetchone()
         self._log_action(
             "donor_upserted",
             email=email,
             opted_out=opted_out,
-            segment=logged_segment,
+            segment=logged_profile["segment"],
+            locale=logged_profile["locale"],
         )
 
     def list_donors(self, segment: str | None = None) -> list[dict[str, Any]]:
@@ -862,6 +1875,15 @@ class FundingBot:
 
         candidates: list[dict[str, Any]] = []
         for connector in active_connectors:
+            health = connector.check_health()
+            if not health.get("healthy", True):
+                self._log_action(
+                    "connector_degraded",
+                    source=getattr(connector, "source_name", connector.__class__.__name__),
+                    state=health.get("state"),
+                    last_error=health.get("last_error"),
+                )
+                continue
             candidates.extend(connector.fetch_opportunities(keyword_list))
 
         return self.discover_opportunities(
@@ -901,6 +1923,263 @@ class FundingBot:
             params.append(limit)
         rows = self.connection.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+
+    def get_translation_review(self, review_id: int) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM translation_reviews WHERE id = ?",
+            (review_id,),
+        ).fetchone()
+        if row is None:
+            raise FundingBotError(f"Unknown translation review id {review_id!r}.")
+        review = dict(row)
+        review["locale_metadata"] = self.get_locale_definition(review["locale"])
+        return review
+
+    def list_translation_reviews(
+        self,
+        *,
+        status: str | None = None,
+        locale: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT id FROM translation_reviews"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(self._validate_translation_review_status(status))
+        if locale is not None:
+            clauses.append("locale = ?")
+            params.append(self._validate_ui_locale(locale))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += (
+            " ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'rejected' THEN 1 ELSE 2 END,"
+            " created_at DESC, id DESC"
+        )
+        rows = self.connection.execute(query, params).fetchall()
+        return [self.get_translation_review(int(row["id"])) for row in rows]
+
+    def submit_translation_review(
+        self,
+        *,
+        locale: str,
+        translation_key: str,
+        source_text: str,
+        translated_text: str,
+        submitted_by_role: str | None = None,
+        submitter_notes: str | None = None,
+        created_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        normalized_locale = self._validate_ui_locale(locale)
+        normalized_key = str(translation_key).strip()
+        normalized_source = str(source_text).strip()
+        normalized_translation = str(translated_text).strip()
+        normalized_notes = (
+            str(submitter_notes).strip() if submitter_notes is not None else None
+        ) or None
+        if not normalized_key:
+            raise ValueError("Field 'translation_key' is required.")
+        if not normalized_source:
+            raise ValueError("Field 'source_text' is required.")
+        if not normalized_translation:
+            raise ValueError("Field 'translated_text' is required.")
+
+        created_iso = self._to_iso(created_at)
+        cursor = self.connection.execute(
+            """
+            INSERT INTO translation_reviews (
+                locale,
+                translation_key,
+                source_text,
+                translated_text,
+                status,
+                submitter_notes,
+                submitted_by_role,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)
+            """,
+            (
+                normalized_locale,
+                normalized_key,
+                normalized_source,
+                normalized_translation,
+                normalized_notes,
+                submitted_by_role,
+                created_iso,
+            ),
+        )
+        self.connection.commit()
+        self._log_action(
+            "translation_review_submitted",
+            review_id=cursor.lastrowid,
+            locale=normalized_locale,
+            translation_key=normalized_key,
+            submitted_by_role=submitted_by_role,
+        )
+        return self.get_translation_review(cursor.lastrowid)
+
+    def review_translation(
+        self,
+        review_id: int,
+        *,
+        status: str,
+        reviewed_by_role: str | None,
+        reviewer_notes: str | None = None,
+        reviewed_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        resolved_status = self._validate_translation_review_status(status, allow_pending=False)
+        existing = self.connection.execute(
+            "SELECT id FROM translation_reviews WHERE id = ?",
+            (review_id,),
+        ).fetchone()
+        if existing is None:
+            raise FundingBotError(f"Unknown translation review id {review_id!r}.")
+
+        normalized_notes = (
+            str(reviewer_notes).strip() if reviewer_notes is not None else None
+        ) or None
+        reviewed_iso = self._to_iso(reviewed_at)
+        self.connection.execute(
+            """
+            UPDATE translation_reviews
+            SET status = ?, reviewed_at = ?, reviewed_by_role = ?, reviewer_notes = ?
+            WHERE id = ?
+            """,
+            (resolved_status, reviewed_iso, reviewed_by_role, normalized_notes, review_id),
+        )
+        self.connection.commit()
+        updated = self.get_translation_review(review_id)
+        self._log_action(
+            "translation_review_updated",
+            review_id=review_id,
+            locale=updated["locale"],
+            translation_key=updated["translation_key"],
+            status=resolved_status,
+            reviewed_by_role=reviewed_by_role,
+        )
+        return updated
+
+    def create_task(
+        self,
+        *,
+        title: str,
+        assigned_to: str,
+        description: str = "",
+        status: str = "todo",
+        created_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        normalized_title = str(title).strip()
+        normalized_assignee = str(assigned_to).strip().lower()
+        if not normalized_title:
+            raise ValueError("Task title is required.")
+        if not normalized_assignee:
+            raise ValueError("Task assignee is required.")
+
+        normalized_status = self._normalize_task_status(status)
+        timestamp = self._to_iso(created_at)
+        cursor = self.connection.execute(
+            """
+            INSERT INTO tasks (
+                title, description, assigned_to, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_title,
+                str(description or "").strip(),
+                normalized_assignee,
+                normalized_status,
+                timestamp,
+                timestamp,
+            ),
+        )
+        self.connection.commit()
+        task = self.get_task(cursor.lastrowid)
+        self._log_action(
+            "task_created",
+            task_id=task["id"],
+            title=task["title"],
+            assigned_to=task["assigned_to"],
+            status=task["status"],
+        )
+        return task
+
+    def get_task(self, task_id: int) -> dict[str, Any]:
+        row = self.connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise FundingBotError(f"Task {task_id!r} does not exist.")
+        return self._serialize_task(row)
+
+    def list_tasks(
+        self,
+        *,
+        assigned_to: str | None = None,
+        status: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM tasks"
+        params: list[Any] = []
+        clauses: list[str] = []
+        if assigned_to:
+            clauses.append("assigned_to = ?")
+            params.append(str(assigned_to).strip().lower())
+        if status:
+            clauses.append("status = ?")
+            params.append(self._normalize_task_status(status))
+        if clauses:
+            query += " WHERE " + " AND ".join(clauses)
+        query += " ORDER BY updated_at DESC, id DESC"
+        rows = self.connection.execute(query, params).fetchall()
+        return [self._serialize_task(row) for row in rows]
+
+    def get_task_status_counts(self, *, assigned_to: str | None = None) -> dict[str, int]:
+        query = "SELECT status, COUNT(*) AS total FROM tasks"
+        params: list[Any] = []
+        if assigned_to:
+            query += " WHERE assigned_to = ?"
+            params.append(str(assigned_to).strip().lower())
+        query += " GROUP BY status"
+        counts = {status: 0 for status in self.TASK_STATUSES}
+        for row in self.connection.execute(query, params).fetchall():
+            counts[str(row["status"])] = int(row["total"])
+        return counts
+
+    def transition_task_status(
+        self,
+        task_id: int,
+        *,
+        new_status: str,
+        changed_by: str,
+    ) -> dict[str, Any]:
+        task = self.get_task(task_id)
+        normalized_status = self._normalize_task_status(new_status)
+        self._validate_task_transition(task["status"], normalized_status)
+        if task["status"] == normalized_status:
+            return task
+
+        updated_at = self._to_iso()
+        with self.connection:
+            updated = self.connection.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+                (normalized_status, updated_at, task_id),
+            )
+            if updated.rowcount == 0:
+                raise FundingBotError(f"Task {task_id!r} does not exist.")
+        notification = (
+            f"Task '{task['title']}' moved from {task['status']} to {normalized_status}."
+        )
+        self._log_action(
+            "task_status_changed",
+            task_id=task_id,
+            title=task["title"],
+            assigned_to=task["assigned_to"],
+            previous_status=task["status"],
+            status=normalized_status,
+            changed_by=str(changed_by).strip().lower(),
+            notification=notification,
+        )
+        updated_task = self.get_task(task_id)
+        updated_task["notification"] = notification
+        return updated_task
 
     def _get_opportunity(self, signature: str) -> sqlite3.Row:
         row = self.connection.execute(
@@ -1140,6 +2419,7 @@ class FundingBot:
         context: dict[str, Any] | None = None,
         sender: Any | None = None,
         sent_at: datetime | None = None,
+        locale: str | None = None,
     ) -> dict[str, Any]:
         donor_email = _validate_email(donor_email)
         donor = self.connection.execute(
@@ -1147,7 +2427,7 @@ class FundingBot:
             (donor_email,),
         ).fetchone()
         if donor is None:
-            self.upsert_donor(email=donor_email, name=donor_name)
+            self.upsert_donor(email=donor_email, name=donor_name, locale=locale)
             donor = self.connection.execute(
                 "SELECT * FROM donors WHERE email = ?",
                 (donor_email,),
@@ -1166,9 +2446,11 @@ class FundingBot:
                     f"{donor_email} was contacted less than seven days ago."
                 )
 
+        donor_locale = self._validate_locale(locale or donor["locale"])
         profile = self.load_organization_profile()
         merged_context = {
             "donor_name": donor_name,
+            "donor_locale": donor_locale,
             "organization_name": profile.get("name", "Nonprofit Funding Bot"),
             "mission": profile.get("mission", ""),
             "opt_out_url": (context or {}).get(
@@ -1177,13 +2459,11 @@ class FundingBot:
         }
         merged_context.update(profile)
         merged_context.update(context or {})
-
         subject = subject_template.format(**merged_context)
         body = body_template.format(**merged_context).rstrip()
         if merged_context["opt_out_url"] not in body:
-            body = (
-                f"{body}\n\nTo opt out of future outreach, visit {merged_context['opt_out_url']}."
-            )
+            opt_out_notice = self._localized_opt_out_notice(donor_locale).format(**merged_context)
+            body = f"{body}\n\n{opt_out_notice}"
 
         if sender is not None:
             sender(donor_email, subject, body)
@@ -1245,10 +2525,11 @@ class FundingBot:
     ) -> dict[str, Any]:
         """Send outreach using a stored template."""
         donor = self.connection.execute(
-            "SELECT segment FROM donors WHERE email = ?",
+            "SELECT segment, locale FROM donors WHERE email = ?",
             (donor_email,),
         ).fetchone()
         donor_segment = donor["segment"] if donor else "unknown"
+        donor_locale = self._validate_locale(donor["locale"] if donor else None)
         row = self.connection.execute(
             """
             SELECT subject_template, body_template, segment
@@ -1260,15 +2541,26 @@ class FundingBot:
             (template_name, donor_segment, donor_segment),
         ).fetchone()
         if row is None:
-            raise FundingBotError(f"Unknown outreach template {template_name!r}.")
+            catalog_template = self._resolve_catalog_template(
+                template_name,
+                segment=donor_segment,
+                locale=donor_locale,
+            )
+            if catalog_template is None:
+                raise FundingBotError(f"Unknown outreach template {template_name!r}.")
+            subject_template, body_template = catalog_template
+        else:
+            subject_template = row["subject_template"]
+            body_template = row["body_template"]
         return self.send_outreach(
             donor_email=donor_email,
             donor_name=donor_name,
-            subject_template=row["subject_template"],
-            body_template=row["body_template"],
+            subject_template=subject_template,
+            body_template=body_template,
             context=context,
             sender=sender,
             sent_at=sent_at,
+            locale=donor_locale,
         )
 
     def record_outreach_event(self, communication_id: int, event_type: str) -> None:
@@ -1918,6 +3210,12 @@ def _print_rows(rows: Iterable[dict[str, Any]], columns: Iterable[str] | None = 
         print("\t".join(str(row.get(column, "")) for column in column_list))
 
 
+def _parse_csv_argument(raw_value: str | None) -> list[str] | None:
+    if raw_value is None:
+        return None
+    return _normalize_text_list(raw_value.split(","))
+
+
 def _build_arg_parser() -> "argparse.ArgumentParser":
     import argparse
 
@@ -2036,6 +3334,30 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
         help="Comma-separated allow-list of sources (default: stored search settings).",
     )
 
+    test_connector_parser = subparsers.add_parser(
+        "test-connector",
+        help="Validate one connector and print sample results.",
+    )
+    test_connector_parser.add_argument(
+        "--connector",
+        required=True,
+        choices=sorted(connector_registry().keys()),
+        metavar="NAME",
+        help="Connector slug to validate.",
+    )
+    test_connector_parser.add_argument(
+        "--keywords",
+        metavar="KEYWORDS",
+        help="Comma-separated keywords to test, including mapped synonyms/categories.",
+    )
+    test_connector_parser.add_argument(
+        "--limit",
+        type=int,
+        default=3,
+        metavar="N",
+        help="Maximum sample results to print (default: 3).",
+    )
+
     outreach_parser = subparsers.add_parser(
         "send-outreach",
         help="Compose and send (or preview) a personalized donor outreach email.",
@@ -2044,17 +3366,20 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     outreach_parser.add_argument("--name", required=True, metavar="NAME", help="Donor name.")
     outreach_parser.add_argument(
         "--subject",
-        default="Thank you for supporting {organization_name}",
+        default=None,
         metavar="TEMPLATE",
-        help="Subject template with {placeholders} (default provided).",
+        help="Subject template with {placeholders} (defaults to the donor's locale-aware template).",
     )
     outreach_parser.add_argument(
         "--body",
-        default=(
-            "Dear {donor_name},\n\nThank you for your continued interest in {organization_name}."
-        ),
+        default=None,
         metavar="TEMPLATE",
-        help="Body template with {placeholders} (default provided).",
+        help="Body template with {placeholders} (defaults to the donor's locale-aware template).",
+    )
+    outreach_parser.add_argument(
+        "--locale",
+        metavar="LOCALE",
+        help="Donor locale preference for template selection (supported: en, bn).",
     )
     outreach_parser.add_argument(
         "--dry-run",
@@ -2166,7 +3491,7 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "list-donors":
             _print_rows(
                 bot.list_donors(segment=args.segment),
-                ["email", "name", "segment", "opted_out", "last_contact_at"],
+                ["email", "name", "segment", "locale", "opted_out", "last_contact_at"],
             )
         elif args.command == "monthly-audit-report":
             report = bot.build_monthly_audit_report(year=args.year, month=args.month)
@@ -2179,30 +3504,52 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 print(report_json)
         elif args.command == "discover":
-            keywords = (
-                [item.strip() for item in args.keywords.split(",") if item.strip()]
-                if args.keywords
-                else None
-            )
-            trusted_sources = (
-                [item.strip() for item in args.trusted_sources.split(",") if item.strip()]
-                if args.trusted_sources
-                else None
-            )
+            keywords = _parse_csv_argument(args.keywords)
+            trusted_sources = _parse_csv_argument(args.trusted_sources)
             found = bot.run_discovery(keywords=keywords, trusted_sources=trusted_sources)
             if found:
                 _print_rows(found, ["signature", "source", "donor_name", "title", "category"])
             else:
                 print("No new opportunities found.")
+        elif args.command == "test-connector":
+            connector = create_connector(args.connector)
+            validation = connector.validate_connectivity(
+                keywords=_parse_csv_argument(args.keywords),
+                sample_limit=max(args.limit, 0),
+            )
+            print(json.dumps(validation, indent=2))
         elif args.command == "send-outreach":
             sender = None if args.dry_run else SMTPEmailSender.from_env()
-            result = bot.send_outreach(
-                donor_email=args.email,
-                donor_name=args.name,
-                subject_template=args.subject,
-                body_template=args.body,
-                sender=sender,
-            )
+            if args.subject is None and args.body is None:
+                if args.locale is not None:
+                    bot.upsert_donor(email=args.email, name=args.name, locale=args.locale)
+                result = bot.send_outreach_from_template(
+                    bot.DEFAULT_OUTREACH_TEMPLATE,
+                    args.email,
+                    args.name,
+                    sender=sender,
+                )
+            else:
+                subject_template, body_template = args.subject, args.body
+                if subject_template is None or body_template is None:
+                    default_subject, default_body = bot._resolve_catalog_template(
+                        bot.DEFAULT_OUTREACH_TEMPLATE,
+                        segment="unknown",
+                        locale=args.locale or bot.DEFAULT_TEMPLATE_LOCALE,
+                    ) or (
+                        "Thank you for supporting {organization_name}",
+                        "Dear {donor_name},\n\nThank you for your continued interest in {organization_name}.",
+                    )
+                    subject_template = subject_template or default_subject
+                    body_template = body_template or default_body
+                result = bot.send_outreach(
+                    donor_email=args.email,
+                    donor_name=args.name,
+                    subject_template=subject_template,
+                    body_template=body_template,
+                    sender=sender,
+                    locale=args.locale,
+                )
             print(f"Subject: {result['subject']}\n")
             print(result["body"])
             if args.dry_run:

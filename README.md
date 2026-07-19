@@ -7,6 +7,7 @@
 The Nonprofit Funding Bot helps staff discover funding opportunities, prevent duplicate applications, track submissions, manage donor outreach, generate application documents, and prepare daily operational summaries. It combines a Python core, a Flask web dashboard, and deployment paths for Docker today and Kubernetes as the scaling roadmap matures.
 
 For planned milestones and release scope, see [roadmap.md](roadmap.md).
+For connector implementation and keyword-mapping guidance, see [docs/CONNECTORS.md](docs/CONNECTORS.md).
 
 ## Overview
 
@@ -67,7 +68,7 @@ The project is designed for nonprofit operations teams that need a lightweight w
 - Flask web dashboard for operations visibility
 - role-based access for admin, staff, and auditor personas
 - monthly audit report generation
-- collaboration workflows for shared review and follow-up
+- collaboration workflows for shared review, follow-up, and personal task tracking
 - self-service `/settings` panel for the organization profile, search keywords, and
   credential aliases, plus one-click actions to prove donation search and donor
   outreach without leaving the browser
@@ -86,13 +87,7 @@ The project is designed for nonprofit operations teams that need a lightweight w
 
 ## Installation
 
-The core bot uses the Python standard library. Install Flask to use the web dashboard:
-
-```bash
-pip install flask
-```
-
-If you prefer the dashboard dependencies from the repository:
+The core bot uses the Python standard library, and the web/task-queue stack uses Flask, Celery, and the Redis client:
 
 ```bash
 pip install -r web/requirements.txt
@@ -118,6 +113,9 @@ python -m funding_bot send-daily-summary --recipient lupael@i4e.com.bd
 # List discovered opportunities (optionally filter by status)
 python -m funding_bot list-opportunities
 python -m funding_bot list-opportunities --status pending --limit 20
+
+# Validate a single connector and print sample results
+python -m funding_bot test-connector --connector grants-portal --keywords learning
 
 # View recent audit log entries
 python -m funding_bot audit-log
@@ -152,6 +150,7 @@ Command reference:
 | `list-donors` | `v0.3.0` | `--segment {corporate,institutional,individual,unknown}` | List donor records and segment membership. | Available |
 | `monthly-audit-report` | `v1.0.0` | `--year YEAR`, `--month MONTH`, `--output FILE` | Generate a monthly GDPR/ISO compliance audit report as JSON. | Available |
 | `discover` | `v0.3.0` | `--keywords KEYWORDS`, `--trusted-sources SOURCES` | Query every configured portal connector and persist new opportunities (proves donation search). | Available |
+| `test-connector` | `v1.0.0` | `--connector NAME`, `--keywords KEYWORDS`, `--limit N` | Validate one connector in isolation and print sample results plus connector-specific keyword mappings. | Available |
 | `send-outreach` | `v0.3.0` | `--email EMAIL`, `--name NAME`, `--subject TEMPLATE`, `--body TEMPLATE`, `--dry-run` | Compose and send (or preview) a personalized donor outreach email (proves donor communication). | Available |
 | `set-organization-profile` | `v0.4.0` | `--file FILE` | Store the nonprofit's organization profile from a JSON file (or stdin). | Available |
 | `register-credential` | `v0.4.0` | `--alias ALIAS`, `--env-var ENV_VAR` | Register a credential alias that resolves to an environment variable. | Available |
@@ -202,6 +201,7 @@ The dashboard uses HTTP Basic Auth. Use one of these usernames as the role name:
 | --- | --- | --- | --- |
 | `/` | `GET` | Public | Redirect to `/dashboard`. |
 | `/dashboard` | `GET` | `staff`, `admin`, `auditor` | HTML operations dashboard (WCAG 2.1 accessible). |
+| `/dashboard/tasks` | `GET` | `staff`, `admin`, `auditor` | HTML task dashboard showing tasks assigned to the authenticated role, plus task counts by status. |
 | `/opportunities` | `GET` | `staff`, `admin`, `auditor` | List opportunities as JSON. |
 | `/opportunities/<signature>` | `GET` | `staff`, `admin`, `auditor` | Show one opportunity, linked application, and submission attempts. |
 | `/opportunities/<signature>/submit` | `POST` | `admin` | Record a submission result for an opportunity. |
@@ -215,9 +215,11 @@ The dashboard uses HTTP Basic Auth. Use one of these usernames as the role name:
 | `/settings/credentials` | `POST` | `admin` | Register a credential alias (never exposes secret values). |
 | `/settings/discover` | `POST` | `admin` | Run every portal connector now and persist new opportunities — proves the bot can search for funding. |
 | `/settings/test-outreach` | `POST` | `admin` | Compose (dry-run) or send a donor outreach email — proves the bot can communicate with donors. |
+| `/tasks/<id>/status` | `POST` | `staff`, `admin`, `auditor` | Transition a task through `todo`, `in-progress`, `blocked`, and `done` with state-machine validation. |
 | `/feedback` | `POST` | `staff`, `admin` | Submit partner feature-request or bug-report feedback. |
-| `/metrics` | `GET` | `admin`, `auditor` | Prometheus-compatible text metrics for Grafana scraping. |
+| `/metrics` | `GET` | `admin`, `auditor` | Prometheus-compatible text metrics for Grafana scraping, including task totals and status counts. |
 | `/health` | `GET` | Public | Health-check endpoint. |
+| `/health/queue` | `GET` | Public | Queue health snapshot including active tasks, pending depth, and worker status. |
 
 ### Prometheus metrics
 
@@ -233,8 +235,57 @@ The `/metrics` endpoint exposes the following gauges and counters in the Prometh
 | `funding_bot_audit_log_entries_total` | counter | Total audit log entries |
 | `funding_bot_communications_total` | counter | Total outreach emails logged |
 | `funding_bot_uptime_seconds` | gauge | Seconds since the web process started |
+| `funding_bot_queue_health_status` | gauge | Queue health state (`1` = broker reachable and metrics collected; `0` = disabled or degraded) |
+| `funding_bot_queue_broker_up` | gauge | Whether the Celery broker is reachable |
+| `funding_bot_queue_active_tasks` | gauge | Active Celery tasks currently executing |
+| `funding_bot_queue_pending_tasks` | gauge | Tasks waiting in the monitored queue |
+| `funding_bot_queue_depth` | gauge | Broker queue depth for the monitored Celery queue |
+| `funding_bot_queue_workers` | gauge | Online Celery workers detected |
 
 Add a scrape target pointing to `http://<host>:5000/metrics` in your Prometheus configuration or Grafana Agent config, and authenticate with an `admin` or `auditor` dashboard role.
+
+### Queue health monitoring
+
+Set the optional queue-monitoring environment variables when Celery is enabled:
+
+```bash
+export CELERY_BROKER_URL=redis://redis:6379/0
+export CELERY_RESULT_BACKEND=redis://redis:6379/0
+export CELERY_QUEUE_NAME=celery
+export CELERY_HEALTH_TIMEOUT_SECONDS=2.0
+```
+
+`GET /health/queue` returns JSON like:
+
+```json
+{
+  "status": "ok",
+  "queue_name": "celery",
+  "broker_reachable": true,
+  "timeout_seconds": 2.0,
+  "active_tasks": 2,
+  "pending_tasks": 4,
+  "queue_depth": 4,
+  "worker_count": 2,
+  "workers": [
+    {
+      "name": "celery@worker-1",
+      "status": "online",
+      "active_tasks": 1,
+      "reserved_tasks": 2,
+      "scheduled_tasks": 0
+    }
+  ]
+}
+```
+
+Possible `status` values:
+
+- `ok`: broker reachable and worker/task metrics collected
+- `disabled`: queue monitoring not configured (`CELERY_BROKER_URL` missing)
+- `degraded`: broker unreachable, Celery unavailable, or the health probe timed out
+
+When `status` is `degraded`, the endpoint responds with HTTP `503` and includes an `error` field describing the timeout or broker failure.
 
 ### Partner feedback
 
@@ -278,6 +329,8 @@ python funding_bot.py send-outreach --email donor@example.org --name "Jane Donor
 
 Both actions are logged to the audit trail (`audit-log` / `/audit-log`) for
 compliance review.
+
+For contributor guidance on English/Bengali outreach copy and locale conventions, see [docs/TRANSLATIONS.md](docs/TRANSLATIONS.md).
 
 ## Docker Deployment
 
@@ -330,13 +383,51 @@ In practice, `gdpr_export()` should bundle all donor/application data tied to a 
 
 ## Scheduling
 
-Use a system cron job to send the report every day at 9 AM:
+Celery is the preferred replacement for cron for new asynchronous work in this repository. See [docs/celery-vs-rq.md](docs/celery-vs-rq.md) for the Celery vs RQ evaluation and recommendation.
+
+### Celery configuration
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `CELERY_BROKER_URL` | `redis://redis:6379/0` | Primary broker URL. Use the RabbitMQ example below to switch brokers. |
+| `CELERY_RESULT_BACKEND` | `redis://redis:6379/1` | Result backend for task metadata and task return values. |
+| `CELERY_DEFAULT_QUEUE` | `funding-bot` | Default queue name for funding bot workers. |
+
+RabbitMQ broker example:
+
+```bash
+export CELERY_BROKER_URL=******rabbitmq:5672//
+```
+
+### Running the worker
+
+```bash
+celery -A celery_app:celery_app worker --loglevel=info --queues funding-bot
+```
+
+### Docker Compose brokers
+
+`docker-compose.yml` now includes:
+
+- `redis` as the default Celery broker and result backend
+- `rabbitmq` as an alternate broker option
+- `worker` running `celery_app:celery_app`
+
+Start the stack with:
+
+```bash
+docker compose up --build
+```
+
+### Legacy cron fallback
+
+Cron can remain as a migration fallback while queue-backed workers are introduced:
 
 ```cron
 0 9 * * * cd /path/to/funding-bot && python -m funding_bot send-daily-summary
 ```
 
-For Kubernetes deployments, mirror this schedule with a `CronJob` that runs the same CLI command inside the bot container.
+For Kubernetes deployments, mirror either the legacy CLI schedule with a `CronJob` or the new worker model with a Celery-compatible broker deployment.
 
 ## Partner Onboarding
 

@@ -10,6 +10,20 @@ services:
     volumes:
       - bot_data:/app/data
 
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: funding-bot:latest
+    command: ["celery", "-A", "celery_app:celery_app", "worker", "--loglevel=info", "--queues", "funding-bot"]
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - rabbitmq
+    volumes:
+      - bot_data:/app/data
+
   web:
     build:
       context: .
@@ -32,10 +46,22 @@ services:
       - .env
     depends_on:
       - bot
+      - worker
     ports:
       - "5000:5000"
     volumes:
       - bot_data:/app/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5672:5672"
+      - "15672:15672"
 
 volumes:
   bot_data:

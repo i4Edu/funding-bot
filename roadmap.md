@@ -17,7 +17,7 @@
 - **Personalized Outreach Templates** with engagement metrics ✅ (segment-aware templates + open/click/bounce analytics)
 - **Compliance Expansion** (encrypted storage, GDPR audit logs) ✅ (GDPR export/delete + monthly audit reports)
 - **Webhook/Status Polling** for live application updates ✅ (`poll_application_status`)
-- **Task Queue** (Celery/RQ) replacing cron — _still open, current scheduling remains cron/CLI-driven_
+- **Task Queue** replacing cron ✅ (Celery selected; Redis default broker with RabbitMQ support, cron retained only as a migration fallback)
 
 ---
 

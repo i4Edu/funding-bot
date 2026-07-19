@@ -14,6 +14,7 @@ from funding_bot import (
     OptOutError,
     OutreachThrottledError,
     SMTPEmailSender,
+    TaskTransitionError,
 )
 
 
@@ -27,6 +28,19 @@ class FakeBrowserClient:
         if self.calls <= self.failures_before_success:
             raise RuntimeError("temporary browser failure")
         return f"ref-{self.calls}"
+
+
+class FakeClock:
+    def __init__(self):
+        self.current = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.current
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.current += seconds
 
 
 class FundingBotTests(unittest.TestCase):
@@ -172,6 +186,45 @@ class FundingBotTests(unittest.TestCase):
             )
 
         self.assertEqual("new", self.bot.list_opportunities()[0]["status"])
+
+    def test_list_tasks_filters_by_assignee(self):
+        self.bot.create_task(title="Prepare budget", assigned_to="staff")
+        self.bot.create_task(title="Review risk log", assigned_to="auditor")
+
+        staff_tasks = self.bot.list_tasks(assigned_to="staff")
+
+        self.assertEqual(1, len(staff_tasks))
+        self.assertEqual("Prepare budget", staff_tasks[0]["title"])
+        self.assertEqual("staff", staff_tasks[0]["assigned_to"])
+
+    def test_task_status_transitions_follow_state_machine(self):
+        task = self.bot.create_task(title="Prepare proposal draft", assigned_to="staff")
+
+        in_progress = self.bot.transition_task_status(
+            task["id"],
+            new_status="in-progress",
+            changed_by="staff",
+        )
+        done = self.bot.transition_task_status(
+            task["id"],
+            new_status="done",
+            changed_by="staff",
+        )
+
+        self.assertEqual("in-progress", in_progress["status"])
+        self.assertEqual("done", done["status"])
+        counts = self.bot.get_task_status_counts(assigned_to="staff")
+        self.assertEqual(1, counts["done"])
+
+    def test_task_status_transition_validation_rejects_invalid_change(self):
+        task = self.bot.create_task(title="Collect attachments", assigned_to="staff")
+
+        with self.assertRaises(TaskTransitionError):
+            self.bot.transition_task_status(
+                task["id"],
+                new_status="done",
+                changed_by="staff",
+            )
 
     def test_sqlite_foreign_keys_are_enabled(self):
         self.assertEqual(
@@ -321,6 +374,7 @@ from funding_bot import (
     FileVault,
     GrantsPortalConnector,
     NGODirectoryConnector,
+    create_connector,
     main,
 )
 
@@ -351,6 +405,171 @@ class PortalConnectorTests(unittest.TestCase):
 
         self.assertEqual([], grants.fetch_opportunities(["health"]))
 
+    def test_connector_keyword_mappings_expand_synonyms_and_categories(self):
+        self.assertEqual(
+            "Education Innovation Grant",
+            GrantsPortalConnector().fetch_opportunities(["learning"])[0]["title"],
+        )
+        self.assertEqual(
+            "CSR Digital Learning Fund",
+            CSRNetworkConnector().fetch_opportunities(["corporate social responsibility"])[0]["title"],
+        )
+        self.assertEqual(
+            "Community Literacy Matching Grant",
+            NGODirectoryConnector().fetch_opportunities(["community engagement"])[0]["title"],
+        )
+
+    def test_connector_validation_reports_available_keyword_mappings(self):
+        validation = create_connector("csr-network").validate_connectivity(["edtech"])
+
+        self.assertEqual("ok", validation["status"])
+        self.assertTrue(validation["connectivity_validated"])
+        self.assertIn("corporate partnerships", validation["expanded_keywords"])
+        self.assertEqual(
+            ["csr", "corporate social responsibility", "corporate giving"],
+            validation["keyword_mappings"]["csr"]["keywords"],
+        )
+
+    def test_connector_retries_transient_errors_with_exponential_backoff(self):
+        clock = FakeClock()
+        calls = []
+
+        def flaky_http_client(url, payload):
+            calls.append((url, payload))
+            if len(calls) < 3:
+                raise TimeoutError("temporary timeout")
+            return {
+                "opportunities": [
+                    {
+                        "source": "Grants Portal",
+                        "donor_name": "Recovered Donor",
+                        "title": "Recovered Opportunity",
+                        "portal_url": "https://grants.example.org/recovered",
+                        "summary": "Recovered after retries.",
+                        "category": "Education",
+                        "tags": ["education"],
+                    }
+                ]
+            }
+
+        connector = GrantsPortalConnector(
+            http_client=flaky_http_client,
+            max_retries=2,
+            retry_backoff_base=1.0,
+            retry_backoff_factor=2.0,
+            sleep_func=clock.sleep,
+            time_func=clock.monotonic,
+        )
+
+        rows = connector.fetch_opportunities(["education"])
+        metrics = connector.get_failure_metrics()
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("Recovered Opportunity", rows[0]["title"])
+        self.assertEqual([1.0, 2.0], clock.sleeps)
+        self.assertEqual(2, metrics["retry_attempts"])
+        self.assertEqual(1, metrics["successful_requests"])
+        self.assertEqual("closed", metrics["state"])
+
+    def test_connector_opens_circuit_and_gracefully_degrades_after_repeated_failures(self):
+        clock = FakeClock()
+
+        def failing_http_client(url, payload):
+            raise ConnectionError("connector offline")
+
+        connector = GrantsPortalConnector(
+            http_client=failing_http_client,
+            max_retries=0,
+            circuit_failure_threshold=2,
+            circuit_recovery_timeout=10.0,
+            sleep_func=clock.sleep,
+            time_func=clock.monotonic,
+        )
+
+        self.assertEqual([], connector.fetch_opportunities(["education"]))
+        first_metrics = connector.get_failure_metrics()
+        self.assertEqual("closed", first_metrics["state"])
+
+        self.assertEqual([], connector.fetch_opportunities(["education"]))
+        opened_metrics = connector.get_failure_metrics()
+        self.assertEqual("open", opened_metrics["state"])
+        self.assertEqual(2, opened_metrics["failed_requests"])
+
+        self.assertEqual([], connector.fetch_opportunities(["education"]))
+        degraded_metrics = connector.get_failure_metrics()
+        self.assertEqual(1, degraded_metrics["short_circuits"])
+        self.assertEqual("connector offline", degraded_metrics["last_error"])
+
+    def test_connector_transitions_open_to_half_open_to_closed(self):
+        clock = FakeClock()
+        should_fail = {"value": True}
+
+        def recovering_http_client(url, payload):
+            if should_fail["value"]:
+                raise OSError("temporary network issue")
+            return {
+                "opportunities": [
+                    {
+                        "source": "Grants Portal",
+                        "donor_name": "Healthy Donor",
+                        "title": "Healthy Opportunity",
+                        "portal_url": "https://grants.example.org/healthy",
+                        "summary": "Healthy again.",
+                        "category": "Education",
+                        "tags": ["education"],
+                    }
+                ]
+            }
+
+        connector = GrantsPortalConnector(
+            http_client=recovering_http_client,
+            max_retries=0,
+            circuit_failure_threshold=1,
+            circuit_recovery_timeout=5.0,
+            sleep_func=clock.sleep,
+            time_func=clock.monotonic,
+        )
+
+        self.assertEqual([], connector.fetch_opportunities(["education"]))
+        self.assertEqual("open", connector.get_failure_metrics()["state"])
+
+        clock.current = 5.0
+        health = connector.check_health()
+        self.assertTrue(health["healthy"])
+        self.assertEqual("half-open", health["state"])
+
+        should_fail["value"] = False
+        rows = connector.fetch_opportunities(["education"])
+        self.assertEqual(1, len(rows))
+        self.assertEqual("closed", connector.get_failure_metrics()["state"])
+
+    def test_run_discovery_skips_unhealthy_connector_and_uses_healthy_ones(self):
+        clock = FakeClock()
+
+        def failing_http_client(url, payload):
+            raise ConnectionError("grants unavailable")
+
+        unhealthy = GrantsPortalConnector(
+            http_client=failing_http_client,
+            max_retries=0,
+            circuit_failure_threshold=1,
+            circuit_recovery_timeout=30.0,
+            sleep_func=clock.sleep,
+            time_func=clock.monotonic,
+        )
+        healthy = CSRNetworkConnector()
+
+        self.assertEqual([], unhealthy.fetch_opportunities(["csr"]))
+
+        bot = FundingBot(trusted_sources={"Grants Portal", "CSR Network"})
+        try:
+            found = bot.run_discovery([unhealthy, healthy], keywords=["csr"])
+        finally:
+            bot.close()
+
+        self.assertEqual(1, len(found))
+        self.assertEqual("CSR Network", found[0]["source"])
+
 
 class DonorSegmentationAndTemplateTests(unittest.TestCase):
     """Tests donor segmentation and outreach templates."""
@@ -369,6 +588,7 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
             email="corp@example.org",
             name="Corporate Donor",
             segment="corporate",
+            locale="bn",
         )
         self.bot.upsert_donor(
             email="inst@example.org",
@@ -386,6 +606,7 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
         self.assertEqual(1, len(corporate))
         self.assertEqual("Corporate Donor Updated", corporate[0]["name"])
         self.assertEqual("corporate", corporate[0]["segment"])
+        self.assertEqual("bn", corporate[0]["locale"])
         self.assertEqual({"corporate", "institutional"}, {row["segment"] for row in all_donors})
         latest_upsert = self.bot.connection.execute(
             "SELECT details_json FROM audit_logs WHERE action = 'donor_upserted' ORDER BY id DESC LIMIT 1"
@@ -439,6 +660,37 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
         self.assertEqual("Support i4Edu", fallback_result["subject"])
         self.assertIn("Expand access to equitable education.", fallback_result["body"])
         self.assertEqual(["corp@example.org", "unknown@example.org"], [call["to"] for call in calls])
+
+    def test_send_outreach_from_template_selects_supported_locale_catalogs(self):
+        self.bot.upsert_donor(
+            email="bangla@example.org",
+            name="বাংলা দাতা",
+            segment="corporate",
+            locale="bn",
+        )
+        self.bot.upsert_donor(
+            email="english@example.org",
+            name="English Donor",
+            locale="en",
+        )
+
+        bangla_result = self.bot.send_outreach_from_template(
+            "default",
+            "bangla@example.org",
+            "বাংলা দাতা",
+            sent_at=datetime(2026, 6, 24, tzinfo=timezone.utc),
+        )
+        english_result = self.bot.send_outreach_from_template(
+            "intro",
+            "english@example.org",
+            "English Donor",
+            sent_at=datetime(2026, 6, 25, tzinfo=timezone.utc),
+        )
+
+        self.assertIn("ধন্যবাদ", bangla_result["subject"])
+        self.assertIn("ভবিষ্যতের যোগাযোগ বন্ধ করতে", bangla_result["body"])
+        self.assertIn("Support i4Edu", english_result["subject"])
+        self.assertIn("Expand access to equitable education.", english_result["body"])
 
 
 class OutreachAnalyticsAndGdprTests(unittest.TestCase):
@@ -964,6 +1216,29 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
             main(["--db", str(self.db_path), "discover", "--keywords", "no-such-keyword"])
 
         self.assertIn("No new opportunities found.", stdout.getvalue())
+
+    def test_test_connector_command_prints_validation_and_sample_results(self):
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(
+                [
+                    "--db",
+                    str(self.db_path),
+                    "test-connector",
+                    "--connector",
+                    "csr-network",
+                    "--keywords",
+                    "edtech",
+                    "--limit",
+                    "1",
+                ]
+            )
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual("csr-network", payload["connector"])
+        self.assertEqual("ok", payload["status"])
+        self.assertEqual(1, len(payload["sample_results"]))
+        self.assertEqual("CSR Digital Learning Fund", payload["sample_results"][0]["title"])
+        self.assertIn("corporate partnerships", payload["expanded_keywords"])
 
     def test_send_outreach_command_dry_run_does_not_send_but_logs(self):
         with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:

@@ -16,14 +16,14 @@
     <nav class="navbar navbar-expand-lg navbar-dark bg-success shadow-sm" role="navigation" aria-label="Primary navigation">
       <div class="container-fluid">
         <span class="navbar-brand mb-0 h1">Nonprofit Funding Bot</span>
-        <a class="nav-link text-white" href="{{ url_for('dashboard') }}">Dashboard</a>
-        <span class="navbar-text text-white-50">Role: {{ current_role }}</span>
+        <a class="nav-link text-white" href="{{ url_for('dashboard') }}" aria-label="Open dashboard page">Dashboard</a>
+        <span class="navbar-text text-white-50" aria-label="Signed in as {{ current_role }}">Role: {{ current_role }}</span>
       </div>
     </nav>
 
-    <main id="main-content" class="container py-4">
+    <main id="main-content" class="container py-4" tabindex="-1">
       <h1 class="h3 mb-4">Settings</h1>
-      <p class="text-muted">
+      <p class="text-muted" id="settings-intro">
         Configure the bot and prove that it can search for donation opportunities and
         communicate with donors, all without leaving the admin panel.
         {% if current_role != "admin" %}
@@ -33,91 +33,94 @@
 
       <div class="row g-4">
         <div class="col-lg-6">
-          <div class="card border-0 shadow-sm mb-4">
-            <div class="card-header bg-white"><h2 class="h5 mb-0">Organization Profile</h2></div>
+          <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="organization-profile-heading">
+            <div class="card-header bg-white"><h2 class="h5 mb-0" id="organization-profile-heading">Organization Profile</h2></div>
             <div class="card-body">
-              <form id="organization-form">
+              <p id="organization-profile-help" class="text-muted small">Update the organization record used in outreach and application documents.</p>
+              <form id="organization-form" aria-labelledby="organization-profile-heading" aria-describedby="organization-profile-help">
                 <div class="mb-3">
                   <label class="form-label" for="org-name">Organization name</label>
-                  <input class="form-control" id="org-name" name="name" value="{{ organization_profile.get('name', '') }}">
+                  <input class="form-control" id="org-name" name="name" value="{{ organization_profile.get('name', '') }}" tabindex="0">
                 </div>
                 <div class="mb-3">
                   <label class="form-label" for="org-mission">Mission</label>
-                  <textarea class="form-control" id="org-mission" name="mission" rows="3">{{ organization_profile.get('mission', '') }}</textarea>
+                  <textarea class="form-control" id="org-mission" name="mission" rows="3" tabindex="0">{{ organization_profile.get('mission', '') }}</textarea>
                 </div>
                 <div class="mb-3">
                   <label class="form-label" for="org-registration">Registration number</label>
-                  <input class="form-control" id="org-registration" name="registration_number" value="{{ organization_profile.get('registration_number', '') }}">
+                  <input class="form-control" id="org-registration" name="registration_number" value="{{ organization_profile.get('registration_number', '') }}" tabindex="0">
                 </div>
-                <button type="submit" class="btn btn-success" {{ "disabled" if current_role != "admin" }}>Save profile</button>
+                <button type="submit" class="btn btn-success" aria-label="Save organization profile" data-keyboard-click {{ "disabled" if current_role != "admin" }}>Save profile</button>
               </form>
-              <div id="organization-result" class="mt-2 small"></div>
+              <div id="organization-result" class="mt-2 small" role="status" aria-live="polite" aria-atomic="true" aria-label="Organization profile save status" tabindex="-1"></div>
             </div>
-          </div>
+          </section>
 
-          <div class="card border-0 shadow-sm mb-4">
-            <div class="card-header bg-white"><h2 class="h5 mb-0">Donation Search Settings</h2></div>
+          <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="search-settings-heading">
+            <div class="card-header bg-white"><h2 class="h5 mb-0" id="search-settings-heading">Donation Search Settings</h2></div>
             <div class="card-body">
-              <form id="search-form">
+              <p id="search-settings-help" class="text-muted small">Choose keywords and trusted portals used during automated discovery.</p>
+              <form id="search-form" aria-labelledby="search-settings-heading" aria-describedby="search-settings-help">
                 <div class="mb-3">
                   <label class="form-label" for="search-keywords">Keyword filters (comma-separated)</label>
-                  <input class="form-control" id="search-keywords" name="keywords" value="{{ search_settings.keywords | join(', ') }}">
+                  <input class="form-control" id="search-keywords" name="keywords" value="{{ search_settings.keywords | join(', ') }}" tabindex="0">
                 </div>
                 <div class="mb-3">
                   <label class="form-label" for="search-sources">Trusted sources (comma-separated, blank = all)</label>
-                  <input class="form-control" id="search-sources" name="trusted_sources" value="{{ search_settings.trusted_sources | join(', ') }}">
+                  <input class="form-control" id="search-sources" name="trusted_sources" value="{{ search_settings.trusted_sources | join(', ') }}" tabindex="0">
                 </div>
-                <button type="submit" class="btn btn-success" {{ "disabled" if current_role != "admin" }}>Save search settings</button>
+                <button type="submit" class="btn btn-success" aria-label="Save donation search settings" data-keyboard-click {{ "disabled" if current_role != "admin" }}>Save search settings</button>
               </form>
-              <div id="search-result" class="mt-2 small"></div>
+              <div id="search-result" class="mt-2 small" role="status" aria-live="polite" aria-atomic="true" aria-label="Donation search settings save status" tabindex="-1"></div>
             </div>
-          </div>
+          </section>
 
-          <div class="card border-0 shadow-sm mb-4">
-            <div class="card-header bg-white"><h2 class="h5 mb-0">Credential Aliases</h2></div>
+          <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="credential-aliases-heading">
+            <div class="card-header bg-white"><h2 class="h5 mb-0" id="credential-aliases-heading">Credential Aliases</h2></div>
             <div class="card-body">
-              <ul class="list-group list-group-flush mb-3">
+              <ul class="list-group list-group-flush mb-3" aria-labelledby="credential-aliases-heading">
                 {% for credential in credentials %}
                 <li class="list-group-item px-0"><code>{{ credential.alias }}</code> → env var <code>{{ credential.env_var_name }}</code></li>
                 {% else %}
                 <li class="list-group-item px-0 text-muted">No credential aliases registered.</li>
                 {% endfor %}
               </ul>
-              <form id="credential-form" class="row g-2">
+              <form id="credential-form" class="row g-2" aria-labelledby="credential-aliases-heading" aria-describedby="credential-aliases-help">
+                <p id="credential-aliases-help" class="text-muted small mb-0">Add a friendly name for a secret-backed environment variable.</p>
                 <div class="col-5">
                   <label class="form-label small mb-1" for="credential-alias">Alias</label>
-                  <input class="form-control" id="credential-alias" name="alias" placeholder="e.g. smtp">
+                  <input class="form-control" id="credential-alias" name="alias" placeholder="e.g. smtp" aria-label="Credential alias" tabindex="0">
                 </div>
                 <div class="col-5">
                   <label class="form-label small mb-1" for="credential-env-var">Environment variable name</label>
-                  <input class="form-control" id="credential-env-var" name="env_var_name" placeholder="e.g. SMTP_PASSWORD">
+                  <input class="form-control" id="credential-env-var" name="env_var_name" placeholder="e.g. SMTP_PASSWORD" aria-label="Credential environment variable name" tabindex="0">
                 </div>
                 <div class="col-2 d-flex align-items-end">
-                  <button type="submit" class="btn btn-success w-100" {{ "disabled" if current_role != "admin" }}>Add</button>
+                  <button type="submit" class="btn btn-success w-100" aria-label="Add credential alias" data-keyboard-click {{ "disabled" if current_role != "admin" }}>Add</button>
                 </div>
               </form>
-              <div id="credential-result" class="mt-2 small"></div>
+              <div id="credential-result" class="mt-2 small" role="status" aria-live="polite" aria-atomic="true" aria-label="Credential alias save status" tabindex="-1"></div>
             </div>
-          </div>
+          </section>
         </div>
 
         <div class="col-lg-6">
-          <div class="card border-0 shadow-sm mb-4">
-            <div class="card-header bg-white"><h2 class="h5 mb-0">Prove: Donation Search</h2></div>
+          <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="discovery-heading">
+            <div class="card-header bg-white"><h2 class="h5 mb-0" id="discovery-heading">Prove: Donation Search</h2></div>
             <div class="card-body">
-              <p class="text-muted small">
+              <p class="text-muted small" id="discovery-help">
                 Runs every configured portal connector right now and stores any new
                 opportunities, proving the bot can actively search for funding.
               </p>
-              <button id="run-discovery" class="btn btn-primary" {{ "disabled" if current_role != "admin" }}>Run discovery now</button>
-              <pre id="discovery-result" class="mt-3 bg-white border rounded p-2 small" style="max-height: 260px; overflow:auto;"></pre>
+              <button id="run-discovery" class="btn btn-primary" aria-label="Run donation discovery now" aria-controls="discovery-result" aria-describedby="discovery-help" aria-keyshortcuts="Alt+Shift+R" data-keyboard-click {{ "disabled" if current_role != "admin" }}>Run discovery now</button>
+              <pre id="discovery-result" class="mt-3 bg-white border rounded p-2 small" style="max-height: 260px; overflow:auto;" role="status" aria-live="polite" aria-atomic="true" aria-label="Discovery results" tabindex="-1"></pre>
             </div>
-          </div>
+          </section>
 
-          <div class="card border-0 shadow-sm mb-4">
-            <div class="card-header bg-white"><h2 class="h5 mb-0">Prove: Donor Communication</h2></div>
+          <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="outreach-heading">
+            <div class="card-header bg-white"><h2 class="h5 mb-0" id="outreach-heading">Prove: Donor Communication</h2></div>
             <div class="card-body">
-              <p class="text-muted small">
+              <p class="text-muted small" id="outreach-help">
                 SMTP status:
                 {% if smtp_configured %}
                 <span class="badge text-bg-success">Configured ({{ smtp_host }})</span>
@@ -125,29 +128,49 @@
                 <span class="badge text-bg-secondary">Not configured (dry-run only)</span>
                 {% endif %}
               </p>
-              <fieldset>
+              <fieldset aria-describedby="outreach-help">
                 <legend class="visually-hidden">Donor outreach test details</legend>
-                <form id="outreach-form">
+                <form id="outreach-form" aria-labelledby="outreach-heading" aria-describedby="outreach-help">
                   <div class="row g-2">
                     <div class="col-6">
                       <label class="form-label small mb-1" for="outreach-email">Donor email</label>
-                      <input class="form-control" id="outreach-email" name="email" placeholder="donor@example.org" required>
+                      <input class="form-control" id="outreach-email" name="email" placeholder="donor@example.org" aria-label="Donor email address" required tabindex="0">
                     </div>
                     <div class="col-6">
                       <label class="form-label small mb-1" for="outreach-name">Donor name</label>
-                      <input class="form-control" id="outreach-name" name="name" placeholder="Donor name" required>
+                      <input class="form-control" id="outreach-name" name="name" placeholder="Donor name" aria-label="Donor name" required tabindex="0">
                     </div>
                   </div>
                   <div class="form-check mt-2">
-                    <input class="form-check-input" type="checkbox" id="outreach-dry-run" checked>
+                    <input class="form-check-input" type="checkbox" id="outreach-dry-run" checked tabindex="0">
                     <label class="form-check-label" for="outreach-dry-run">Dry run (compose only, do not send)</label>
                   </div>
-                  <button type="submit" class="btn btn-primary mt-2" {{ "disabled" if current_role != "admin" }}>Send test outreach</button>
+                  <button type="submit" class="btn btn-primary mt-2" aria-label="Send donor outreach test" data-keyboard-click {{ "disabled" if current_role != "admin" }}>Send test outreach</button>
                 </form>
               </fieldset>
-              <pre id="outreach-result" class="mt-3 bg-white border rounded p-2 small" style="max-height: 260px; overflow:auto;"></pre>
+              <pre id="outreach-result" class="mt-3 bg-white border rounded p-2 small" style="max-height: 260px; overflow:auto;" role="status" aria-live="polite" aria-atomic="true" aria-label="Outreach results" tabindex="-1"></pre>
             </div>
-          </div>
+          </section>
+
+          <section id="keyboard-shortcuts" class="card border-0 shadow-sm" role="region" aria-labelledby="keyboard-shortcuts-heading" tabindex="-1">
+            <div class="card-header bg-white"><h2 class="h5 mb-0" id="keyboard-shortcuts-heading">Keyboard shortcuts</h2></div>
+            <div class="card-body">
+              <p id="keyboard-shortcuts-note" class="text-muted small mb-3">
+                Keyboard navigation follows the visible form order. Use Enter or Space to activate settings action buttons.
+              </p>
+              <ul class="list-group list-group-flush small" aria-describedby="keyboard-shortcuts-note">
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>D</kbd> — Open the dashboard</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>S</kbd> — Open settings</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>M</kbd> — Focus the main content</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>O</kbd> — Focus organization profile</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>F</kbd> — Focus donation search settings</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>C</kbd> — Focus credential aliases</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>R</kbd> — Run discovery now</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> — Focus donor outreach</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>K</kbd> — Focus this shortcut help</li>
+              </ul>
+            </div>
+          </section>
         </div>
       </div>
     </main>
@@ -167,13 +190,76 @@
         return value.split(",").map((item) => item.trim()).filter(Boolean);
       }
 
+      function focusAndScroll(element) {
+        if (!element) {
+          return;
+        }
+        element.focus();
+        element.scrollIntoView({ block: "start", behavior: "smooth" });
+      }
+
+      function writeStatus(targetId, message) {
+        const target = document.getElementById(targetId);
+        target.textContent = message;
+        target.focus();
+      }
+
+      function bindKeyboardActivation(element) {
+        element.addEventListener("keydown", (event) => {
+          if ((event.key === "Enter" || event.key === " ") && !element.disabled) {
+            event.preventDefault();
+            element.click();
+          }
+        });
+      }
+
+      document.querySelectorAll("[data-keyboard-click]").forEach(bindKeyboardActivation);
+
+      document.addEventListener("keydown", (event) => {
+        if (!(event.altKey && event.shiftKey) || event.ctrlKey || event.metaKey) {
+          return;
+        }
+
+        const activeElement = document.activeElement;
+        const isTyping = activeElement && (
+          activeElement.tagName === "INPUT"
+          || activeElement.tagName === "TEXTAREA"
+          || activeElement.tagName === "SELECT"
+          || activeElement.isContentEditable
+        );
+        if (isTyping && !["KeyK", "KeyM", "KeyR"].includes(event.code)) {
+          return;
+        }
+
+        const shortcutActions = {
+          KeyD: () => window.location.assign("{{ url_for('dashboard') }}"),
+          KeyS: () => window.location.assign("{{ url_for('settings_page') }}"),
+          KeyM: () => focusAndScroll(document.getElementById("main-content")),
+          KeyO: () => focusAndScroll(document.getElementById("org-name")),
+          KeyF: () => focusAndScroll(document.getElementById("search-keywords")),
+          KeyC: () => focusAndScroll(document.getElementById("credential-alias")),
+          KeyR: () => document.getElementById("run-discovery").click(),
+          KeyT: () => focusAndScroll(document.getElementById("outreach-email")),
+          KeyK: () => focusAndScroll(document.getElementById("keyboard-shortcuts")),
+        };
+
+        const action = shortcutActions[event.code];
+        if (!action) {
+          return;
+        }
+
+        event.preventDefault();
+        action();
+      });
+
       document.getElementById("organization-form").addEventListener("submit", async (event) => {
         event.preventDefault();
         const form = new FormData(event.target);
         const { ok, data } = await postJson("/settings/organization", Object.fromEntries(form));
-        document.getElementById("organization-result").textContent = ok
-          ? "Profile saved."
-          : `Error: ${data.error}`;
+        writeStatus(
+          "organization-result",
+          ok ? "Profile saved." : `Error: ${data.error}`,
+        );
       });
 
       document.getElementById("search-form").addEventListener("submit", async (event) => {
@@ -183,26 +269,28 @@
           keywords: splitList(form.get("keywords") || ""),
           trusted_sources: splitList(form.get("trusted_sources") || ""),
         });
-        document.getElementById("search-result").textContent = ok
-          ? "Search settings saved."
-          : `Error: ${data.error}`;
+        writeStatus(
+          "search-result",
+          ok ? "Search settings saved." : `Error: ${data.error}`,
+        );
       });
 
       document.getElementById("credential-form").addEventListener("submit", async (event) => {
         event.preventDefault();
         const form = new FormData(event.target);
         const { ok, data } = await postJson("/settings/credentials", Object.fromEntries(form));
-        document.getElementById("credential-result").textContent = ok
-          ? "Credential alias registered."
-          : `Error: ${data.error}`;
+        writeStatus(
+          "credential-result",
+          ok ? "Credential alias registered." : `Error: ${data.error}`,
+        );
         if (ok) {
           window.location.reload();
         }
       });
 
       document.getElementById("run-discovery").addEventListener("click", async () => {
-        const { ok, data } = await postJson("/settings/discover", {});
-        document.getElementById("discovery-result").textContent = JSON.stringify(data, null, 2);
+        const { data } = await postJson("/settings/discover", {});
+        writeStatus("discovery-result", JSON.stringify(data, null, 2));
       });
 
       document.getElementById("outreach-form").addEventListener("submit", async (event) => {
@@ -214,9 +302,10 @@
           name: form.get("name"),
           dry_run: dryRun,
         });
-        document.getElementById("outreach-result").textContent = ok
-          ? JSON.stringify(data, null, 2)
-          : `Error: ${data.error}`;
+        writeStatus(
+          "outreach-result",
+          ok ? JSON.stringify(data, null, 2) : `Error: ${data.error}`,
+        );
       });
     </script>
   </body>

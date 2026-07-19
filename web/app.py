@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import hmac
+import importlib
 import json
 import os
 import sys
@@ -24,12 +25,15 @@ from funding_bot import (  # noqa: E402
     FundingBotError,
     OpportunityNotFoundError,
     SMTPEmailSender,
+    TaskTransitionError,
     _validate_email,
 )
+from task_queue import dispatch_discovery, get_queue_status, load_queue_config  # noqa: E402
 
 app = Flask(__name__, template_folder=str(Path(__file__).resolve().parent / "templates"))
 app.config["JSON_SORT_KEYS"] = False
 MAX_FEEDBACK_MESSAGE_LENGTH = 2000
+DEFAULT_CELERY_HEALTH_TIMEOUT_SECONDS = 2.0
 
 ROLE_PASSWORD_ENV_VARS = {
     "admin": "ADMIN_PASSWORD",
@@ -165,6 +169,10 @@ def _serialize_submission_attempt(row: Any) -> dict[str, Any]:
     return data
 
 
+def _serialize_task(row: Any) -> dict[str, Any]:
+    return dict(row)
+
+
 def _fetch_opportunity(signature: str) -> dict[str, Any]:
     row = _bot().connection.execute(
         "SELECT * FROM opportunities WHERE signature = ?",
@@ -190,6 +198,7 @@ def _get_request_json() -> dict[str, Any]:
 def _dashboard_context() -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     recent_cutoff = (now - timedelta(days=7)).isoformat()
+    current_role = getattr(g, "current_role", None)
 
     new_opportunities_count = _bot().connection.execute(
         "SELECT COUNT(*) FROM opportunities WHERE discovered_at >= ?",
@@ -231,16 +240,180 @@ def _dashboard_context() -> dict[str, Any]:
             """
         ).fetchall()
     ]
+    my_task_counts = _bot().get_task_status_counts(assigned_to=current_role) if current_role else {}
 
     return {
-        "current_role": getattr(g, "current_role", None),
+        "current_role": current_role,
         "new_opportunities_count": new_opportunities_count,
         "applications_submitted_count": applications_submitted_count,
         "pending_applications_count": pending_applications_count,
         "donor_communications_count": donor_communications_count,
+        "my_tasks_count": sum(my_task_counts.values()),
+        "my_open_tasks_count": sum(
+            count for status, count in my_task_counts.items() if status != "done"
+        ),
         "recent_opportunities": recent_opportunities,
         "recent_applications": recent_applications,
     }
+
+
+def _task_dashboard_context() -> dict[str, Any]:
+    current_role = getattr(g, "current_role", None)
+    tasks = [_serialize_task(task) for task in _bot().list_tasks(assigned_to=current_role)]
+    counts = _bot().get_task_status_counts(assigned_to=current_role)
+    return {
+        "current_role": current_role,
+        "tasks": tasks,
+        "task_counts": counts,
+        "total_tasks": sum(counts.values()),
+    }
+
+
+def _queue_health_timeout_seconds() -> float:
+    configured = os.environ.get("CELERY_HEALTH_TIMEOUT_SECONDS", str(DEFAULT_CELERY_HEALTH_TIMEOUT_SECONDS))
+    try:
+        timeout = float(configured)
+    except ValueError:
+        return DEFAULT_CELERY_HEALTH_TIMEOUT_SECONDS
+    return max(timeout, 0.1)
+
+
+def _count_tasks_by_worker(task_map: Any) -> int:
+    if not isinstance(task_map, dict):
+        return 0
+    return sum(len(tasks) for tasks in task_map.values() if isinstance(tasks, list))
+
+
+def _create_celery_health_app() -> Any:
+    broker_url = os.environ.get("CELERY_BROKER_URL")
+    if not broker_url:
+        raise RuntimeError("CELERY_BROKER_URL is not configured.")
+
+    celery_module = importlib.import_module("celery")
+    return celery_module.Celery(
+        "funding-bot-health",
+        broker=broker_url,
+        backend=os.environ.get("CELERY_RESULT_BACKEND") or None,
+    )
+
+
+def _fetch_celery_queue_snapshot() -> dict[str, Any]:
+    queue_name = os.environ.get("CELERY_QUEUE_NAME", "celery")
+    timeout_seconds = _queue_health_timeout_seconds()
+    celery_app = _create_celery_health_app()
+    inspect = celery_app.control.inspect(timeout=timeout_seconds)
+
+    active = inspect.active() or {}
+    reserved = inspect.reserved() or {}
+    scheduled = inspect.scheduled() or {}
+    stats = inspect.stats() or {}
+    ping = inspect.ping() or {}
+
+    worker_names = sorted({*active.keys(), *reserved.keys(), *scheduled.keys(), *stats.keys(), *ping.keys()})
+    workers = []
+    for worker_name in worker_names:
+        worker_active = active.get(worker_name, []) if isinstance(active, dict) else []
+        worker_reserved = reserved.get(worker_name, []) if isinstance(reserved, dict) else []
+        worker_scheduled = scheduled.get(worker_name, []) if isinstance(scheduled, dict) else []
+        workers.append(
+            {
+                "name": worker_name,
+                "status": "online" if worker_name in ping else "unreachable",
+                "active_tasks": len(worker_active) if isinstance(worker_active, list) else 0,
+                "reserved_tasks": len(worker_reserved) if isinstance(worker_reserved, list) else 0,
+                "scheduled_tasks": len(worker_scheduled) if isinstance(worker_scheduled, list) else 0,
+            }
+        )
+
+    queue_depth = 0
+    with celery_app.connection_for_read() as connection:
+        queue = connection.SimpleQueue(queue_name)
+        try:
+            queue_depth = int(queue.qsize() or 0)
+        finally:
+            queue.close()
+
+    return {
+        "status": "ok",
+        "queue_name": queue_name,
+        "broker_reachable": True,
+        "timeout_seconds": timeout_seconds,
+        "active_tasks": _count_tasks_by_worker(active),
+        "pending_tasks": queue_depth,
+        "queue_depth": queue_depth,
+        "worker_count": len(worker_names),
+        "workers": workers,
+    }
+
+
+def _get_queue_health_snapshot() -> dict[str, Any]:
+    queue_config = load_queue_config()
+    queue_name = queue_config.queue_name
+    timeout_seconds = _queue_health_timeout_seconds()
+    if not queue_config.enable_task_queue:
+        return {
+            "status": "disabled",
+            "mode": queue_config.mode,
+            "active_modes": queue_config.active_modes,
+            "queue_enabled": queue_config.enable_task_queue,
+            "legacy_cron_enabled": queue_config.enable_legacy_cron,
+            "queue_name": queue_name,
+            "broker_reachable": False,
+            "timeout_seconds": timeout_seconds,
+            "active_tasks": 0,
+            "pending_tasks": 0,
+            "queue_depth": 0,
+            "worker_count": 0,
+            "workers": [],
+            "error": "Queue monitoring is disabled because ENABLE_TASK_QUEUE is not enabled.",
+        }
+
+    try:
+        snapshot = _fetch_celery_queue_snapshot()
+        snapshot.update(
+            {
+                "mode": queue_config.mode,
+                "active_modes": queue_config.active_modes,
+                "queue_enabled": queue_config.enable_task_queue,
+                "legacy_cron_enabled": queue_config.enable_legacy_cron,
+            }
+        )
+        return snapshot
+    except TimeoutError as exc:
+        return {
+            "status": "degraded",
+            "mode": queue_config.mode,
+            "active_modes": queue_config.active_modes,
+            "queue_enabled": queue_config.enable_task_queue,
+            "legacy_cron_enabled": queue_config.enable_legacy_cron,
+            "queue_name": queue_name,
+            "broker_reachable": False,
+            "timeout_seconds": timeout_seconds,
+            "active_tasks": 0,
+            "pending_tasks": 0,
+            "queue_depth": 0,
+            "worker_count": 0,
+            "workers": [],
+            "error": f"Timed out while contacting the Celery broker: {exc}",
+        }
+    except Exception as exc:
+        fallback_status = get_queue_status(config=queue_config)
+        return {
+            "status": "degraded",
+            "mode": queue_config.mode,
+            "active_modes": queue_config.active_modes,
+            "queue_enabled": queue_config.enable_task_queue,
+            "legacy_cron_enabled": queue_config.enable_legacy_cron,
+            "queue_name": queue_name,
+            "broker_reachable": fallback_status["worker_count"] > 0,
+            "timeout_seconds": timeout_seconds,
+            "active_tasks": fallback_status["active_tasks"],
+            "pending_tasks": fallback_status["queue_depth"],
+            "queue_depth": fallback_status["queue_depth"],
+            "worker_count": fallback_status["worker_count"],
+            "workers": fallback_status["workers"],
+            "error": f"Unable to query Celery queue health: {exc}",
+        }
 
 
 @app.errorhandler(400)
@@ -278,6 +451,11 @@ def handle_funding_bot_error(exc: FundingBotError) -> Response:
     return _json_error(str(exc), 400)
 
 
+@app.errorhandler(TaskTransitionError)
+def handle_task_transition_error(exc: TaskTransitionError) -> Response:
+    return _json_error(str(exc), 400)
+
+
 @app.errorhandler(ValueError)
 def handle_value_error(exc: ValueError) -> Response:
     return _json_error(str(exc), 400)
@@ -306,6 +484,12 @@ def index() -> Response:
 @require_role("staff", "admin", "auditor")
 def dashboard() -> str:
     return render_template("dashboard.html", **_dashboard_context())
+
+
+@app.get("/dashboard/tasks")
+@require_role("staff", "admin", "auditor")
+def dashboard_tasks() -> str:
+    return render_template("tasks.html", **_task_dashboard_context())
 
 
 @app.get("/opportunities")
@@ -388,6 +572,7 @@ def upsert_donor() -> Response:
     name = str(payload.get("name", "")).strip()
     opted_out = _coerce_bool(payload.get("opted_out", False), "opted_out")
     preferences = payload.get("preferences", {})
+    locale = payload.get("locale")
 
     if not email:
         raise ValueError("Field 'email' is required.")
@@ -405,6 +590,7 @@ def upsert_donor() -> Response:
         name=name,
         opted_out=opted_out,
         preferences=preferences,
+        locale=None if locale is None else str(locale),
     )
     donor = _fetch_donor(email)
     return jsonify(donor), 201
@@ -525,8 +711,12 @@ def run_discovery_now() -> Response:
     if isinstance(trusted_sources, str):
         trusted_sources = [item.strip() for item in trusted_sources.split(",") if item.strip()]
 
-    found = _bot().run_discovery(keywords=keywords, trusted_sources=trusted_sources)
-    return jsonify({"new_opportunities": found, "count": len(found)})
+    status_code, payload = dispatch_discovery(
+        keywords=keywords,
+        trusted_sources=trusted_sources,
+        db_path=os.environ.get("BOT_DB_PATH", "funding_bot.db"),
+    )
+    return jsonify(payload), status_code
 
 
 @app.post("/settings/test-outreach")
@@ -543,13 +733,9 @@ def send_test_outreach() -> Response:
     email = str(payload.get("email", "")).strip()
     name = str(payload.get("name", "")).strip()
     dry_run = _coerce_bool(payload.get("dry_run", True), "dry_run")
-    subject_template = payload.get(
-        "subject_template", "Thank you for supporting {organization_name}"
-    )
-    body_template = payload.get(
-        "body_template",
-        "Dear {donor_name},\n\nThank you for your continued interest in {organization_name}.",
-    )
+    subject_template = payload.get("subject_template")
+    body_template = payload.get("body_template")
+    locale = payload.get("locale")
 
     if not email:
         raise ValueError("Field 'email' is required.")
@@ -557,20 +743,70 @@ def send_test_outreach() -> Response:
         raise ValueError("Field 'name' is required.")
 
     sender = None if dry_run else SMTPEmailSender.from_env()
-    result = _bot().send_outreach(
-        donor_email=email,
-        donor_name=name,
-        subject_template=subject_template,
-        body_template=body_template,
-        sender=sender,
-    )
+    if subject_template is None and body_template is None:
+        if locale is not None:
+            _bot().upsert_donor(email=email, name=name, locale=str(locale))
+        result = _bot().send_outreach_from_template(
+            _bot().DEFAULT_OUTREACH_TEMPLATE,
+            email,
+            name,
+            sender=sender,
+        )
+    else:
+        if subject_template is None or body_template is None:
+            default_subject, default_body = _bot()._resolve_catalog_template(
+                _bot().DEFAULT_OUTREACH_TEMPLATE,
+                segment="unknown",
+                locale=str(locale) if locale is not None else _bot().DEFAULT_TEMPLATE_LOCALE,
+            ) or (
+                "Thank you for supporting {organization_name}",
+                "Dear {donor_name},\n\nThank you for your continued interest in {organization_name}.",
+            )
+            subject_template = subject_template or default_subject
+            body_template = body_template or default_body
+        result = _bot().send_outreach(
+            donor_email=email,
+            donor_name=name,
+            subject_template=subject_template,
+            body_template=body_template,
+            sender=sender,
+            locale=None if locale is None else str(locale),
+        )
     result["dry_run"] = dry_run
     return jsonify(result), 201
 
 
+@app.post("/tasks/<int:task_id>/status")
+@require_role("staff", "admin", "auditor")
+def transition_task_status_route(task_id: int) -> Response:
+    payload = _get_request_json()
+    new_status = str(payload.get("status", "")).strip()
+    if not new_status:
+        raise ValueError("Field 'status' is required.")
+
+    task = _bot().get_task(task_id)
+    current_role = getattr(g, "current_role", None)
+    if current_role != "admin" and task["assigned_to"] != current_role:
+        return _json_error("Forbidden", 403)
+
+    updated_task = _bot().transition_task_status(
+        task_id,
+        new_status=new_status,
+        changed_by=current_role or "unknown",
+    )
+    return jsonify({"task": updated_task, "notification": updated_task.get("notification")})
+
+
 @app.get("/health")
 def health() -> Response:
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "queue": _get_queue_health_snapshot()})
+
+
+@app.get("/health/queue")
+def queue_health() -> Response:
+    snapshot = _get_queue_health_snapshot()
+    status_code = 200 if snapshot["status"] in {"ok", "disabled"} else 503
+    return jsonify(snapshot), status_code
 
 
 @app.get("/metrics")
@@ -593,7 +829,14 @@ def metrics() -> Response:
     opted_out_donors = conn.execute("SELECT COUNT(*) FROM donors WHERE opted_out = 1").fetchone()[0]
     audit_log_total = conn.execute("SELECT COUNT(*) FROM audit_logs").fetchone()[0]
     communications_total = conn.execute("SELECT COUNT(*) FROM communications").fetchone()[0]
+    tasks_total = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
     uptime_seconds = time.time() - _APP_START_TIME
+    task_counts = bot.get_task_status_counts()
+    queue_health = _get_queue_health_snapshot()
+    queue_status_value = 1 if queue_health["status"] == "ok" else 0
+    task_assignments = conn.execute(
+        "SELECT assigned_to, COUNT(*) AS total FROM tasks GROUP BY assigned_to ORDER BY assigned_to ASC"
+    ).fetchall()
 
     lines = [
         "# HELP funding_bot_opportunities_total Total funding opportunities discovered",
@@ -617,10 +860,49 @@ def metrics() -> Response:
         "# HELP funding_bot_communications_total Total outreach emails logged",
         "# TYPE funding_bot_communications_total counter",
         f"funding_bot_communications_total {communications_total}",
+        "# HELP funding_bot_tasks_total Total collaboration tasks",
+        "# TYPE funding_bot_tasks_total gauge",
+        f"funding_bot_tasks_total {tasks_total}",
         "# HELP funding_bot_uptime_seconds Seconds since the web process started",
         "# TYPE funding_bot_uptime_seconds gauge",
         f"funding_bot_uptime_seconds {uptime_seconds:.3f}",
+        "# HELP funding_bot_queue_health_status Queue health status (1=ok, 0=disabled/degraded)",
+        "# TYPE funding_bot_queue_health_status gauge",
+        f"funding_bot_queue_health_status {queue_status_value}",
+        "# HELP funding_bot_queue_broker_up Whether the Celery broker is reachable (1=yes, 0=no)",
+        "# TYPE funding_bot_queue_broker_up gauge",
+        f"funding_bot_queue_broker_up {1 if queue_health['broker_reachable'] else 0}",
+        "# HELP funding_bot_queue_active_tasks Active Celery tasks currently executing",
+        "# TYPE funding_bot_queue_active_tasks gauge",
+        f"funding_bot_queue_active_tasks {queue_health['active_tasks']}",
+        "# HELP funding_bot_queue_pending_tasks Tasks waiting in the monitored queue",
+        "# TYPE funding_bot_queue_pending_tasks gauge",
+        f"funding_bot_queue_pending_tasks {queue_health['pending_tasks']}",
+        "# HELP funding_bot_queue_depth Broker queue depth for the monitored Celery queue",
+        "# TYPE funding_bot_queue_depth gauge",
+        f"funding_bot_queue_depth {queue_health['queue_depth']}",
+        "# HELP funding_bot_queue_workers Online Celery workers detected",
+        "# TYPE funding_bot_queue_workers gauge",
+        f"funding_bot_queue_workers {queue_health['worker_count']}",
     ]
+    lines.extend(
+        [
+            "# HELP funding_bot_tasks_status_total Tasks by workflow status",
+            "# TYPE funding_bot_tasks_status_total gauge",
+        ]
+    )
+    for status, total in task_counts.items():
+        lines.append(f'funding_bot_tasks_status_total{{status="{status}"}} {total}')
+    lines.extend(
+        [
+            "# HELP funding_bot_tasks_assigned_total Tasks assigned per dashboard role",
+            "# TYPE funding_bot_tasks_assigned_total gauge",
+        ]
+    )
+    for row in task_assignments:
+        lines.append(
+            f'funding_bot_tasks_assigned_total{{assigned_to="{row["assigned_to"]}"}} {row["total"]}'
+        )
     return Response("\n".join(lines) + "\n", mimetype="text/plain; version=0.0.4")
 
 

@@ -1,0 +1,19 @@
+{
+  "templates": {
+    "default": {
+      "subject": "{organization_name}-কে সহায়তা করার জন্য আপনাকে ধন্যবাদ",
+      "body": "প্রিয় {donor_name},\n\n{organization_name}-এর পাশে থাকার জন্য আপনাকে আন্তরিক ধন্যবাদ।",
+      "opt_out_notice": "ভবিষ্যতের যোগাযোগ বন্ধ করতে {opt_out_url} দেখুন।"
+    },
+    "intro": {
+      "subject": "{organization_name}-কে সহায়তা করুন",
+      "body": "প্রিয় {donor_name},\n\n{mission}",
+      "segments": {
+        "corporate": {
+          "subject": "{organization_name}-এর সঙ্গে কর্পোরেট অংশীদারিত্ব",
+          "body": "প্রিয় {donor_name},\n\n{organization_name}-এর জন্য CSR সহায়তা নিয়ে আমরা আপনার সঙ্গে কথা বলতে চাই।"
+        }
+      }
+    }
+  }
+}

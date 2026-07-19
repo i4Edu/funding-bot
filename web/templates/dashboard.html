@@ -16,16 +16,16 @@
     <nav class="navbar navbar-expand-lg navbar-dark bg-success shadow-sm" role="navigation" aria-label="Primary navigation">
       <div class="container-fluid">
         <span class="navbar-brand mb-0 h1">Nonprofit Funding Bot</span>
-        <a class="nav-link text-white" href="{{ url_for('settings_page') }}">Settings</a>
-        <span class="navbar-text text-white-50">Role: {{ current_role }}</span>
+        <a class="nav-link text-white" href="{{ url_for('settings_page') }}" aria-label="Open settings page">Settings</a>
+        <span class="navbar-text text-white-50" aria-label="Signed in as {{ current_role }}">Role: {{ current_role }}</span>
       </div>
     </nav>
 
-    <main id="main-content" class="container py-4">
+    <main id="main-content" class="container py-4" tabindex="-1">
       <h1 class="visually-hidden">Operations Dashboard</h1>
       <div class="row g-4 mb-4" role="region" aria-label="Summary statistics">
         <div class="col-md-6 col-xl-3">
-          <div class="card border-0 shadow-sm h-100">
+          <div class="card border-0 shadow-sm h-100" role="group" aria-labelledby="stat-new-opps" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted" id="stat-new-opps">New Opportunities</h2>
               <p class="display-6 mb-1" aria-labelledby="stat-new-opps">{{ new_opportunities_count }}</p>
@@ -34,7 +34,7 @@
           </div>
         </div>
         <div class="col-md-6 col-xl-3">
-          <div class="card border-0 shadow-sm h-100">
+          <div class="card border-0 shadow-sm h-100" role="group" aria-labelledby="stat-apps-submitted" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted" id="stat-apps-submitted">Applications Submitted</h2>
               <p class="display-6 mb-1" aria-labelledby="stat-apps-submitted">{{ applications_submitted_count }}</p>
@@ -43,7 +43,7 @@
           </div>
         </div>
         <div class="col-md-6 col-xl-3">
-          <div class="card border-0 shadow-sm h-100">
+          <div class="card border-0 shadow-sm h-100" role="group" aria-labelledby="stat-pending-apps" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted" id="stat-pending-apps">Pending Applications</h2>
               <p class="display-6 mb-1" aria-labelledby="stat-pending-apps">{{ pending_applications_count }}</p>
@@ -52,7 +52,7 @@
           </div>
         </div>
         <div class="col-md-6 col-xl-3">
-          <div class="card border-0 shadow-sm h-100">
+          <div class="card border-0 shadow-sm h-100" role="group" aria-labelledby="stat-donor-comms" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted" id="stat-donor-comms">Donor Communications</h2>
               <p class="display-6 mb-1" aria-labelledby="stat-donor-comms">{{ donor_communications_count }}</p>
@@ -64,12 +64,15 @@
 
       <div class="row g-4">
         <div class="col-lg-8">
-          <div class="card border-0 shadow-sm">
+          <section class="card border-0 shadow-sm" role="region" aria-labelledby="recent-opps-heading">
             <div class="card-header bg-white">
               <h2 class="h5 mb-0" id="recent-opps-heading">Recent Opportunities</h2>
             </div>
             <div class="card-body p-0">
-              <div class="table-responsive">
+              <p id="recent-opps-description" class="visually-hidden">
+                Use Alt+Shift+O to focus this table. Tab and Shift+Tab move between dashboard links and help.
+              </p>
+              <div class="table-responsive" id="recent-opps-region" role="region" aria-labelledby="recent-opps-heading" aria-describedby="recent-opps-description" tabindex="0">
                 <table class="table table-hover align-middle mb-0" aria-labelledby="recent-opps-heading">
                   <thead class="table-light">
                     <tr>
@@ -100,16 +103,16 @@
                 </table>
               </div>
             </div>
-          </div>
+          </section>
         </div>
 
         <div class="col-lg-4">
-          <div class="card border-0 shadow-sm">
+          <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="recent-apps-heading">
             <div class="card-header bg-white">
               <h2 class="h5 mb-0" id="recent-apps-heading">Recent Applications</h2>
             </div>
             <div class="card-body">
-              <ul class="list-group list-group-flush" aria-labelledby="recent-apps-heading">
+              <ul class="list-group list-group-flush" id="recent-apps-region" aria-labelledby="recent-apps-heading" tabindex="0">
                 {% for application in recent_applications %}
                 <li class="list-group-item px-0">
                   <div class="fw-semibold">{{ application.title }}</div>
@@ -125,9 +128,72 @@
                 {% endfor %}
               </ul>
             </div>
-          </div>
+          </section>
+
+          <section id="keyboard-shortcuts" class="card border-0 shadow-sm" role="region" aria-labelledby="keyboard-shortcuts-heading" tabindex="-1">
+            <div class="card-header bg-white">
+              <h2 class="h5 mb-0" id="keyboard-shortcuts-heading">Keyboard shortcuts</h2>
+            </div>
+            <div class="card-body">
+              <p id="keyboard-shortcuts-note" class="text-muted small mb-3">
+                Keyboard navigation follows the page order. Use Enter or Space to activate dashboard action buttons.
+              </p>
+              <ul class="list-group list-group-flush small" aria-describedby="keyboard-shortcuts-note">
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>D</kbd> — Open the dashboard</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>S</kbd> — Open settings</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>M</kbd> — Focus the main content</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>O</kbd> — Focus recent opportunities</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>A</kbd> — Focus recent applications</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>K</kbd> — Focus this shortcut help</li>
+              </ul>
+            </div>
+          </section>
         </div>
       </div>
     </main>
+
+    <script>
+      function focusAndScroll(element) {
+        if (!element) {
+          return;
+        }
+        element.focus();
+        element.scrollIntoView({ block: "start", behavior: "smooth" });
+      }
+
+      document.addEventListener("keydown", (event) => {
+        if (!(event.altKey && event.shiftKey) || event.ctrlKey || event.metaKey) {
+          return;
+        }
+
+        const activeElement = document.activeElement;
+        const isTyping = activeElement && (
+          activeElement.tagName === "INPUT"
+          || activeElement.tagName === "TEXTAREA"
+          || activeElement.tagName === "SELECT"
+          || activeElement.isContentEditable
+        );
+        if (isTyping && !["KeyK", "KeyM"].includes(event.code)) {
+          return;
+        }
+
+        const shortcutActions = {
+          KeyD: () => window.location.assign("{{ url_for('dashboard') }}"),
+          KeyS: () => window.location.assign("{{ url_for('settings_page') }}"),
+          KeyM: () => focusAndScroll(document.getElementById("main-content")),
+          KeyO: () => focusAndScroll(document.getElementById("recent-opps-region")),
+          KeyA: () => focusAndScroll(document.getElementById("recent-apps-region")),
+          KeyK: () => focusAndScroll(document.getElementById("keyboard-shortcuts")),
+        };
+
+        const action = shortcutActions[event.code];
+        if (!action) {
+          return;
+        }
+
+        event.preventDefault();
+        action();
+      });
+    </script>
   </body>
 </html>
