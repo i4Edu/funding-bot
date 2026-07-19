@@ -186,9 +186,11 @@ _reset_artifacts()
 
 
 def _challenge(message: str = "Authentication required") -> Response:
-    # Only expose known-safe messages to prevent information leakage
-    _SAFE_MESSAGES = frozenset({"Authentication required", "Invalid authentication credentials"})
-    safe_message = message if message in _SAFE_MESSAGES else "Authentication required"
+    # Map to known-safe literal strings to prevent information leakage
+    if message == "Invalid authentication credentials":
+        safe_message = "Invalid authentication credentials"
+    else:
+        safe_message = "Authentication required"
     response = jsonify({"error": safe_message})
     response.status_code = 401
     response.headers["WWW-Authenticate"] = 'Basic realm="Funding Bot E2E"'

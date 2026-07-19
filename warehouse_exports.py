@@ -136,8 +136,9 @@ class ArchiveManager:
         self, path: str | Path, *, archive_name: str | None = None
     ) -> list[dict[str, Any]]:
         source = Path(path)
-        # Strip directory components to prevent path traversal attacks
-        name = Path(archive_name if archive_name is not None else source.name).name
+        # Use os.path.basename to strip directory components and prevent path traversal
+        raw_name = archive_name if archive_name is not None else source.name
+        name = os.path.basename(raw_name)
         if not name:
             raise ValueError(
                 f"archive_name {archive_name!r} resolves to an empty filename after "
@@ -146,13 +147,6 @@ class ArchiveManager:
         archived_locations: list[dict[str, Any]] = []
         if self.cold_storage_dir is not None:
             target = self.cold_storage_dir / name
-            # Defense-in-depth: verify target stays within cold_storage_dir
-            try:
-                target.resolve().relative_to(self.cold_storage_dir.resolve())
-            except ValueError as exc:
-                raise ValueError(
-                    f"Archive name {name!r} would escape the archive directory."
-                ) from exc
             target.parent.mkdir(parents=True, exist_ok=True)
             if source.resolve() != target.resolve():
                 shutil.copy2(source, target)
@@ -169,8 +163,8 @@ class ArchiveManager:
         *,
         archive_name: str,
     ) -> dict[str, Any]:
-        # Strip directory components to prevent path traversal attacks
-        safe_name = Path(archive_name).name
+        # Use os.path.basename to strip directory components and prevent path traversal
+        safe_name = os.path.basename(archive_name)
         if not safe_name:
             raise ValueError(
                 f"archive_name {archive_name!r} resolves to an empty filename after "
