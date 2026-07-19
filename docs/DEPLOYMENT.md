@@ -43,8 +43,13 @@ Hybrid mode is the recommended migration step because it lets operators verify q
 
 ```bash
 cp .env.example .env
+# Set ENABLE_TASK_QUEUE=0 in .env.
 docker compose up --build
 ```
+
+The `bot` Compose service executes the daily-summary command once; schedule
+that Compose command with your platform's scheduler if recurring execution is
+required.
 
 ### Hybrid or queue-first
 

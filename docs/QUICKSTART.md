@@ -90,17 +90,15 @@ python3 -m funding_bot send-daily-summary --dry-run
 
 ### Option B: Run with Docker Compose
 
-Keep `BOT_DB_PATH=/app/data/funding_bot.db` and start the containers:
-
-```bash
-docker compose up --build
-```
-
-To start the queue worker, Redis, RabbitMQ, and Flower too:
+Keep `BOT_DB_PATH=/app/data/funding_bot.db`. The example environment enables
+the task queue, so start the queue profile:
 
 ```bash
 docker compose --profile queue up --build
 ```
+
+To run only the web and one-shot bot services, set `ENABLE_TASK_QUEUE=0` in
+`.env` before running `docker compose up --build`.
 
 Services:
 

@@ -587,8 +587,8 @@ python -m funding_bot export-data-warehouse --format csv --output-dir generated/
 python -m funding_bot send-daily-summary --recipient lupael@i4e.com.bd
 
 # Run Celery worker and beat
-celery -A celery_tasks.app worker --loglevel=info
-celery -A celery_tasks.app beat --loglevel=info
+celery -A celery_app:celery_app worker --loglevel=info
+celery -A celery_app:celery_app beat --loglevel=info
 
 # Generate a weekly GDPR self-check report
 python -m funding_bot gdpr-self-check-report --cadence weekly
