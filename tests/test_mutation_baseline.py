@@ -12,8 +12,8 @@ os.environ.setdefault("STAFF_PASSWORD", "staff-secret")
 os.environ.setdefault("AUDITOR_PASSWORD", "auditor-secret")
 os.environ.setdefault("SESSION_COOKIE_SECURE", "0")
 
-from funding_bot import FundingBot  # noqa: E402
 import task_queue  # noqa: E402
+from funding_bot import FundingBot  # noqa: E402
 from web.app import app  # noqa: E402
 
 
