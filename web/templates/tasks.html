@@ -1,0 +1,538 @@
+{% extends "base.html" %}
+
+{% block title %}Task Board{% endblock %}
+
+{% block nav_links %}
+        <a class="nav-link app-nav-link" href="{{ url_for('dashboard') }}" aria-label="Open dashboard page">Dashboard</a>
+        <a class="nav-link app-nav-link" href="{{ url_for('settings_page') }}" aria-label="Open settings page">Settings</a>
+        <a class="nav-link app-nav-link" href="{{ url_for('translation_review_dashboard') }}" aria-label="Open translation review dashboard">Translations</a>
+{% endblock %}
+
+{% block head %}
+    <style>
+      .kanban-column {
+        min-height: 24rem;
+      }
+
+      .kanban-dropzone {
+        min-height: 18rem;
+        border: 2px dashed var(--border-color);
+        border-radius: 0.75rem;
+        background: var(--surface-alt);
+        padding: 0.75rem;
+      }
+
+      .kanban-dropzone.drag-over,
+      .kanban-dropzone:focus-visible {
+        border-color: var(--success-bg);
+        background: color-mix(in srgb, var(--success-bg) 10%, var(--surface-alt));
+        outline: 3px solid color-mix(in srgb, var(--success-bg) 25%, transparent);
+        outline-offset: 2px;
+      }
+
+      .task-card {
+        cursor: grab;
+      }
+
+      .task-card:focus-visible {
+        outline: 3px solid #0d6efd;
+        outline-offset: 2px;
+      }
+
+      .task-card[draggable="false"] {
+        cursor: default;
+      }
+
+      .task-card-overdue {
+        border-color: rgba(220, 53, 69, 0.35);
+        background: rgba(220, 53, 69, 0.08);
+      }
+    </style>
+{% endblock %}
+
+{% block main_content %}
+      <div class="d-flex justify-content-between align-items-center mb-4">
+        <div>
+          <h1 class="h3 mb-1">Task Board</h1>
+          <p class="text-muted mb-0">{{ total_tasks }} task(s) match the active filters. Overdue tasks are highlighted.</p>
+        </div>
+        <div class="d-flex gap-2">
+          <a class="btn btn-outline-success" href="{{ url_for('list_tasks_route', **task_filters) }}" aria-label="View filtered tasks as JSON" data-keyboard-click>View JSON API</a>
+          {% if can_export_tasks %}
+          <a
+            class="btn btn-success"
+            id="task-export-link"
+            href="{{ url_for('export_tasks_route', **task_filters) }}"
+            target="_blank"
+            rel="noopener"
+            aria-label="Export filtered tasks as JSON"
+            data-keyboard-click
+          >Export JSON</a>
+          {% endif %}
+        </div>
+      </div>
+
+      <div id="board-message" class="alert d-none" role="status" aria-live="polite" aria-atomic="true" tabindex="-1"></div>
+
+      <div class="row g-4 mb-4" aria-label="Task metrics">
+        {% for status, total in task_counts.items() %}
+        <div class="col-md-6 col-xl-3">
+          <div class="card border-0 shadow-sm h-100" role="group" aria-label="{{ status.replace('-', ' ').title() }} task count" tabindex="0">
+            <div class="card-body">
+              <h2 class="h6 text-muted">{{ status.replace('-', ' ').title() }}</h2>
+              <p class="display-6 mb-0">{{ total }}</p>
+            </div>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+
+      <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="task-filters-heading">
+        <div class="card-header bg-white">
+          <h2 class="h5 mb-0" id="task-filters-heading">Filters</h2>
+        </div>
+        <div class="card-body">
+          <form class="row g-3" method="get" action="{{ url_for('dashboard_tasks') }}" aria-labelledby="task-filters-heading" aria-describedby="task-filters-help">
+            <p id="task-filters-help" class="text-muted small mb-0">Use Alt+Shift+F to focus filters and Alt+Shift+T to jump to the task board.</p>
+            <div class="col-md-3">
+              <label class="form-label" for="assignee">Assignee</label>
+              {% if can_filter_all_assignees %}
+              <select class="form-select" id="assignee" name="assignee">
+                <option value="">All assignees</option>
+                {% for assignee in task_assignee_options %}
+                <option value="{{ assignee }}" {% if task_filters.assignee == assignee %}selected{% endif %}>{{ assignee }}</option>
+                {% endfor %}
+              </select>
+              {% else %}
+              <input class="form-control" id="assignee" name="assignee" value="{{ task_filters.assignee or current_role }}" readonly>
+              {% endif %}
+            </div>
+            <div class="col-md-3">
+              <label class="form-label" for="status">Status</label>
+              <select class="form-select" id="status" name="status">
+                <option value="">All statuses</option>
+                {% for status_name in ['todo', 'in-progress', 'done', 'blocked'] %}
+                <option value="{{ status_name }}" {% if task_filters.status == status_name %}selected{% endif %}>{{ status_name.replace('-', ' ').title() }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="col-md-2">
+              <label class="form-label" for="due_date_after">Due after</label>
+              <input class="form-control" id="due_date_after" name="due_date_after" type="date" value="{{ task_filters.due_date_after or '' }}">
+            </div>
+            <div class="col-md-2">
+              <label class="form-label" for="due_date_before">Due before</label>
+              <input class="form-control" id="due_date_before" name="due_date_before" type="date" value="{{ task_filters.due_date_before or '' }}">
+            </div>
+            <div class="col-md-2">
+              <label class="form-label" for="sort">Sort by</label>
+              <select class="form-select" id="sort" name="sort">
+                {% for sort_value, sort_label in task_sort_options %}
+                <option value="{{ sort_value }}" {% if task_filters.sort == sort_value %}selected{% endif %}>{{ sort_label }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div class="col-12 d-flex gap-2">
+              <button class="btn btn-success" type="submit" aria-label="Apply task filters" data-keyboard-click>Apply filters</button>
+              <a class="btn btn-outline-secondary" href="{{ url_for('dashboard_tasks') }}" aria-label="Reset task filters" data-keyboard-click>Reset</a>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      {% if can_manage_tasks %}
+      <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="task-management-heading">
+        <div class="card-header bg-white">
+          <h2 class="h5 mb-0" id="task-management-heading">Task management</h2>
+        </div>
+        <div class="card-body">
+          <div class="row g-4">
+            <div class="col-lg-6">
+              <h3 class="h6">Create task</h3>
+              <form id="task-create-form" class="row g-3" aria-labelledby="task-management-heading">
+                <div class="col-12">
+                  <label class="form-label" for="task-create-title">Task title</label>
+                  <input class="form-control" id="task-create-title" name="title" required>
+                </div>
+                <div class="col-md-6">
+                  <label class="form-label" for="task-create-assignee">Task assignee</label>
+                  <select class="form-select" id="task-create-assignee" name="assignee">
+                    {% for assignee in task_assignment_options %}
+                    <option value="{{ assignee }}">{{ assignee }}</option>
+                    {% endfor %}
+                  </select>
+                </div>
+                <div class="col-md-6">
+                  <label class="form-label" for="task-create-status">Task status</label>
+                  <select class="form-select" id="task-create-status" name="status">
+                    {% for status_name in ['todo', 'in-progress', 'done', 'blocked'] %}
+                    <option value="{{ status_name }}">{{ task_status_labels[status_name] }}</option>
+                    {% endfor %}
+                  </select>
+                </div>
+                <div class="col-md-6">
+                  <label class="form-label" for="task-create-due-date">Task due date</label>
+                  <input class="form-control" id="task-create-due-date" name="due_date" type="date" required>
+                </div>
+                <div class="col-12">
+                  <label class="form-label" for="task-create-description">Task description</label>
+                  <textarea class="form-control" id="task-create-description" name="description" rows="3"></textarea>
+                </div>
+                <div class="col-12">
+                  <button class="btn btn-success" type="submit" aria-label="Create task" data-keyboard-click>Create task</button>
+                </div>
+              </form>
+            </div>
+            <div class="col-lg-6">
+              <h3 class="h6">Edit selected task</h3>
+              <p class="text-muted small">Select a task card below to load it into the editor.</p>
+              <form id="task-edit-form" class="row g-3" aria-labelledby="task-management-heading">
+                <input type="hidden" id="task-edit-id" name="task_id">
+                <div class="col-12">
+                  <label class="form-label" for="task-edit-title">Edit task title</label>
+                  <input class="form-control" id="task-edit-title" name="title" disabled required>
+                </div>
+                <div class="col-md-6">
+                  <label class="form-label" for="task-edit-assignee">Edit task assignee</label>
+                  <select class="form-select" id="task-edit-assignee" name="assignee" disabled>
+                    {% for assignee in task_assignment_options %}
+                    <option value="{{ assignee }}">{{ assignee }}</option>
+                    {% endfor %}
+                  </select>
+                </div>
+                <div class="col-md-6">
+                  <label class="form-label" for="task-edit-status">Edit task status</label>
+                  <select class="form-select" id="task-edit-status" name="status" disabled>
+                    {% for status_name in ['todo', 'in-progress', 'done', 'blocked'] %}
+                    <option value="{{ status_name }}">{{ task_status_labels[status_name] }}</option>
+                    {% endfor %}
+                  </select>
+                </div>
+                <div class="col-md-6">
+                  <label class="form-label" for="task-edit-due-date">Edit task due date</label>
+                  <input class="form-control" id="task-edit-due-date" name="due_date" type="date" disabled>
+                </div>
+                <div class="col-12">
+                  <label class="form-label" for="task-edit-description">Edit task description</label>
+                  <textarea class="form-control" id="task-edit-description" name="description" rows="3" disabled></textarea>
+                </div>
+                <div class="col-12 d-flex gap-2">
+                  <button class="btn btn-primary" type="submit" aria-label="Save task changes" data-keyboard-click disabled>Save changes</button>
+                  <button class="btn btn-outline-secondary" type="button" id="task-edit-clear" aria-label="Clear selected task" data-keyboard-click disabled>Clear selection</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+      </section>
+      {% endif %}
+
+      <section id="task-board-region" class="row g-4" aria-label="Kanban task board" tabindex="-1">
+        {% for status_name in ['todo', 'in-progress', 'done', 'blocked'] %}
+        <div class="col-xl-3 col-md-6">
+          <section class="card border-0 shadow-sm h-100 kanban-column" role="region" aria-labelledby="column-{{ status_name }}-heading">
+            <div class="card-header bg-white d-flex justify-content-between align-items-center">
+              <h2 class="h5 mb-0" id="column-{{ status_name }}-heading">{{ status_name.replace('-', ' ').title() }}</h2>
+              <span class="badge text-bg-secondary" aria-label="{{ task_columns[status_name] | length }} task(s)">{{ task_columns[status_name] | length }}</span>
+            </div>
+            <div class="card-body">
+              <div class="kanban-dropzone" id="kanban-{{ status_name }}" data-task-status="{{ status_name }}" role="list" aria-labelledby="column-{{ status_name }}-heading" tabindex="0">
+                {% for task in task_columns[status_name] %}
+                <article
+                  class="card shadow-sm mb-3 task-card {% if task.is_overdue %}task-card-overdue{% endif %}"
+                  data-task-id="{{ task.id }}"
+                  data-task-title="{{ task.title }}"
+                  data-task-assignee="{{ task.assigned_to }}"
+                  data-task-description="{{ task.description or '' }}"
+                  data-task-due-date="{{ task.due_date or '' }}"
+                  data-task-status="{{ status_name }}"
+                  data-can-move="{{ 'true' if task.can_move else 'false' }}"
+                  draggable="{{ 'true' if task.can_move else 'false' }}"
+                  tabindex="0"
+                  role="listitem"
+                  aria-label="{{ task.title }}. Status {{ task.status.replace('-', ' ') }}. Assigned to {{ task.assigned_to }}. Due {{ task.due_date or 'none' }}."
+                  aria-keyshortcuts="Enter Space ArrowLeft ArrowRight"
+                >
+                  <div class="card-body">
+                    <div class="d-flex justify-content-between gap-2 align-items-start mb-2">
+                      <div class="fw-semibold">{{ task.title }}</div>
+                      {% if task.is_overdue %}
+                      <span class="badge text-bg-danger">Overdue</span>
+                      {% endif %}
+                    </div>
+                    <div class="small text-muted mb-2">Assigned to {{ task.assigned_to }}</div>
+                    <div class="small mb-3">{{ task.description or 'No description provided.' }}</div>
+                    <div class="d-flex flex-wrap gap-2 small">
+                      <span class="badge text-bg-light border">Due: {{ task.due_date or 'None' }}</span>
+                      <span class="badge text-bg-secondary">{{ task.status.replace('-', ' ').title() }}</span>
+                    </div>
+                  </div>
+                </article>
+                {% else %}
+                <p role="listitem" class="text-muted small mb-0">No {{ status_name.replace('-', ' ') }} tasks.</p>
+                {% endfor %}
+              </div>
+            </div>
+          </section>
+        </div>
+        {% endfor %}
+      </section>
+
+      <section id="keyboard-shortcuts" class="card border-0 shadow-sm mt-4" role="region" aria-labelledby="keyboard-shortcuts-heading" tabindex="-1">
+        <div class="card-header bg-white">
+          <h2 class="h5 mb-0" id="keyboard-shortcuts-heading">Keyboard shortcuts</h2>
+        </div>
+        <div class="card-body">
+          <p id="keyboard-shortcuts-note" class="text-muted small mb-3">
+            Keyboard navigation follows the filter form and then each task column. On a focused task card, use Left or Right Arrow to move the task between columns.
+          </p>
+          <ul class="list-group list-group-flush small" aria-describedby="keyboard-shortcuts-note">
+            <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>D</kbd> — Open the dashboard</li>
+            <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>S</kbd> — Open settings</li>
+            <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>F</kbd> — Focus filters</li>
+            <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> — Focus the task board</li>
+            <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>K</kbd> — Focus this shortcut help</li>
+            <li class="list-group-item px-0"><kbd>Left</kbd>/<kbd>Right</kbd> Arrow — Move a focused task to the previous or next column</li>
+          </ul>
+        </div>
+      </section>
+{% endblock %}
+
+{% block scripts %}
+    <script>
+      const boardMessage = document.getElementById("board-message");
+      const taskCards = Array.from(document.querySelectorAll(".task-card"));
+      const dropzones = Array.from(document.querySelectorAll(".kanban-dropzone"));
+      const taskCreateForm = document.getElementById("task-create-form");
+      const taskEditForm = document.getElementById("task-edit-form");
+      const taskEditId = document.getElementById("task-edit-id");
+      const taskEditTitle = document.getElementById("task-edit-title");
+      const taskEditAssignee = document.getElementById("task-edit-assignee");
+      const taskEditStatus = document.getElementById("task-edit-status");
+      const taskEditDueDate = document.getElementById("task-edit-due-date");
+      const taskEditDescription = document.getElementById("task-edit-description");
+      const taskEditClear = document.getElementById("task-edit-clear");
+      const statusOrder = ["todo", "in-progress", "done", "blocked"];
+      let draggedTaskId = null;
+
+      async function postJson(url, body, method = "POST") {
+        const response = await fetch(url, {
+          method,
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(body),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          throw new Error(payload.error || "Request failed.");
+        }
+        return payload;
+      }
+
+      function focusAndScroll(element) {
+        if (!element) {
+          return;
+        }
+        element.focus();
+        element.scrollIntoView({ block: "start", behavior: "smooth" });
+      }
+
+      function bindKeyboardActivation(element) {
+        element.addEventListener("keydown", (event) => {
+          if (event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            element.click();
+          }
+        });
+      }
+
+      function showBoardMessage(kind, text) {
+        boardMessage.className = `alert alert-${kind}`;
+        boardMessage.textContent = text;
+        boardMessage.focus();
+      }
+
+      function setTaskEditorEnabled(enabled) {
+        if (!taskEditForm) {
+          return;
+        }
+        [taskEditTitle, taskEditAssignee, taskEditStatus, taskEditDueDate, taskEditDescription, taskEditClear, taskEditForm.querySelector('button[type="submit"]')].forEach((element) => {
+          if (element) {
+            element.disabled = !enabled;
+          }
+        });
+      }
+
+      function clearTaskEditor() {
+        if (!taskEditForm) {
+          return;
+        }
+        taskEditId.value = "";
+        taskEditTitle.value = "";
+        taskEditAssignee.value = "{{ current_role or 'admin' }}";
+        taskEditStatus.value = "todo";
+        taskEditDueDate.value = "";
+        taskEditDescription.value = "";
+        setTaskEditorEnabled(false);
+      }
+
+      function loadTaskIntoEditor(card) {
+        if (!taskEditForm) {
+          return;
+        }
+        taskEditId.value = card.dataset.taskId;
+        taskEditTitle.value = card.dataset.taskTitle || "";
+        taskEditAssignee.value = card.dataset.taskAssignee || "admin";
+        taskEditStatus.value = card.dataset.taskStatus || "todo";
+        taskEditDueDate.value = card.dataset.taskDueDate || "";
+        taskEditDescription.value = card.dataset.taskDescription || "";
+        setTaskEditorEnabled(true);
+        focusAndScroll(taskEditTitle);
+      }
+
+      async function moveTask(taskId, nextStatus) {
+        const payload = await postJson(`/tasks/${taskId}/status`, { status: nextStatus });
+        showBoardMessage("success", payload.notification || `Task moved to ${nextStatus}.`);
+        window.location.reload();
+      }
+
+      document.querySelectorAll("[data-keyboard-click]").forEach(bindKeyboardActivation);
+
+      document.addEventListener("keydown", (event) => {
+        if (!(event.altKey && event.shiftKey) || event.ctrlKey || event.metaKey) {
+          return;
+        }
+
+        const activeElement = document.activeElement;
+        const isTyping = activeElement && (
+          activeElement.tagName === "INPUT"
+          || activeElement.tagName === "TEXTAREA"
+          || activeElement.tagName === "SELECT"
+          || activeElement.isContentEditable
+        );
+        if (isTyping && !["KeyK", "KeyT"].includes(event.code)) {
+          return;
+        }
+
+        const shortcutActions = {
+          KeyD: () => window.location.assign("{{ url_for('dashboard') }}"),
+          KeyS: () => window.location.assign("{{ url_for('settings_page') }}"),
+          KeyF: () => focusAndScroll(document.getElementById("assignee")),
+          KeyT: () => focusAndScroll(document.getElementById("task-board-region")),
+          KeyK: () => focusAndScroll(document.getElementById("keyboard-shortcuts")),
+        };
+
+        const action = shortcutActions[event.code];
+        if (!action) {
+          return;
+        }
+
+        event.preventDefault();
+        action();
+      });
+
+      if (taskCreateForm) {
+        taskCreateForm.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const form = new FormData(event.target);
+          try {
+            await postJson("/tasks", Object.fromEntries(form.entries()));
+            showBoardMessage("success", "Task created.");
+            window.location.reload();
+          } catch (error) {
+            showBoardMessage("danger", error.message || "Could not create task.");
+          }
+        });
+      }
+
+      if (taskEditForm) {
+        clearTaskEditor();
+        taskEditClear.addEventListener("click", clearTaskEditor);
+        taskEditForm.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          if (!taskEditId.value) {
+            showBoardMessage("warning", "Select a task before editing it.");
+            return;
+          }
+          const form = new FormData(event.target);
+          try {
+            await postJson(`/tasks/${taskEditId.value}`, {
+              title: form.get("title"),
+              assignee: form.get("assignee"),
+              status: form.get("status"),
+              due_date: form.get("due_date"),
+              description: form.get("description"),
+            }, "PUT");
+            showBoardMessage("success", "Task updated.");
+            window.location.reload();
+          } catch (error) {
+            showBoardMessage("danger", error.message || "Could not update task.");
+          }
+        });
+      }
+
+      taskCards.forEach((card) => {
+        card.addEventListener("click", () => loadTaskIntoEditor(card));
+        if (card.dataset.canMove !== "true") {
+          return;
+        }
+
+        card.addEventListener("dragstart", (event) => {
+          draggedTaskId = card.dataset.taskId;
+          event.dataTransfer.effectAllowed = "move";
+          event.dataTransfer.setData("text/plain", draggedTaskId);
+        });
+
+        card.addEventListener("keydown", async (event) => {
+          if (!["ArrowLeft", "ArrowRight", "Enter", " "].includes(event.key)) {
+            return;
+          }
+
+          const currentIndex = statusOrder.indexOf(card.dataset.taskStatus);
+          let nextIndex = currentIndex;
+          if (event.key === "ArrowLeft") {
+            nextIndex = Math.max(0, currentIndex - 1);
+          } else {
+            nextIndex = Math.min(statusOrder.length - 1, currentIndex + 1);
+          }
+          if (nextIndex === currentIndex) {
+            return;
+          }
+
+          event.preventDefault();
+          try {
+            await moveTask(card.dataset.taskId, statusOrder[nextIndex]);
+          } catch (error) {
+            showBoardMessage("danger", error.message || "Could not move task right now.");
+          }
+        });
+      });
+
+      dropzones.forEach((dropzone) => {
+        dropzone.addEventListener("dragover", (event) => {
+          event.preventDefault();
+          dropzone.classList.add("drag-over");
+        });
+        dropzone.addEventListener("dragleave", () => {
+          dropzone.classList.remove("drag-over");
+        });
+        dropzone.addEventListener("drop", async (event) => {
+          event.preventDefault();
+          dropzone.classList.remove("drag-over");
+          const taskId = draggedTaskId || event.dataTransfer.getData("text/plain");
+          const nextStatus = dropzone.dataset.taskStatus;
+          if (!taskId || !nextStatus) {
+            return;
+          }
+          try {
+            await moveTask(taskId, nextStatus);
+          } catch (error) {
+            showBoardMessage("danger", error.message || "Could not move task right now.");
+          } finally {
+            draggedTaskId = null;
+          }
+        });
+      });
+    </script>
+{% endblock %}

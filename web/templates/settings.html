@@ -1,42 +1,53 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>Nonprofit Funding Bot Settings</title>
-    <link
-      href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
-      rel="stylesheet"
-      integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
-      crossorigin="anonymous"
-    >
-  </head>
-  <body class="bg-light">
-    <a class="visually-hidden-focusable" href="#main-content">Skip to main content</a>
-    <nav class="navbar navbar-expand-lg navbar-dark bg-success shadow-sm" role="navigation" aria-label="Primary navigation">
-      <div class="container-fluid">
-        <span class="navbar-brand mb-0 h1">Nonprofit Funding Bot</span>
-        <a class="nav-link text-white" href="{{ url_for('dashboard') }}">Dashboard</a>
-        <span class="navbar-text text-white-50">Role: {{ current_role }}</span>
-      </div>
-    </nav>
+{% extends "base.html" %}
 
-    <main id="main-content" class="container py-4">
+{% block title %}Nonprofit Funding Bot Settings{% endblock %}
+
+{% block nav_links %}
+        <a class="nav-link app-nav-link" href="{{ url_for('dashboard') }}" aria-label="Open dashboard page">Dashboard</a>
+        <a class="nav-link app-nav-link" href="{{ url_for('translation_review_dashboard') }}" aria-label="Open translation review dashboard">Translations</a>
+        <a class="nav-link app-nav-link" href="{{ url_for('dashboard_tasks') }}" aria-label="Open my tasks dashboard">My Tasks</a>
+{% endblock %}
+
+{% block main_content %}
+      {% set queue_monitoring = queue_monitoring if queue_monitoring is defined else {
+        "flower": {"url": "#"},
+        "queue": {
+          "status": "disabled",
+          "queue_name": "n/a",
+          "worker_count": 0,
+          "queue_depth": 0,
+          "active_tasks": 0
+        },
+        "task_metrics": {
+          "retries_scheduled": 0,
+          "duration_seconds_average": 0,
+          "duration_seconds_max": 0
+        }
+      } %}
       <h1 class="h3 mb-4">Settings</h1>
-      <p class="text-muted">
+      <p class="text-muted" id="settings-intro">
         Configure the bot and prove that it can search for donation opportunities and
         communicate with donors, all without leaving the admin panel.
         {% if current_role != "admin" %}
         <span class="badge text-bg-warning">Read-only for role "{{ current_role }}"</span>
         {% endif %}
       </p>
+      <p class="small text-muted">
+        Locale preview:
+        <span class="badge text-bg-light text-dark locale-chip">{{ ui_locale.code }} · {{ ui_locale.direction }}</span>
+        {% if ui_locale.is_rtl %}
+        <span class="badge text-bg-info">RTL preview active</span>
+        {% endif %}
+      </p>
 
       <div class="row g-4">
         <div class="col-lg-6">
-          <div class="card border-0 shadow-sm mb-4">
-            <div class="card-header bg-white"><h2 class="h5 mb-0">Organization Profile</h2></div>
+          <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="organization-profile-heading">
+            <div class="card-header bg-white"><h2 class="h5 mb-0" id="organization-profile-heading">Organization Profile</h2></div>
             <div class="card-body">
-              <form id="organization-form">
+              <p id="organization-profile-help" class="text-muted small">Update the organization record used in outreach and application documents.</p>
+              <form id="organization-form" class="rtl-safe" aria-labelledby="organization-profile-heading" aria-describedby="organization-profile-help">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() if csrf_token is defined else '' }}">
                 <div class="mb-3">
                   <label class="form-label" for="org-name">Organization name</label>
                   <input class="form-control" id="org-name" name="name" value="{{ organization_profile.get('name', '') }}">
@@ -49,16 +60,38 @@
                   <label class="form-label" for="org-registration">Registration number</label>
                   <input class="form-control" id="org-registration" name="registration_number" value="{{ organization_profile.get('registration_number', '') }}">
                 </div>
-                <button type="submit" class="btn btn-success" {{ "disabled" if current_role != "admin" }}>Save profile</button>
+                <div class="mb-3">
+                  <label class="form-label" for="org-website">Website</label>
+                  <input class="form-control" id="org-website" name="website" value="{{ organization_profile.get('website', '') }}">
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="org-contact-email">Contact email</label>
+                  <input class="form-control" id="org-contact-email" name="contact_email" value="{{ organization_profile.get('contact_email', '') }}">
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="org-privacy-email">Privacy contact email</label>
+                  <input class="form-control" id="org-privacy-email" name="privacy_email" value="{{ organization_profile.get('privacy_email', '') }}">
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="org-address">Address</label>
+                  <textarea class="form-control" id="org-address" name="address" rows="2">{{ organization_profile.get('address', '') }}</textarea>
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="org-jurisdictions">Privacy jurisdictions</label>
+                  <input class="form-control" id="org-jurisdictions" name="privacy_jurisdictions" value="{{ organization_profile.get('privacy_jurisdictions', []) | join(', ') if organization_profile.get('privacy_jurisdictions') is iterable and organization_profile.get('privacy_jurisdictions') is not string else organization_profile.get('privacy_jurisdictions', '') }}" placeholder="EU, US">
+                </div>
+                <button type="submit" class="btn btn-success" aria-label="Save organization profile" data-keyboard-click {{ "disabled" if current_role != "admin" }}>Save profile</button>
               </form>
-              <div id="organization-result" class="mt-2 small"></div>
+              <div id="organization-result" class="mt-2 small" role="status" aria-live="polite" aria-atomic="true" aria-label="Organization profile save status" tabindex="-1"></div>
             </div>
-          </div>
+          </section>
 
-          <div class="card border-0 shadow-sm mb-4">
-            <div class="card-header bg-white"><h2 class="h5 mb-0">Donation Search Settings</h2></div>
+          <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="search-settings-heading">
+            <div class="card-header bg-white"><h2 class="h5 mb-0" id="search-settings-heading">Donation Search Settings</h2></div>
             <div class="card-body">
-              <form id="search-form">
+              <p id="search-settings-help" class="text-muted small">Choose keywords and trusted portals used during automated discovery.</p>
+              <form id="search-form" class="rtl-safe" aria-labelledby="search-settings-heading" aria-describedby="search-settings-help">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() if csrf_token is defined else '' }}">
                 <div class="mb-3">
                   <label class="form-label" for="search-keywords">Keyword filters (comma-separated)</label>
                   <input class="form-control" id="search-keywords" name="keywords" value="{{ search_settings.keywords | join(', ') }}">
@@ -67,57 +100,125 @@
                   <label class="form-label" for="search-sources">Trusted sources (comma-separated, blank = all)</label>
                   <input class="form-control" id="search-sources" name="trusted_sources" value="{{ search_settings.trusted_sources | join(', ') }}">
                 </div>
-                <button type="submit" class="btn btn-success" {{ "disabled" if current_role != "admin" }}>Save search settings</button>
+                <button type="submit" class="btn btn-success" aria-label="Save donation search settings" data-keyboard-click {{ "disabled" if current_role != "admin" }}>Save search settings</button>
               </form>
-              <div id="search-result" class="mt-2 small"></div>
+              <div id="search-result" class="mt-2 small" role="status" aria-live="polite" aria-atomic="true" aria-label="Donation search settings save status" tabindex="-1"></div>
             </div>
-          </div>
+          </section>
 
-          <div class="card border-0 shadow-sm mb-4">
-            <div class="card-header bg-white"><h2 class="h5 mb-0">Credential Aliases</h2></div>
+          <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="credential-aliases-heading">
+            <div class="card-header bg-white"><h2 class="h5 mb-0" id="credential-aliases-heading">Credential Aliases</h2></div>
             <div class="card-body">
-              <ul class="list-group list-group-flush mb-3">
+              <ul class="list-group list-group-flush mb-3 rtl-safe" aria-labelledby="credential-aliases-heading">
                 {% for credential in credentials %}
                 <li class="list-group-item px-0"><code>{{ credential.alias }}</code> → env var <code>{{ credential.env_var_name }}</code></li>
                 {% else %}
                 <li class="list-group-item px-0 text-muted">No credential aliases registered.</li>
                 {% endfor %}
               </ul>
-              <form id="credential-form" class="row g-2">
+              <form id="credential-form" class="row g-2 rtl-safe" aria-labelledby="credential-aliases-heading" aria-describedby="credential-aliases-help">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() if csrf_token is defined else '' }}">
+                <p id="credential-aliases-help" class="text-muted small mb-0">Add a friendly name for a secret-backed environment variable.</p>
                 <div class="col-5">
                   <label class="form-label small mb-1" for="credential-alias">Alias</label>
-                  <input class="form-control" id="credential-alias" name="alias" placeholder="e.g. smtp">
+                  <input class="form-control" id="credential-alias" name="alias" placeholder="e.g. smtp" aria-label="Credential alias">
                 </div>
                 <div class="col-5">
                   <label class="form-label small mb-1" for="credential-env-var">Environment variable name</label>
-                  <input class="form-control" id="credential-env-var" name="env_var_name" placeholder="e.g. SMTP_PASSWORD">
+                  <input class="form-control" id="credential-env-var" name="env_var_name" placeholder="e.g. SMTP_PASSWORD" aria-label="Credential environment variable name">
                 </div>
                 <div class="col-2 d-flex align-items-end">
-                  <button type="submit" class="btn btn-success w-100" {{ "disabled" if current_role != "admin" }}>Add</button>
+                  <button type="submit" class="btn btn-success w-100" aria-label="Add credential alias" data-keyboard-click {{ "disabled" if current_role != "admin" }}>Add</button>
                 </div>
               </form>
-              <div id="credential-result" class="mt-2 small"></div>
+              <div id="credential-result" class="mt-2 small" role="status" aria-live="polite" aria-atomic="true" aria-label="Credential alias save status" tabindex="-1"></div>
             </div>
-          </div>
+          </section>
         </div>
 
         <div class="col-lg-6">
-          <div class="card border-0 shadow-sm mb-4">
-            <div class="card-header bg-white"><h2 class="h5 mb-0">Prove: Donation Search</h2></div>
+          <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="discovery-heading">
+            <div class="card-header bg-white"><h2 class="h5 mb-0" id="discovery-heading">Prove: Donation Search</h2></div>
             <div class="card-body">
-              <p class="text-muted small">
+              <p class="text-muted small" id="discovery-help">
                 Runs every configured portal connector right now and stores any new
                 opportunities, proving the bot can actively search for funding.
               </p>
-              <button id="run-discovery" class="btn btn-primary" {{ "disabled" if current_role != "admin" }}>Run discovery now</button>
-              <pre id="discovery-result" class="mt-3 bg-white border rounded p-2 small" style="max-height: 260px; overflow:auto;"></pre>
+              <button id="run-discovery" class="btn btn-primary" aria-label="Run donation discovery now" aria-controls="discovery-result" aria-describedby="discovery-help" aria-keyshortcuts="Alt+Shift+R" data-keyboard-click {{ "disabled" if current_role != "admin" }}>Run discovery now</button>
+              <pre id="discovery-result" class="mt-3 bg-white border rounded p-2 small rtl-safe-pre" style="max-height: 260px; overflow:auto;" role="status" aria-live="polite" aria-atomic="true" aria-label="Discovery results" tabindex="-1"></pre>
             </div>
-          </div>
+          </section>
 
-          <div class="card border-0 shadow-sm mb-4">
-            <div class="card-header bg-white"><h2 class="h5 mb-0">Prove: Donor Communication</h2></div>
+          <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="queue-monitoring-heading">
+            <div class="card-header bg-white d-flex justify-content-between align-items-center">
+              <h2 class="h5 mb-0" id="queue-monitoring-heading">Queue Monitoring</h2>
+              <button id="refresh-queue-monitor" type="button" class="btn btn-outline-primary btn-sm" data-keyboard-click>Refresh</button>
+            </div>
+            <div class="card-body">
+              <p class="text-muted small" id="queue-monitoring-help">
+                Monitor Celery queue depth, worker availability, retry activity, and task runtimes.
+                <a href="{{ queue_monitoring.flower.url }}" target="_blank" rel="noopener noreferrer">Open Flower</a>
+              </p>
+              <dl class="row small mb-3" id="queue-monitoring-summary">
+                <dt class="col-sm-5">Status</dt>
+                <dd class="col-sm-7"><span id="queue-monitor-status" class="badge text-bg-{{ 'success' if queue_monitoring.queue.status == 'ok' else 'secondary' if queue_monitoring.queue.status == 'disabled' else 'warning' }}">{{ queue_monitoring.queue.status }}</span></dd>
+                <dt class="col-sm-5">Queue name</dt>
+                <dd class="col-sm-7" id="queue-monitor-name">{{ queue_monitoring.queue.queue_name }}</dd>
+                <dt class="col-sm-5">Workers</dt>
+                <dd class="col-sm-7" id="queue-monitor-workers">{{ queue_monitoring.queue.worker_count }}</dd>
+                <dt class="col-sm-5">Pending depth</dt>
+                <dd class="col-sm-7" id="queue-monitor-depth">{{ queue_monitoring.queue.queue_depth }}</dd>
+                <dt class="col-sm-5">Active tasks</dt>
+                <dd class="col-sm-7" id="queue-monitor-active">{{ queue_monitoring.queue.active_tasks }}</dd>
+                <dt class="col-sm-5">Retry events</dt>
+                <dd class="col-sm-7" id="queue-monitor-retries">{{ queue_monitoring.task_metrics.retries_scheduled }}</dd>
+                <dt class="col-sm-5">Average task runtime</dt>
+                <dd class="col-sm-7" id="queue-monitor-duration">{{ "%.2fs"|format(queue_monitoring.task_metrics.duration_seconds_average) }}</dd>
+                <dt class="col-sm-5">Longest task runtime</dt>
+                <dd class="col-sm-7" id="queue-monitor-duration-max">{{ "%.2fs"|format(queue_monitoring.task_metrics.duration_seconds_max) }}</dd>
+              </dl>
+              <pre id="queue-monitoring-result" class="mt-3 bg-white border rounded p-2 small rtl-safe-pre" style="max-height: 220px; overflow:auto;" role="status" aria-live="polite" aria-atomic="true" aria-label="Queue monitoring results" tabindex="0">{{ queue_monitoring | tojson(indent=2) }}</pre>
+            </div>
+          </section>
+
+          <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="privacy-policy-heading">
+            <div class="card-header bg-white"><h2 class="h5 mb-0" id="privacy-policy-heading">Privacy Policy Generator</h2></div>
             <div class="card-body">
               <p class="text-muted small">
+                Runtime residency:
+                <span class="badge text-bg-success">{{ residency_status.data_residency }}</span>
+                <span class="text-muted">storage region {{ residency_status.storage_region }}</span>
+              </p>
+              <form id="privacy-policy-form" class="rtl-safe" aria-labelledby="privacy-policy-heading">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() if csrf_token is defined else '' }}">
+                <div class="mb-3">
+                  <label class="form-label" for="policy-jurisdictions">Jurisdictions (comma-separated)</label>
+                  <input class="form-control" id="policy-jurisdictions" name="jurisdictions" value="{{ organization_profile.get('privacy_jurisdictions', residency_status.data_residency) | join(', ') if organization_profile.get('privacy_jurisdictions') is iterable and organization_profile.get('privacy_jurisdictions') is not string else organization_profile.get('privacy_jurisdictions', residency_status.data_residency) }}">
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="policy-effective-date">Effective date</label>
+                  <input class="form-control" id="policy-effective-date" name="effective_date" type="date">
+                </div>
+                <button type="submit" class="btn btn-primary" aria-label="Generate privacy policy" data-keyboard-click {{ "disabled" if current_role != "admin" }}>Generate HTML/PDF</button>
+              </form>
+              <pre id="privacy-policy-result" class="mt-3 bg-white border rounded p-2 small rtl-safe-pre" style="max-height: 260px; overflow:auto;" role="status" aria-live="polite" aria-atomic="true" aria-label="Privacy policy generation results" tabindex="-1"></pre>
+              <div class="mt-3">
+                <h3 class="h6">Recent versions</h3>
+                <ul class="list-group list-group-flush small">
+                  {% for policy in privacy_policy_versions %}
+                  <li class="list-group-item px-0">{{ policy.version }} — {{ policy.jurisdiction }} — {{ policy.generated_at }}</li>
+                  {% else %}
+                  <li class="list-group-item px-0 text-muted">No privacy policies generated yet.</li>
+                  {% endfor %}
+                </ul>
+              </div>
+            </div>
+          </section>
+
+          <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="outreach-heading">
+            <div class="card-header bg-white"><h2 class="h5 mb-0" id="outreach-heading">Prove: Donor Communication</h2></div>
+            <div class="card-body">
+              <p class="text-muted small" id="outreach-help">
                 SMTP status:
                 {% if smtp_configured %}
                 <span class="badge text-bg-success">Configured ({{ smtp_host }})</span>
@@ -125,38 +226,62 @@
                 <span class="badge text-bg-secondary">Not configured (dry-run only)</span>
                 {% endif %}
               </p>
-              <fieldset>
+              <fieldset aria-describedby="outreach-help">
                 <legend class="visually-hidden">Donor outreach test details</legend>
-                <form id="outreach-form">
+                <form id="outreach-form" class="rtl-safe" aria-labelledby="outreach-heading" aria-describedby="outreach-help">
+                  <input type="hidden" name="csrf_token" value="{{ csrf_token() if csrf_token is defined else '' }}">
                   <div class="row g-2">
                     <div class="col-6">
                       <label class="form-label small mb-1" for="outreach-email">Donor email</label>
-                      <input class="form-control" id="outreach-email" name="email" placeholder="donor@example.org" required>
+                      <input class="form-control" id="outreach-email" name="email" placeholder="donor@example.org" aria-label="Donor email address" required>
                     </div>
                     <div class="col-6">
                       <label class="form-label small mb-1" for="outreach-name">Donor name</label>
-                      <input class="form-control" id="outreach-name" name="name" placeholder="Donor name" required>
+                      <input class="form-control" id="outreach-name" name="name" placeholder="Donor name" aria-label="Donor name" required>
                     </div>
                   </div>
                   <div class="form-check mt-2">
                     <input class="form-check-input" type="checkbox" id="outreach-dry-run" checked>
                     <label class="form-check-label" for="outreach-dry-run">Dry run (compose only, do not send)</label>
                   </div>
-                  <button type="submit" class="btn btn-primary mt-2" {{ "disabled" if current_role != "admin" }}>Send test outreach</button>
+                  <button type="submit" class="btn btn-primary mt-2" aria-label="Send donor outreach test" data-keyboard-click {{ "disabled" if current_role != "admin" }}>Send test outreach</button>
                 </form>
               </fieldset>
-              <pre id="outreach-result" class="mt-3 bg-white border rounded p-2 small" style="max-height: 260px; overflow:auto;"></pre>
+              <pre id="outreach-result" class="mt-3 bg-white border rounded p-2 small rtl-safe-pre" style="max-height: 260px; overflow:auto;" role="status" aria-live="polite" aria-atomic="true" aria-label="Outreach results" tabindex="-1"></pre>
             </div>
-          </div>
+          </section>
+
+          <section id="keyboard-shortcuts" class="card border-0 shadow-sm" role="region" aria-labelledby="keyboard-shortcuts-heading" tabindex="-1">
+            <div class="card-header bg-white"><h2 class="h5 mb-0" id="keyboard-shortcuts-heading">Keyboard shortcuts</h2></div>
+            <div class="card-body">
+              <p id="keyboard-shortcuts-note" class="text-muted small mb-3">
+                Keyboard navigation follows the visible form order. Use Enter or Space to activate settings action buttons.
+              </p>
+              <ul class="list-group list-group-flush small" aria-describedby="keyboard-shortcuts-note">
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>D</kbd> — Open the dashboard</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>S</kbd> — Open settings</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>M</kbd> — Focus the main content</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>O</kbd> — Focus organization profile</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>F</kbd> — Focus donation search settings</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>C</kbd> — Focus credential aliases</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>R</kbd> — Run discovery now</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> — Focus donor outreach</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>K</kbd> — Focus this shortcut help</li>
+              </ul>
+            </div>
+          </section>
         </div>
       </div>
-    </main>
+{% endblock %}
 
+{% block scripts %}
     <script>
+      const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
+
       async function postJson(url, body) {
         const response = await fetch(url, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
           body: JSON.stringify(body),
         });
         const data = await response.json();
@@ -167,13 +292,87 @@
         return value.split(",").map((item) => item.trim()).filter(Boolean);
       }
 
+      function focusAndScroll(element) {
+        if (!element) {
+          return;
+        }
+        element.focus();
+        element.scrollIntoView({ block: "start", behavior: "smooth" });
+      }
+
+      function writeStatus(targetId, message) {
+        const target = document.getElementById(targetId);
+        target.textContent = message;
+        target.focus();
+      }
+
+      function renderQueueMonitoring(data) {
+        const queue = data.queue || {};
+        const taskMetrics = data.task_metrics || {};
+        document.getElementById("queue-monitor-status").textContent = queue.status || "unknown";
+        document.getElementById("queue-monitor-name").textContent = queue.queue_name || "";
+        document.getElementById("queue-monitor-workers").textContent = queue.worker_count ?? 0;
+        document.getElementById("queue-monitor-depth").textContent = queue.queue_depth ?? 0;
+        document.getElementById("queue-monitor-active").textContent = queue.active_tasks ?? 0;
+        document.getElementById("queue-monitor-retries").textContent = taskMetrics.retries_scheduled ?? 0;
+        document.getElementById("queue-monitor-duration").textContent = `${Number(taskMetrics.duration_seconds_average || 0).toFixed(2)}s`;
+        document.getElementById("queue-monitor-duration-max").textContent = `${Number(taskMetrics.duration_seconds_max || 0).toFixed(2)}s`;
+        writeStatus("queue-monitoring-result", JSON.stringify(data, null, 2));
+      }
+
+      function bindKeyboardActivation(element) {
+        element.addEventListener("keydown", (event) => {
+          if ((event.key === "Enter" || event.key === " ") && !element.disabled) {
+            event.preventDefault();
+            element.click();
+          }
+        });
+      }
+
+      document.querySelectorAll("[data-keyboard-click]").forEach(bindKeyboardActivation);
+
+      document.addEventListener("keydown", (event) => {
+        if (!(event.altKey && event.shiftKey) || event.ctrlKey || event.metaKey) {
+          return;
+        }
+
+        const activeElement = document.activeElement;
+        const isTyping = activeElement && (
+          activeElement.tagName === "INPUT"
+          || activeElement.tagName === "TEXTAREA"
+          || activeElement.tagName === "SELECT"
+          || activeElement.isContentEditable
+        );
+        if (isTyping && !["KeyK", "KeyM", "KeyR"].includes(event.code)) {
+          return;
+        }
+
+        const shortcutActions = {
+          KeyD: () => window.location.assign("{{ url_for('dashboard') }}"),
+          KeyS: () => window.location.assign("{{ url_for('settings_page') }}"),
+          KeyM: () => focusAndScroll(document.getElementById("main-content")),
+          KeyO: () => focusAndScroll(document.getElementById("org-name")),
+          KeyF: () => focusAndScroll(document.getElementById("search-keywords")),
+          KeyC: () => focusAndScroll(document.getElementById("credential-alias")),
+          KeyR: () => document.getElementById("run-discovery").click(),
+          KeyT: () => focusAndScroll(document.getElementById("outreach-email")),
+          KeyK: () => focusAndScroll(document.getElementById("keyboard-shortcuts")),
+        };
+
+        const action = shortcutActions[event.code];
+        if (!action) {
+          return;
+        }
+
+        event.preventDefault();
+        action();
+      });
+
       document.getElementById("organization-form").addEventListener("submit", async (event) => {
         event.preventDefault();
         const form = new FormData(event.target);
         const { ok, data } = await postJson("/settings/organization", Object.fromEntries(form));
-        document.getElementById("organization-result").textContent = ok
-          ? "Profile saved."
-          : `Error: ${data.error}`;
+        writeStatus("organization-result", ok ? "Profile saved." : `Error: ${data.error}`);
       });
 
       document.getElementById("search-form").addEventListener("submit", async (event) => {
@@ -183,18 +382,14 @@
           keywords: splitList(form.get("keywords") || ""),
           trusted_sources: splitList(form.get("trusted_sources") || ""),
         });
-        document.getElementById("search-result").textContent = ok
-          ? "Search settings saved."
-          : `Error: ${data.error}`;
+        writeStatus("search-result", ok ? "Search settings saved." : `Error: ${data.error}`);
       });
 
       document.getElementById("credential-form").addEventListener("submit", async (event) => {
         event.preventDefault();
         const form = new FormData(event.target);
         const { ok, data } = await postJson("/settings/credentials", Object.fromEntries(form));
-        document.getElementById("credential-result").textContent = ok
-          ? "Credential alias registered."
-          : `Error: ${data.error}`;
+        writeStatus("credential-result", ok ? "Credential alias registered." : `Error: ${data.error}`);
         if (ok) {
           window.location.reload();
         }
@@ -202,7 +397,26 @@
 
       document.getElementById("run-discovery").addEventListener("click", async () => {
         const { ok, data } = await postJson("/settings/discover", {});
-        document.getElementById("discovery-result").textContent = JSON.stringify(data, null, 2);
+        writeStatus("discovery-result", ok ? JSON.stringify(data, null, 2) : `Error: ${data.error}`);
+      });
+
+      document.getElementById("refresh-queue-monitor").addEventListener("click", async () => {
+        const response = await fetch("/monitoring/queue");
+        const data = await response.json();
+        renderQueueMonitoring(response.ok ? data : { error: data.error || "Unable to load queue monitoring." });
+      });
+
+      document.getElementById("privacy-policy-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const form = new FormData(event.target);
+        const { ok, data } = await postJson("/settings/privacy-policy", {
+          jurisdictions: splitList(form.get("jurisdictions") || ""),
+          effective_date: form.get("effective_date") || undefined,
+        });
+        writeStatus("privacy-policy-result", ok ? JSON.stringify(data, null, 2) : `Error: ${data.error}`);
+        if (ok) {
+          window.location.reload();
+        }
       });
 
       document.getElementById("outreach-form").addEventListener("submit", async (event) => {
@@ -214,10 +428,7 @@
           name: form.get("name"),
           dry_run: dryRun,
         });
-        document.getElementById("outreach-result").textContent = ok
-          ? JSON.stringify(data, null, 2)
-          : `Error: ${data.error}`;
+        writeStatus("outreach-result", ok ? JSON.stringify(data, null, 2) : `Error: ${data.error}`);
       });
     </script>
-  </body>
-</html>
+{% endblock %}

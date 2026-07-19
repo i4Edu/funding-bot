@@ -1,0 +1,266 @@
+{% extends "base.html" %}
+
+{% block title %}Translation Review Dashboard{% endblock %}
+
+{% block nav_links %}
+        <a class="nav-link app-nav-link" href="{{ url_for('dashboard') }}">Dashboard</a>
+        <a class="nav-link app-nav-link" href="{{ url_for('settings_page') }}">Settings</a>
+        <a class="nav-link app-nav-link" href="{{ url_for('dashboard_tasks') }}">My Tasks</a>
+{% endblock %}
+
+{% block main_content %}
+      <div class="d-flex justify-content-between align-items-start mb-4 rtl-row-reverse">
+        <div>
+          <h1 class="h3 mb-1">Translation Review</h1>
+          <p class="text-muted mb-1">
+            Submit locale copy updates, then approve or reject them from a shared review queue.
+          </p>
+          <p class="small text-muted mb-0">
+            Preview locale:
+            <span class="badge text-bg-light text-dark locale-chip">{{ ui_locale.code }} · {{ ui_locale.direction }}</span>
+            {% if ui_locale.is_rtl %}
+            <span class="badge text-bg-info">RTL preview active</span>
+            {% endif %}
+          </p>
+        </div>
+      </div>
+
+      <div class="row g-4 mb-4" role="region" aria-label="Translation review metrics">
+        <div class="col-md-4">
+          <div class="card border-0 shadow-sm h-100">
+            <div class="card-body">
+              <h2 class="h6 text-muted">Pending</h2>
+              <p class="display-6 mb-0">{{ review_counts.pending }}</p>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <div class="card border-0 shadow-sm h-100">
+            <div class="card-body">
+              <h2 class="h6 text-muted">Approved</h2>
+              <p class="display-6 mb-0">{{ review_counts.approved }}</p>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-4">
+          <div class="card border-0 shadow-sm h-100">
+            <div class="card-body">
+              <h2 class="h6 text-muted">Rejected</h2>
+              <p class="display-6 mb-0">{{ review_counts.rejected }}</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="row g-4">
+        <div class="col-lg-4">
+          <div class="card border-0 shadow-sm mb-4">
+            <div class="card-header bg-white"><h2 class="h5 mb-0">Supported Locales</h2></div>
+            <div class="card-body">
+              <ul class="list-group list-group-flush rtl-safe">
+                {% for locale in supported_locales %}
+                <li class="list-group-item px-0 d-flex justify-content-between align-items-center">
+                  <span>
+                    <strong>{{ locale.display_name }}</strong>
+                    <span class="text-muted">({{ locale.native_name }})</span>
+                  </span>
+                  <span class="badge {{ 'text-bg-dark' if locale.is_rtl else 'text-bg-secondary' }}">{{ locale.direction }}</span>
+                </li>
+                {% endfor %}
+              </ul>
+            </div>
+          </div>
+
+          <div class="card border-0 shadow-sm">
+            <div class="card-header bg-white"><h2 class="h5 mb-0">Submit Translation</h2></div>
+            <div class="card-body">
+              <form id="translation-form" class="rtl-safe">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token() if csrf_token is defined else '' }}">
+                <div class="mb-3">
+                  <label class="form-label" for="translation-locale">Locale</label>
+                  <select id="translation-locale" name="locale" class="form-select">
+                    {% for locale in supported_locales %}
+                    <option value="{{ locale.code }}" {{ "selected" if locale.code == selected_review_locale else "" }}>
+                      {{ locale.display_name }} ({{ locale.code }})
+                    </option>
+                    {% endfor %}
+                  </select>
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="translation-key">Translation key</label>
+                  <input id="translation-key" name="translation_key" class="form-control" placeholder="outreach.default.subject">
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="source-text">Source text</label>
+                  <textarea id="source-text" name="source_text" class="form-control" rows="3" placeholder="Thank you for supporting {organization_name}"></textarea>
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="translated-text">Translated text</label>
+                  <textarea id="translated-text" name="translated_text" class="form-control" rows="3" placeholder="Localized copy goes here"></textarea>
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="submitter-notes">Submitter notes</label>
+                  <textarea id="submitter-notes" name="submitter_notes" class="form-control" rows="2" placeholder="Optional reviewer context"></textarea>
+                </div>
+                <button type="submit" class="btn btn-success" {{ "disabled" if current_role not in ("staff", "admin") }}>Queue for review</button>
+              </form>
+              <div id="translation-result" class="small mt-2"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="col-lg-8">
+          <div class="card border-0 shadow-sm mb-4">
+            <div class="card-header bg-white">
+              <div class="d-flex justify-content-between align-items-center rtl-row-reverse">
+                <h2 class="h5 mb-0">Review Queue</h2>
+                <form method="get" class="row g-2 align-items-end rtl-safe">
+                  <div class="col-auto">
+                    <label class="form-label small mb-1" for="page-locale">Preview locale</label>
+                    <select id="page-locale" name="locale" class="form-select form-select-sm">
+                      {% for locale in supported_locales %}
+                      <option value="{{ locale.code }}" {{ "selected" if locale.code == ui_locale.code else "" }}>{{ locale.code }}</option>
+                      {% endfor %}
+                    </select>
+                  </div>
+                  <div class="col-auto">
+                    <label class="form-label small mb-1" for="filter-status">Status</label>
+                    <select id="filter-status" name="status" class="form-select form-select-sm">
+                      <option value="">All</option>
+                      {% for status in ["pending", "approved", "rejected"] %}
+                      <option value="{{ status }}" {{ "selected" if status == selected_status else "" }}>{{ status.title() }}</option>
+                      {% endfor %}
+                    </select>
+                  </div>
+                  <div class="col-auto">
+                    <label class="form-label small mb-1" for="filter-review-locale">Review locale</label>
+                    <select id="filter-review-locale" name="review_locale" class="form-select form-select-sm">
+                      <option value="">All</option>
+                      {% for locale in supported_locales %}
+                      <option value="{{ locale.code }}" {{ "selected" if locale.code == selected_review_locale else "" }}>{{ locale.code }}</option>
+                      {% endfor %}
+                    </select>
+                  </div>
+                  <div class="col-auto">
+                    <button type="submit" class="btn btn-outline-secondary btn-sm">Apply</button>
+                  </div>
+                </form>
+              </div>
+            </div>
+            <div class="card-body p-0">
+              <div class="table-responsive">
+                <table class="table table-hover align-middle mb-0 rtl-safe">
+                  <thead class="table-light">
+                    <tr>
+                      <th scope="col">Locale</th>
+                      <th scope="col">Key</th>
+                      <th scope="col">Translation</th>
+                      <th scope="col">Status</th>
+                      <th scope="col">Review</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {% for review in reviews %}
+                    <tr>
+                      <td>
+                        <div class="fw-semibold">{{ review.locale_metadata.display_name }}</div>
+                        <div class="small text-muted">{{ review.locale }}</div>
+                      </td>
+                      <td>
+                        <code>{{ review.translation_key }}</code>
+                        <div class="small text-muted">{{ review.created_at }}</div>
+                      </td>
+                      <td class="rtl-safe">
+                        <div class="small text-muted mb-1">Source: {{ review.source_text }}</div>
+                        <div>{{ review.translated_text }}</div>
+                        {% if review.submitter_notes %}
+                        <div class="small text-muted mt-1">Notes: {{ review.submitter_notes }}</div>
+                        {% endif %}
+                      </td>
+                      <td>
+                        <span class="badge {{ 'text-bg-warning' if review.status == 'pending' else 'text-bg-success' if review.status == 'approved' else 'text-bg-danger' }}">
+                          {{ review.status.title() }}
+                        </span>
+                        {% if review.reviewed_by_role %}
+                        <div class="small text-muted mt-1">{{ review.reviewed_by_role }} · {{ review.reviewed_at }}</div>
+                        {% endif %}
+                      </td>
+                      <td>
+                        {% if current_role in ("staff", "admin") %}
+                        <form class="decision-form rtl-safe" data-review-id="{{ review.id }}">
+                          <input type="hidden" name="csrf_token" value="{{ csrf_token() if csrf_token is defined else '' }}">
+                          <div class="mb-2">
+                            <select class="form-select form-select-sm" name="status" aria-label="Review decision" {{ "disabled" if review.status != "pending" }}>
+                              <option value="approved">Approve</option>
+                              <option value="rejected">Reject</option>
+                            </select>
+                          </div>
+                          <div class="mb-2">
+                            <textarea class="form-control form-control-sm" name="reviewer_notes" rows="2" placeholder="Optional reviewer notes" aria-label="Reviewer notes" {{ "disabled" if review.status != "pending" }}></textarea>
+                          </div>
+                          <button type="submit" class="btn btn-sm btn-outline-primary" {{ "disabled" if review.status != "pending" }}>Save</button>
+                        </form>
+                        {% else %}
+                        <span class="text-muted small">Read-only</span>
+                        {% endif %}
+                      </td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                      <td colspan="5" class="text-center text-muted py-4">No translation reviews matched the current filters.</td>
+                    </tr>
+                    {% endfor %}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+{% endblock %}
+
+{% block scripts %}
+    <script>
+      const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || "";
+
+      async function postJson(url, body) {
+        const response = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-CSRF-Token": csrfToken },
+          body: JSON.stringify(body),
+        });
+        const data = await response.json();
+        return { ok: response.ok, data };
+      }
+
+      const translationForm = document.getElementById("translation-form");
+      if (translationForm) {
+        translationForm.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const form = new FormData(event.target);
+          const payload = Object.fromEntries(form.entries());
+          const { ok, data } = await postJson("/translations/reviews", payload);
+          document.getElementById("translation-result").textContent = ok
+            ? `Queued review #${data.id} (${data.status}).`
+            : `Error: ${data.error}`;
+          if (ok) {
+            window.location.reload();
+          }
+        });
+      }
+
+      document.querySelectorAll(".decision-form").forEach((form) => {
+        form.addEventListener("submit", async (event) => {
+          event.preventDefault();
+          const reviewId = event.target.dataset.reviewId;
+          const body = Object.fromEntries(new FormData(event.target).entries());
+          const { ok, data } = await postJson(`/translations/reviews/${reviewId}/decision`, body);
+          if (ok) {
+            window.location.reload();
+            return;
+          }
+          alert(`Error: ${data.error}`);
+        });
+      });
+    </script>
+{% endblock %}

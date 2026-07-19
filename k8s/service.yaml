@@ -1,4 +1,4 @@
-# Internal service exposing the Flask web process.
+# Stable ClusterIP service for the dashboard.
 apiVersion: v1
 kind: Service
 metadata:
@@ -6,6 +6,7 @@ metadata:
   namespace: funding-bot
   labels:
     app: funding-bot
+    component: web
 spec:
   type: ClusterIP
   selector:
@@ -13,5 +14,5 @@ spec:
     component: web
   ports:
     - name: http
-      port: 5000
+      port: 80
       targetPort: http

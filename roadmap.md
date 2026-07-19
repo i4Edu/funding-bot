@@ -17,7 +17,7 @@
 - **Personalized Outreach Templates** with engagement metrics ✅ (segment-aware templates + open/click/bounce analytics)
 - **Compliance Expansion** (encrypted storage, GDPR audit logs) ✅ (GDPR export/delete + monthly audit reports)
 - **Webhook/Status Polling** for live application updates ✅ (`poll_application_status`)
-- **Task Queue** (Celery/RQ) replacing cron — _still open, current scheduling remains cron/CLI-driven_
+- **Task Queue** replacing cron ✅ (Celery selected; Redis default broker with RabbitMQ support, cron retained only as a migration fallback)
 
 ---
 
@@ -43,14 +43,14 @@
 - **Horizontal Scaling** with container orchestration (Docker + Kubernetes) ✅ (`Dockerfile`, `docker-compose.yml`, `k8s/`)
 - **Monitoring** (Prometheus, Grafana dashboards) ✅ (`/metrics` endpoint)
 - **Resilience** with retry/backoff policies ✅ (`submit_application_via_browser` retries)
-- **Multi‑Language Outreach** (English + Bengali templates) — _still open_
+- **Multi‑Language Outreach** (English + Bengali templates) ✅ (`i18n/outreach_templates/` + donor locale-aware outreach selection)
 
 ---
 
 ### **v1.0.0 → Production‑Grade Release**
 - **Full Portal Ecosystem** with connectors + APIs — connectors ship with demo data by default; wiring real portal credentials/APIs per-deployment remains open
 - **Mature Donor CRM** integrated into bot memory ✅ (segmented donor records, preferences, opt-outs, communication history)
-- **Advanced Compliance** (WCAG accessibility, GDPR, ISO audits) — GDPR export/delete done; WCAG/ISO audits still open
+- **Advanced Compliance** (WCAG accessibility, GDPR, ISO audits) ✅ (accessibility status docs, ISO/GDPR checklists, retention policy config, and cleanup job now documented/implemented)
 - **Community Documentation** for staff onboarding ✅ (`README.md`, `docs/`)
 - **Automated Reporting** (daily, weekly, monthly summaries) ✅ (daily summary + monthly audit report; weekly cadence still open)
 
@@ -63,5 +63,4 @@
 - **Community Collaboration** across NGOs  
 
 ---
-
 

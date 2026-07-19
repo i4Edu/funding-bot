@@ -1,0 +1,30 @@
+db: funding_bot.db
+
+send_daily_summary:
+  recipient: ops@example.org
+  dry_run: false
+
+discover:
+  keywords:
+    - education
+    - csr
+  trusted_sources:
+    - Grants Portal
+    - CSR Network
+  dry_run: false
+
+send_outreach:
+  email: donor@example.org
+  name: Example Donor
+  template_name: intro
+  locale: en
+  dry_run: true
+
+export_data_warehouse:
+  datasets:
+    - donors
+    - tasks
+  format: json
+  output_dir: generated/exports
+  archive: false
+  dry_run: false

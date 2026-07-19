@@ -1,0 +1,13 @@
+{
+  "name": "funding-bot-accessibility-tests",
+  "private": true,
+  "scripts": {
+    "test:a11y": "node tests/accessibility/run_axe.mjs",
+    "test:e2e": "playwright test",
+    "test:e2e:headed": "playwright test --headed"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "4.12.1",
+    "playwright": "1.61.1"
+  }
+}

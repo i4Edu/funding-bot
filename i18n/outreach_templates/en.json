@@ -1,0 +1,19 @@
+{
+  "templates": {
+    "default": {
+      "subject": "Thank you for supporting {organization_name}",
+      "body": "Dear {donor_name},\n\nThank you for your continued interest in {organization_name}.",
+      "opt_out_notice": "To opt out of future outreach, visit {opt_out_url}."
+    },
+    "intro": {
+      "subject": "Support {organization_name}",
+      "body": "Hello {donor_name},\n\n{mission}",
+      "segments": {
+        "corporate": {
+          "subject": "Corporate partnership with {organization_name}",
+          "body": "Dear {donor_name},\n\nLet us discuss CSR support for {organization_name}."
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,48 @@
+[tool.black]
+line-length = 100
+target-version = ["py311", "py312"]
+extend-exclude = "tests/test_async_batching.py"
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip_gitignore = true
+src_paths = ["."]
+known_first_party = ["scripts", "tasks", "tests", "web"]
+skip_glob = ["tests/test_async_batching.py"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["."]
+extend-exclude = ["node_modules", "tests/test_async_batching.py"]
+
+[tool.ruff.lint]
+select = ["I", "DJ"]
+
+[tool.ruff.lint.per-file-ignores]
+"profiling/runner.py" = ["I001"]
+"tests/**/*.py" = ["DJ008"]
+
+[tool.mutmut]
+paths_to_mutate = ["web/app.py", "task_queue.py"]
+also_copy = [
+  "tests/",
+  "pytest.ini",
+  "funding_bot.py",
+  "cache_manager.py",
+  "cli_config.py",
+  "database.py",
+  "observability.py",
+  "warehouse_exports.py",
+  "celery_app.py",
+  "tasks/",
+  "web/",
+  "i18n/",
+  "migrations/",
+]
+do_not_mutate = ["tests/*.py", "tests/**/*.py"]
+tests_dir = [
+  "tests/test_mutation_baseline.py",
+]
+max_stack_depth = 8

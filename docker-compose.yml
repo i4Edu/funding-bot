@@ -7,6 +7,63 @@ services:
     command: ["python", "-m", "funding_bot", "send-daily-summary"]
     env_file:
       - .env
+    depends_on:
+      - jaeger
+    volumes:
+      - bot_data:/app/data
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: funding-bot:latest
+    profiles: ["queue"]
+    command:
+      [
+        "celery",
+        "-A",
+        "celery_app:celery_app",
+        "worker",
+        "--loglevel=info",
+        "--queues",
+        "funding-bot",
+      ]
+    env_file:
+      - .env
+    stop_signal: SIGTERM
+    stop_grace_period: 45s
+    depends_on:
+      - redis
+      - rabbitmq
+      - jaeger
+    volumes:
+      - bot_data:/app/data
+
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: funding-bot:latest
+    profiles: ["queue"]
+    command:
+      [
+        "celery",
+        "-A",
+        "celery_app:celery_app",
+        "flower",
+        "--port=5555",
+      ]
+    env_file:
+      - .env
+    environment:
+      FLOWER_BASIC_AUTH: ${FLOWER_BASIC_AUTH:-}
+    depends_on:
+      - redis
+      - rabbitmq
+      - worker
+      - jaeger
+    ports:
+      - "5555:5555"
     volumes:
       - bot_data:/app/data
 
@@ -32,10 +89,30 @@ services:
       - .env
     depends_on:
       - bot
+      - jaeger
     ports:
       - "5000:5000"
     volumes:
       - bot_data:/app/data
+
+  redis:
+    image: redis:7-alpine
+    profiles: ["queue"]
+    ports:
+      - "6379:6379"
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    profiles: ["queue"]
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.67.0
+    ports:
+      - "16686:16686"
+      - "4318:4318"
 
 volumes:
   bot_data:

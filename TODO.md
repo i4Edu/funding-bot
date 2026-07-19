@@ -204,14 +204,14 @@ _A prioritized backlog of 200 actionable tasks expanding on the open items in `r
 
 ### Task Queue & Scheduling
 
-21. [ ] Evaluate Celery vs RQ for the task queue replacing cron
-22. [ ] Add a Celery app configuration with Redis/RabbitMQ broker
+21. [x] Evaluate Celery vs RQ for the task queue replacing cron
+22. [x] Add a Celery app configuration with Redis/RabbitMQ broker
 23. [ ] Convert `discover` CLI command into an async Celery task
 24. [ ] Convert `send-outreach` CLI command into an async Celery task
 25. [ ] Convert daily summary generation into a scheduled Celery beat task
-26. [ ] Add task retry policies with exponential backoff for queue tasks
-27. [ ] Add a dead-letter queue for repeatedly failing tasks
-28. [ ] Add task result persistence for auditing task outcomes
+26. [x] Add task retry policies with exponential backoff for queue tasks
+27. [x] Add a dead-letter queue for repeatedly failing tasks
+28. [x] Add task result persistence for auditing task outcomes
 29. [ ] Add a Flower (or equivalent) dashboard for task queue monitoring
 30. [ ] Add graceful shutdown handling for in-flight queue tasks
 31. [ ] Add idempotency keys to prevent duplicate task execution
@@ -222,16 +222,16 @@ _A prioritized backlog of 200 actionable tasks expanding on the open items in `r
 
 ### Multi-Language Outreach
 
-36. [ ] Add Bengali translations for outreach email templates
-37. [ ] Add a template locale selection mechanism keyed by donor preference
+36. [x] Add Bengali translations for outreach email templates
+37. [x] Add a template locale selection mechanism keyed by donor preference
 38. [ ] Add fallback to English when a translation is missing
 39. [ ] Add locale-aware date/number formatting in generated documents
-40. [ ] Add a translation review workflow for staff to approve new locale content
-41. [ ] Add RTL-safe rendering checks for future Arabic/Urdu support
-42. [ ] Add locale field to donor profile schema
+40. [x] Add a translation review workflow for staff to approve new locale content
+41. [x] Add RTL-safe rendering checks for future Arabic/Urdu support
+42. [x] Add locale field to donor profile schema
 43. [ ] Add CLI option to preview outreach templates in a given locale
-44. [ ] Add automated tests validating all templates render for every supported locale
-45. [ ] Document the process for contributing new language templates
+44. [x] Add automated tests validating all templates render for every supported locale
+45. [x] Document the process for contributing new language templates
 
 ### Collaboration Tools
 

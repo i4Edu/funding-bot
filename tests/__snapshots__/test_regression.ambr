@@ -1,0 +1,142 @@
+# serializer version: 1
+# name: test_daily_summary_formatting_regression
+  dict({
+    'body': '''
+      To: lupael_i4e.team@example.org
+      
+      Hello Lupael I4E Team,
+      
+      Here is today’s funding activity summary:
+      
+      - New Opportunities Found: 1
+         • UNICEF CSR Grant – Pending
+      
+      - Applications Submitted: 1
+         • UNICEF CSR Grant – Pending
+      
+      - Donor Communications: 1 personalized emails sent
+         • No bounce or spam flags detected
+      
+      - Pending Applications: 1
+         • UNICEF CSR Grant – Pending (Awaiting confirmation)
+      
+      Best regards,
+      Nonprofit Funding Bot
+    ''',
+    'subject': 'Daily Nonprofit Funding Report – 2026-06-22',
+  })
+# ---
+# name: test_deduplication_results_snapshot
+  dict({
+    'first_run': list([
+      dict({
+        'category': 'Education',
+        'discovered_at': '2026-06-22T08:30:00+00:00',
+        'donor_name': 'UNICEF',
+        'portal_url': 'https://example.org/unicef',
+        'raw_data_json': '{"category": "Education", "donor_name": "UNICEF", "portal_url": "https://example.org/unicef", "source": "Grants Portal", "summary": "CSR funding for nonprofit education programs.", "tags": ["CSR funding", "education"], "title": "UNICEF CSR Grant"}',
+        'signature': '5bffc30ce9339d8edc144ec8082b8976be423c81866509d9295778a2612388ed',
+        'source': 'Grants Portal',
+        'status': 'new',
+        'summary': 'CSR funding for nonprofit education programs.',
+        'title': 'UNICEF CSR Grant',
+      }),
+      dict({
+        'category': 'STEM',
+        'discovered_at': '2026-06-22T08:30:00+00:00',
+        'donor_name': 'UNICEF',
+        'portal_url': 'https://example.org/stem-expansion',
+        'raw_data_json': '{"category": "STEM", "donor_name": "UNICEF", "portal_url": "https://example.org/stem-expansion", "source": "Grants Portal", "summary": "Education support for STEM classrooms and labs.", "tags": ["CSR funding", "education"], "title": "STEM Expansion Challenge"}',
+        'signature': 'c29a3b815c875e37aeac2626ba07fedf513cffeb7e6d6a8c29f7c4903821846c',
+        'source': 'Grants Portal',
+        'status': 'new',
+        'summary': 'Education support for STEM classrooms and labs.',
+        'title': 'STEM Expansion Challenge',
+      }),
+    ]),
+    'second_run': list([
+    ]),
+    'stored': list([
+      dict({
+        'category': 'Education',
+        'data_classification': 'public',
+        'discovered_at': '2026-06-22T08:30:00+00:00',
+        'donor_name': 'UNICEF',
+        'portal_url': 'https://example.org/unicef',
+        'raw_data_json': '{"category": "Education", "donor_name": "UNICEF", "portal_url": "https://example.org/unicef", "source": "Grants Portal", "summary": "CSR funding for nonprofit education programs.", "tags": ["CSR funding", "education"], "title": "UNICEF CSR Grant"}',
+        'signature': '5bffc30ce9339d8edc144ec8082b8976be423c81866509d9295778a2612388ed',
+        'source': 'Grants Portal',
+        'status': 'new',
+        'summary': 'CSR funding for nonprofit education programs.',
+        'title': 'UNICEF CSR Grant',
+      }),
+      dict({
+        'category': 'STEM',
+        'data_classification': 'public',
+        'discovered_at': '2026-06-22T08:30:00+00:00',
+        'donor_name': 'UNICEF',
+        'portal_url': 'https://example.org/stem-expansion',
+        'raw_data_json': '{"category": "STEM", "donor_name": "UNICEF", "portal_url": "https://example.org/stem-expansion", "source": "Grants Portal", "summary": "Education support for STEM classrooms and labs.", "tags": ["CSR funding", "education"], "title": "STEM Expansion Challenge"}',
+        'signature': 'c29a3b815c875e37aeac2626ba07fedf513cffeb7e6d6a8c29f7c4903821846c',
+        'source': 'Grants Portal',
+        'status': 'new',
+        'summary': 'Education support for STEM classrooms and labs.',
+        'title': 'STEM Expansion Challenge',
+      }),
+    ]),
+  })
+# ---
+# name: test_monthly_audit_report_empty_month_regression
+  dict({
+    'application_outcomes': dict({
+    }),
+    'audit_log_entries': dict({
+    }),
+    'gdpr_operations': dict({
+    }),
+    'generated_at': '<generated-at>',
+    'new_donors_registered': 0,
+    'opted_out_donors_total': 0,
+    'outreach_summary': dict({
+      'bounce_rate': 0.0,
+      'clicked': 0,
+      'opened': 0,
+      'top_engaged_donors': list([
+      ]),
+      'total_sent': 0,
+    }),
+    'period': '2026-01',
+    'report_type': 'monthly_compliance_audit',
+  })
+# ---
+# name: test_monthly_audit_report_leap_year_regression
+  dict({
+    'application_outcomes': dict({
+      'submitted': 1,
+    }),
+    'audit_log_entries': dict({
+    }),
+    'gdpr_operations': dict({
+    }),
+    'generated_at': '<generated-at>',
+    'new_donors_registered': 0,
+    'opted_out_donors_total': 0,
+    'outreach_summary': dict({
+      'bounce_rate': 0.0,
+      'clicked': 1,
+      'opened': 1,
+      'top_engaged_donors': list([
+        dict({
+          'clicked': 1,
+          'donor_email': 'leap@example.org',
+          'donor_name': 'Leap Donor',
+          'opened': 1,
+          'total_events': 3,
+        }),
+      ]),
+      'total_sent': 1,
+    }),
+    'period': '2024-02',
+    'report_type': 'monthly_compliance_audit',
+  })
+# ---

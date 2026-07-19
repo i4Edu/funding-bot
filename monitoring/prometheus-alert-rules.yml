@@ -1,0 +1,81 @@
+groups:
+  - name: funding-bot-database
+    interval: 30s
+    rules:
+      - alert: FundingBotDatabaseQueryErrorRateHigh
+        expr: |
+          (
+            sum(rate(funding_bot_db_queries_total{statement="all",status=~"error|timeout"}[5m]))
+            /
+            clamp_min(sum(rate(funding_bot_db_queries_total{statement="all"}[5m])), 0.001)
+          ) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          team: funding-bot
+          service: funding-bot
+        annotations:
+          summary: Funding Bot database query error rate is elevated
+          description: More than 5% of database queries are failing or timing out over the last 10 minutes.
+      - alert: FundingBotDatabaseSlowQueryRateHigh
+        expr: |
+          (
+            rate(funding_bot_db_slow_queries_total{statement="all"}[10m])
+            /
+            clamp_min(sum(rate(funding_bot_db_queries_total{statement="all"}[10m])), 0.001)
+          ) > 0.20
+        for: 15m
+        labels:
+          severity: warning
+          team: funding-bot
+          service: funding-bot
+        annotations:
+          summary: Funding Bot slow query rate is elevated
+          description: More than 20% of database queries exceeded the configured slow-query threshold for 15 minutes.
+      - alert: FundingBotDatabaseQueryTimeoutsDetected
+        expr: increase(funding_bot_db_query_timeouts_total{statement="all"}[10m]) > 0
+        for: 5m
+        labels:
+          severity: critical
+          team: funding-bot
+          service: funding-bot
+        annotations:
+          summary: Funding Bot database query timeouts detected
+          description: At least one database query timed out or hit a lock timeout in the last 10 minutes.
+      - alert: FundingBotDatabaseP95LatencyHigh
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (rate(funding_bot_db_query_duration_seconds_bucket{statement!="all"}[10m]))
+          ) > 0.75
+        for: 15m
+        labels:
+          severity: warning
+          team: funding-bot
+          service: funding-bot
+        annotations:
+          summary: Funding Bot database p95 latency is high
+          description: The 95th percentile database query latency has been above 750ms for 15 minutes.
+  - name: funding-bot-platform
+    interval: 30s
+    rules:
+      - alert: FundingBotQueueHealthDegraded
+        expr: funding_bot_queue_health_status == 0
+        for: 5m
+        labels:
+          severity: critical
+          team: funding-bot
+          service: funding-bot
+        annotations:
+          summary: Funding Bot queue health is degraded
+          description: Queue health has remained degraded or disabled for at least 5 minutes.
+      - alert: FundingBotDatabasePoolSaturation
+        expr: funding_bot_db_pool_checked_out / clamp_min(funding_bot_db_pool_size, 1) > 0.8
+        for: 10m
+        labels:
+          severity: warning
+          team: funding-bot
+          service: funding-bot
+        annotations:
+          summary: Funding Bot database pool is near saturation
+          description: More than 80% of pooled database connections are checked out for 10 minutes.
