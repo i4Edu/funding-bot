@@ -201,16 +201,26 @@ class WarehouseExportService:
         normalized_datasets = normalize_datasets(datasets)
         normalized_format = normalize_export_format(export_format)
         safe_base = Path(DEFAULT_EXPORT_OUTPUT_DIR).resolve()
-        requested_output = Path(output_dir) if output_dir else Path(".")
-        if requested_output.is_absolute():
-            requested_output = Path(*requested_output.parts[1:])
+        if output_dir:
+            # Sanitize each path component: reject any traversal segments
+            sanitized_parts = [
+                os.path.basename(part)
+                for part in Path(output_dir).parts
+                if part not in ("/", "\\")
+            ]
+            sanitized_parts = [p for p in sanitized_parts if p and p != ".."]
+            if not sanitized_parts:
+                raise ValueError(
+                    "output_dir contains only invalid path components."
+                )
+            requested_output = Path(*sanitized_parts)
+        else:
+            requested_output = Path(".")
         export_root = (safe_base / requested_output).resolve()
-        try:
-            export_root.relative_to(safe_base)
-        except ValueError as exc:
+        if not str(export_root).startswith(str(safe_base)):
             raise ValueError(
-                f"output_dir {str(output_dir)!r} resolves outside the allowed export directory."
-            ) from exc
+                "output_dir resolves outside the allowed export directory."
+            )
         exported_at = self.bot._to_iso()
         archive_manager = archive_manager or ArchiveManager.from_env()
         artifacts: list[dict[str, Any]] = []
