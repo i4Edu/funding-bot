@@ -136,10 +136,23 @@ class ArchiveManager:
         self, path: str | Path, *, archive_name: str | None = None
     ) -> list[dict[str, Any]]:
         source = Path(path)
-        name = archive_name or source.name
+        # Strip directory components to prevent path traversal attacks
+        name = Path(archive_name if archive_name is not None else source.name).name
+        if not name:
+            raise ValueError(
+                f"archive_name {archive_name!r} resolves to an empty filename after "
+                "stripping path components."
+            )
         archived_locations: list[dict[str, Any]] = []
         if self.cold_storage_dir is not None:
             target = self.cold_storage_dir / name
+            # Defense-in-depth: verify target stays within cold_storage_dir
+            try:
+                target.resolve().relative_to(self.cold_storage_dir.resolve())
+            except ValueError as exc:
+                raise ValueError(
+                    f"Archive name {name!r} would escape the archive directory."
+                ) from exc
             target.parent.mkdir(parents=True, exist_ok=True)
             if source.resolve() != target.resolve():
                 shutil.copy2(source, target)
@@ -156,13 +169,20 @@ class ArchiveManager:
         *,
         archive_name: str,
     ) -> dict[str, Any]:
+        # Strip directory components to prevent path traversal attacks
+        safe_name = Path(archive_name).name
+        if not safe_name:
+            raise ValueError(
+                f"archive_name {archive_name!r} resolves to an empty filename after "
+                "stripping path components."
+            )
         target_root = self.cold_storage_dir or DEFAULT_ARCHIVE_DIR
-        target_path = Path(target_root) / archive_name
+        target_path = Path(target_root) / safe_name
         target_path.parent.mkdir(parents=True, exist_ok=True)
         target_path.write_text(
             json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8"
         )
-        locations = self.archive_file(target_path, archive_name=archive_name)
+        locations = self.archive_file(target_path, archive_name=safe_name)
         return {
             "path": str(target_path),
             "locations": locations,
@@ -187,6 +207,11 @@ class WarehouseExportService:
         normalized_datasets = normalize_datasets(datasets)
         normalized_format = normalize_export_format(export_format)
         export_root = Path(output_dir or DEFAULT_EXPORT_OUTPUT_DIR)
+        # Prevent path traversal: reject paths containing '..' components
+        if ".." in export_root.parts:
+            raise ValueError(
+                f"output_dir {str(output_dir)!r} must not contain '..' path components."
+            )
         exported_at = self.bot._to_iso()
         archive_manager = archive_manager or ArchiveManager.from_env()
         artifacts: list[dict[str, Any]] = []
