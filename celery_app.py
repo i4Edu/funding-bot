@@ -25,6 +25,7 @@ def get_celery_config() -> dict[str, Any]:
         "task_always_eager": config.task_always_eager,
         "task_default_queue": config.queue_name,
         "imports": ("tasks.celery_tasks",),
+        "beat_schedule": celery_app.conf.beat_schedule,
     }
 
 

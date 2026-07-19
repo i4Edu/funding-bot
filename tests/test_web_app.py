@@ -418,7 +418,7 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn(b"Prepare proposal", response.data)
         self.assertNotIn(b"Check audit trail", response.data)
         self.assertIn(b"Task Board", response.data)
-        self.assertIn(b"Pending", response.data)
+        self.assertIn(b"Todo", response.data)
         self.assertIn(b"In Progress", response.data)
         self.assertIn(b"Overdue", response.data)
 
@@ -426,27 +426,27 @@ class SettingsPanelTests(unittest.TestCase):
         bot = FundingBot(db_path=str(self.db_path))
         tasks = [
             bot.create_task(
-                title="Staff pending soon",
+                title="Staff todo soon",
                 assigned_to="staff",
-                status="pending",
+                status="todo",
                 due_date="2026-07-20",
             ),
             bot.create_task(
                 title="Staff in progress late",
                 assigned_to="staff",
-                status="in_progress",
+                status="in-progress",
                 due_date="2026-07-25",
             ),
             bot.create_task(
-                title="Admin pending mid",
+                title="Admin todo mid",
                 assigned_to="admin",
-                status="pending",
+                status="todo",
                 due_date="2026-07-22",
             ),
             bot.create_task(
-                title="Auditor completed early",
+                title="Auditor done early",
                 assigned_to="auditor",
-                status="completed",
+                status="done",
                 due_date="2026-07-18",
             ),
             bot.create_task(
@@ -463,7 +463,7 @@ class SettingsPanelTests(unittest.TestCase):
         tasks = self._seed_task_filter_data()
         filter_values = {
             "assignee": "staff",
-            "status": "pending",
+            "status": "todo",
             "due_date_after": "2026-07-20",
             "due_date_before": "2026-07-22",
         }
@@ -507,23 +507,23 @@ class SettingsPanelTests(unittest.TestCase):
         self._seed_task_filter_data()
         expected_orders = {
             "assignee": [
-                "Admin pending mid",
+                "Admin todo mid",
                 "Admin blocked latest",
-                "Auditor completed early",
-                "Staff pending soon",
+                "Auditor done early",
+                "Staff todo soon",
                 "Staff in progress late",
             ],
             "status": [
                 "Admin blocked latest",
-                "Auditor completed early",
+                "Auditor done early",
                 "Staff in progress late",
-                "Staff pending soon",
-                "Admin pending mid",
+                "Staff todo soon",
+                "Admin todo mid",
             ],
             "due_date": [
-                "Auditor completed early",
-                "Staff pending soon",
-                "Admin pending mid",
+                "Auditor done early",
+                "Staff todo soon",
+                "Admin todo mid",
                 "Staff in progress late",
                 "Admin blocked latest",
             ],
@@ -539,7 +539,7 @@ class SettingsPanelTests(unittest.TestCase):
             "/dashboard/tasks",
             query_string={
                 "assignee": "admin",
-                "status": "pending",
+                "status": "todo",
                 "due_date_after": "2026-07-20",
                 "due_date_before": "2026-07-22",
                 "sort": "due_date",
@@ -548,9 +548,9 @@ class SettingsPanelTests(unittest.TestCase):
         )
 
         self.assertEqual(200, response.status_code)
-        self.assertIn(b"Admin pending mid", response.data)
-        self.assertNotIn(b"Staff pending soon", response.data)
-        self.assertIn(b'value="pending" selected', response.data)
+        self.assertIn(b"Admin todo mid", response.data)
+        self.assertNotIn(b"Staff todo soon", response.data)
+        self.assertIn(b'value="todo" selected', response.data)
         self.assertIn(b'value="2026-07-20"', response.data)
         self.assertIn(b'value="2026-07-22"', response.data)
 
@@ -583,8 +583,8 @@ class SettingsPanelTests(unittest.TestCase):
         )
         self.assertEqual(200, valid.status_code)
         payload = valid.get_json()
-        self.assertEqual("in_progress", payload["task"]["status"])
-        self.assertIn("moved from pending to in_progress", payload["notification"])
+        self.assertEqual("in-progress", payload["task"]["status"])
+        self.assertIn("moved from todo to in-progress", payload["notification"])
 
     def test_task_assignment_route_requires_admin(self):
         bot = FundingBot(db_path=str(self.db_path))
@@ -828,7 +828,7 @@ class SettingsPanelTests(unittest.TestCase):
 
         class _FakeConnection:
             def execute(self, query: str) -> _FakeCursor:
-                if "GROUP BY assigned_to" in query:
+                if "GROUP BY assignee" in query:
                     return _FakeCursor(rows=[])
                 return _FakeCursor(one=0)
 
@@ -939,6 +939,109 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn(b'dir="rtl"', response.data)
         self.assertIn(b"RTL preview active", response.data)
         self.assertIn(b"Translation Review", response.data)
+
+
+class TaskApiRequirementRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.db_path = Path(".test_web_task_api.db")
+        if self.db_path.exists():
+            self.db_path.unlink()
+        os.environ["BOT_DB_PATH"] = str(self.db_path)
+        app.config["TESTING"] = True
+        self.client = app.test_client()
+        self.admin_headers = _auth_header("admin", "admin-secret")
+        self.staff_headers = _auth_header("staff", "staff-secret")
+        self.auditor_headers = _auth_header("auditor", "auditor-secret")
+
+    def tearDown(self):
+        if self.db_path.exists():
+            self.db_path.unlink()
+        os.environ.pop("BOT_DB_PATH", None)
+
+    def test_post_tasks_requires_admin(self):
+        response = self.client.post(
+            "/tasks",
+            json={
+                "title": "Write summary",
+                "description": "Draft a concise summary",
+                "assignee": "staff",
+                "status": "pending",
+                "due_date": "2026-07-30",
+            },
+            headers=self.staff_headers,
+        )
+        self.assertEqual(403, response.status_code)
+
+    def test_admin_can_create_list_and_update_tasks(self):
+        created = self.client.post(
+            "/tasks",
+            json={
+                "title": "Write summary",
+                "description": "Draft a concise summary",
+                "assignee": "staff",
+                "status": "pending",
+                "due_date": "2026-07-30",
+            },
+            headers=self.admin_headers,
+        )
+        self.assertEqual(201, created.status_code)
+        task_id = created.get_json()["task"]["id"]
+
+        second = self.client.post(
+            "/tasks",
+            json={
+                "title": "Review budget",
+                "description": "Review finance notes",
+                "assignee": "staff",
+                "status": "pending",
+                "due_date": "2026-07-25",
+            },
+            headers=self.admin_headers,
+        )
+        self.assertEqual(201, second.status_code)
+
+        listed = self.client.get(
+            "/tasks",
+            query_string={
+                "assignee": "staff",
+                "status": "pending",
+                "sort_by": "due_date",
+                "sort_order": "asc",
+            },
+            headers=self.staff_headers,
+        )
+        self.assertEqual(200, listed.status_code)
+        self.assertEqual(["Review budget", "Write summary"], [row["title"] for row in listed.get_json()])
+
+        updated = self.client.put(
+            f"/tasks/{task_id}",
+            json={"status": "blocked", "assignee": "auditor", "due_date": "2026-07-31"},
+            headers=self.admin_headers,
+        )
+        self.assertEqual(200, updated.status_code)
+        payload = updated.get_json()["task"]
+        self.assertEqual("blocked", payload["status"])
+        self.assertEqual("auditor", payload["assignee"])
+        self.assertEqual("2026-07-31", payload["due_date"])
+
+    def test_put_tasks_requires_admin(self):
+        bot = FundingBot(db_path=str(self.db_path))
+        try:
+            task = bot.create_task(
+                title="Prepare checklist",
+                assignee="staff",
+                description="Initial draft",
+                due_date="2026-07-24",
+            )
+        finally:
+            bot.close()
+
+        response = self.client.put(
+            f"/tasks/{task['id']}",
+            json={"status": "blocked"},
+            headers=self.auditor_headers,
+        )
+        self.assertEqual(403, response.status_code)
 
 
 if __name__ == "__main__":

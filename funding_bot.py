@@ -1108,12 +1108,11 @@ class _BasePortalConnector:
         return OAuth2ClientCredentialsVault(credential_vault or EnvVarVault())
 
     def _get_resolved_credentials(self) -> dict[str, Any]:
-        resolved: dict[str, Any] = {}
-        if self.credential_name:
-            resolved = dict(self._credential_vault.resolve_credentials(self.credential_name))
         if self.credentials:
-            resolved.update(self.credentials)
-        return resolved
+            return dict(self.credentials)
+        if self.credential_name:
+            return dict(self._credential_vault.resolve_credentials(self.credential_name))
+        return {}
 
     def _get_request_session(self) -> Any:
         if self._request_session is None:
@@ -1557,11 +1556,12 @@ class _BasePortalConnector:
         headers: dict[str, str] | None = None,
     ) -> Any:
         self._throttle_remote_request()
+        resolved_credentials = self._get_resolved_credentials()
         if self.http_client is not None:
             attempts = (
-                lambda: self.http_client(url, params, self.credentials, headers=headers or {}),
+                lambda: self.http_client(url, params, resolved_credentials, headers=headers or {}),
                 lambda: self.http_client(url, params, headers=headers or {}),
-                lambda: self.http_client(url, params, self.credentials),
+                lambda: self.http_client(url, params, resolved_credentials),
                 lambda: self.http_client(url, params),
             )
             for attempt in attempts:
@@ -1800,7 +1800,9 @@ class GrantsPortalConnector(_BasePortalConnector):
             http_client,
             base_url=base_url or os.environ.get("GRANTS_GOV_API_BASE_URL") or self.base_url,
             credentials=credentials,
-            credential_name=credential_name or "GRANTS_GOV_API_CREDENTIALS",
+            credential_name=(
+                credential_name if credential_name is not None else "GRANTS_GOV_API_CREDENTIALS"
+            ),
             credential_vault=credential_vault,
             request_session=request_session,
             transport=transport,
@@ -1811,7 +1813,10 @@ class GrantsPortalConnector(_BasePortalConnector):
         if self.http_client is not None:
             return super()._fetch_remote_result(keywords)
 
-        credentials = self._get_resolved_credentials()
+        try:
+            credentials = self._get_resolved_credentials()
+        except CredentialNotFoundError:
+            credentials = {}
         keyword_query = " ".join(_normalize_text_list(keywords))
         payload: dict[str, Any] = {
             "keyword": keyword_query,
@@ -1868,6 +1873,7 @@ class GrantsPortalConnector(_BasePortalConnector):
                 [
                     row.get("oppStatus"),
                     row.get("agencyCode"),
+                    *keywords,
                     *(row.get("cfdaList", []) if isinstance(row.get("cfdaList"), list) else []),
                 ]
             )
@@ -1885,8 +1891,10 @@ class GrantsPortalConnector(_BasePortalConnector):
                         f"{donor_name} opportunity {opportunity_number or title} "
                         f"opens {open_date} and closes {close_date}."
                     ),
-                    "category": str(row.get("docType", "Government Grant")).strip()
-                    or "Government Grant",
+                    "category": (
+                        str(row.get("docType", "")).strip()
+                        or (keywords[0].title() if keywords else "Government Grant")
+                    ),
                     "tags": tags,
                 }
             )
@@ -1951,7 +1959,9 @@ class CSRNetworkConnector(_BasePortalConnector):
             http_client,
             base_url=base_url or os.environ.get("CSR_NETWORK_API_BASE_URL") or self.base_url,
             credentials=credentials,
-            credential_name=credential_name or "CSR_NETWORK_API_CREDENTIALS",
+            credential_name=(
+                credential_name if credential_name is not None else "CSR_NETWORK_API_CREDENTIALS"
+            ),
             credential_vault=credential_vault,
             request_session=request_session,
             transport=transport,
@@ -2017,7 +2027,12 @@ class CSRNetworkConnector(_BasePortalConnector):
             eligibility = _normalize_text_list(row.get("eligibility"))
             row_tags = row.get("tags", [])
             tags = _normalize_text_list(
-                [*program_areas, *eligibility, *(row_tags if isinstance(row_tags, list) else [row_tags])]
+                [
+                    *program_areas,
+                    *eligibility,
+                    *keywords,
+                    *(row_tags if isinstance(row_tags, list) else [row_tags]),
+                ]
             )
             category = (
                 str(row.get("category", "")).strip()
@@ -2199,7 +2214,8 @@ class FoundationDirectoryConnector(_BasePortalConnector):
     }
 
     def _fetch_remote_result(self, keywords: list[str]) -> dict[str, Any]:
-        api_key = str(self.credentials.get("api_key") or self.credentials.get("secret") or "").strip()
+        credentials = self._get_resolved_credentials()
+        api_key = str(credentials.get("api_key") or credentials.get("secret") or "").strip()
         if not api_key:
             raise ConnectorConfigError(
                 "Foundation Directory live mode requires credentials containing 'api_key' "
@@ -2223,7 +2239,7 @@ class FoundationDirectoryConnector(_BasePortalConnector):
                     "sort_order": "desc",
                     "transaction": "TA",
                 },
-                headers={"x-api-key": api_key},
+                headers={"X-API-Key": api_key},
             )
             page_payload, _, page_response_keys, next_page = self._parse_remote_page(
                 response,
@@ -4309,8 +4325,15 @@ class FundingBot:
         return templates
 
     @classmethod
+    def list_supported_outreach_locales(cls) -> tuple[str, ...]:
+        return tuple(sorted(cls.SUPPORTED_TEMPLATE_LOCALES))
+
+    @classmethod
     def validate_outreach_template_catalogs(cls) -> None:
-        _validate_localized_outreach_templates(_load_localized_outreach_templates())
+        try:
+            _validate_localized_outreach_templates(_load_localized_outreach_templates())
+        except ValueError as exc:
+            raise FundingBotError(str(exc)) from exc
 
     @classmethod
     def list_catalog_outreach_templates(cls) -> tuple[str, ...]:

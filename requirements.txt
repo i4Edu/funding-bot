@@ -1,2 +1,1 @@
 -r web/requirements.txt
-celery==5.5.3

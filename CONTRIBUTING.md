@@ -49,7 +49,7 @@ Common contribution areas include:
 3. Install Python dependencies:
 
    ```bash
-   pip install -r web/requirements.txt
+   pip install -r requirements-dev.txt
    ```
 
 4. Optional: install accessibility test dependencies:
@@ -156,8 +156,11 @@ Run the smallest relevant existing test scope first, then widen if your change c
 python -m unittest tests.test_funding_bot -v
 python -m unittest tests.test_web_app -v
 python -m unittest tests.test_celery_tasks -v
+python -m unittest tests.test_signature_properties -v
 npm run test:a11y
 ```
+
+For dashboard concurrency validation, follow [docs/LOAD_TESTING.md](docs/LOAD_TESTING.md).
 
 Do not add new tooling solely for a contribution unless maintainers have agreed it is needed.
 

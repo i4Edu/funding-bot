@@ -240,13 +240,6 @@ class CollaborationApiTests(unittest.TestCase):
     def test_status_transition_route_enforces_assignment_permissions(self):
         task = self._seed_tasks()[0]
 
-        forbidden = self.client.post(
-            f"/tasks/{task['id']}/status",
-            json={"status": "in-progress"},
-            headers=self.auditor_headers,
-        )
-        self.assertEqual(403, forbidden.status_code)
-
         valid = self.client.post(
             f"/tasks/{task['id']}/status",
             json={"status": "in-progress"},
@@ -254,6 +247,13 @@ class CollaborationApiTests(unittest.TestCase):
         )
         self.assertEqual(200, valid.status_code)
         self.assertEqual("in-progress", valid.get_json()["task"]["status"])
+
+        forbidden = app.test_client().post(
+            f"/tasks/{task['id']}/status",
+            json={"status": "blocked"},
+            headers=self.auditor_headers,
+        )
+        self.assertEqual(403, forbidden.status_code)
 
     def test_task_sync_and_export_routes_round_trip(self):
         sync_response = self.client.post(

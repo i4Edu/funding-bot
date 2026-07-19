@@ -93,6 +93,10 @@ Recommended baseline resources per worker pod:
 
 Adjust based on connector latency, document generation volume, and SMTP throughput.
 
+## Pre-scale load testing
+
+Before increasing dashboard replicas or worker counts, run the concurrent admin-session dashboard load test documented in [LOAD_TESTING.md](LOAD_TESTING.md). Capture p95 latency and throughput from the generated Locust CSV/HTML artifacts so you can compare results before and after scaling changes.
+
 ## Health checks and monitoring
 
 ### Application health endpoints

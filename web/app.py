@@ -493,7 +493,7 @@ def _dashboard_context() -> dict[str, Any]:
         "pending_translation_reviews_count": pending_translation_reviews_count,
         "my_tasks_count": sum(my_task_counts.values()),
         "my_open_tasks_count": sum(
-            count for status, count in my_task_counts.items() if status != "completed"
+            count for status, count in my_task_counts.items() if status != "done"
         ),
         "overdue_tasks": overdue_tasks,
         "overdue_tasks_count": len(overdue_tasks),
@@ -1208,12 +1208,14 @@ def list_tasks_route() -> Response:
 def create_task_route() -> Response:
     payload = _get_request_json()
     title = str(payload.get("title", "")).strip()
-    assigned_to = str(payload.get("assignee", payload.get("assigned_to", ""))).strip()
+    assigned_to = str(payload.get("assignee", payload.get("assigned_to", ""))).strip().lower()
     due_date = payload.get("due_date")
     if not title:
         raise ValueError("Field 'title' is required.")
     if not assigned_to:
         raise ValueError("Field 'assignee' is required.")
+    if assigned_to not in ROLE_PASSWORD_ENV_VARS:
+        raise ValueError(f"Field 'assignee' must be one of {sorted(ROLE_PASSWORD_ENV_VARS)}.")
     if due_date in (None, ""):
         raise ValueError("Field 'due_date' is required.")
 
@@ -1238,11 +1240,14 @@ def update_task_route(task_id: int) -> Response:
     payload = _get_request_json()
     if not payload:
         raise ValueError("Request body must include at least one task field to update.")
+    assignee = payload.get("assignee", payload.get("assigned_to"))
+    if assignee not in (None, "") and str(assignee).strip().lower() not in ROLE_PASSWORD_ENV_VARS:
+        raise ValueError(f"Field 'assignee' must be one of {sorted(ROLE_PASSWORD_ENV_VARS)}.")
     task = _bot().update_task(
         task_id,
         title=payload.get("title"),
         description=payload.get("description"),
-        assignee=payload.get("assignee", payload.get("assigned_to")),
+        assignee=assignee,
         status=payload.get("status"),
         due_date=payload.get("due_date"),
     )
@@ -1306,9 +1311,13 @@ def import_tasks_route() -> Response:
 @require_role("admin")
 def assign_task_route(task_id: int) -> Response:
     payload = _get_request_json()
-    assigned_to = str(payload.get("assigned_to", "")).strip()
+    assigned_to = str(payload.get("assigned_to", "")).strip().lower()
     if not assigned_to:
         raise ValueError("Field 'assigned_to' is required.")
+    if assigned_to not in ROLE_PASSWORD_ENV_VARS:
+        raise ValueError(
+            f"Field 'assigned_to' must be one of {sorted(ROLE_PASSWORD_ENV_VARS)}."
+        )
     task = _bot().update_task_assignment(
         task_id,
         assigned_to=assigned_to,
@@ -1425,7 +1434,19 @@ def metrics() -> Response:
     tasks_total = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
     uptime_seconds = time.time() - _APP_START_TIME
     task_counts = bot.get_task_status_counts()
-    queue_metrics = bot.get_queue_metrics()
+    raw_queue_metrics = getattr(bot, "get_queue_metrics", lambda: {})()
+    queue_metrics = {
+        "running": 0,
+        "completed": 0,
+        "failed": 0,
+        "cancelled": 0,
+        "retry_attempts": 0,
+        "dead_letter": 0,
+        "duplicate_preventions": 0,
+    }
+    if isinstance(raw_queue_metrics, dict):
+        for key in queue_metrics:
+            queue_metrics[key] = int(raw_queue_metrics.get(key, 0) or 0)
     queue_health = _get_queue_health_snapshot()
     queue_status_value = 1 if queue_health["status"] == "ok" else 0
     task_assignments = conn.execute(

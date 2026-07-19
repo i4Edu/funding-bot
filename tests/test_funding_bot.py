@@ -351,10 +351,14 @@ class FundingBotTests(unittest.TestCase):
         self.assertTrue(overdue[0]["is_overdue"])
         self.assertFalse(overdue[1]["is_overdue"])
 
-    def test_reassign_task_updates_assignee(self):
+    def test_update_task_assignment_updates_assignee(self):
         task = self.bot.create_task(title="Coordinate reviewers", assigned_to="staff")
 
-        updated = self.bot.reassign_task(task["id"], assigned_to="admin", changed_by="admin")
+        updated = self.bot.update_task_assignment(
+            task["id"],
+            assigned_to="admin",
+            changed_by="admin",
+        )
 
         self.assertEqual("admin", updated["assigned_to"])
 
@@ -752,31 +756,31 @@ class TaskFilteringFundingBotTests(unittest.TestCase):
     def _task_filter_fixtures(self):
         return [
             self.bot.create_task(
-                title="Staff pending soon",
+                title="Staff todo soon",
                 assigned_to="staff",
-                status="pending",
+                status="todo",
                 due_date="2026-07-20",
             ),
             self.bot.create_task(
                 title="Staff in progress late",
                 assigned_to="staff",
-                status="in_progress",
+                status="in-progress",
                 due_date="2026-07-25",
             ),
             self.bot.create_task(
-                title="Admin pending mid",
+                title="Admin todo mid",
                 assigned_to="admin",
-                status="pending",
+                status="todo",
                 due_date="2026-07-22",
             ),
             self.bot.create_task(
-                title="Auditor completed early",
+                title="Auditor done early",
                 assigned_to="auditor",
-                status="completed",
+                status="done",
                 due_date="2026-07-18",
             ),
             self.bot.create_task(
-                title="Admin blocked no date",
+                title="Admin blocked latest",
                 assigned_to="admin",
                 status="blocked",
                 due_date="2026-08-01",
@@ -787,7 +791,7 @@ class TaskFilteringFundingBotTests(unittest.TestCase):
         tasks = self._task_filter_fixtures()
         filter_values = {
             "assigned_to": "staff",
-            "status": "pending",
+            "status": "todo",
             "due_date_after": "2026-07-20",
             "due_date_before": "2026-07-22",
         }
@@ -831,25 +835,25 @@ class TaskFilteringFundingBotTests(unittest.TestCase):
         self._task_filter_fixtures()
         expected_orders = {
             "assignee": [
-                "Admin pending mid",
-                "Admin blocked no date",
-                "Auditor completed early",
-                "Staff pending soon",
+                "Admin todo mid",
+                "Admin blocked latest",
+                "Auditor done early",
+                "Staff todo soon",
                 "Staff in progress late",
             ],
             "status": [
-                "Admin blocked no date",
-                "Auditor completed early",
+                "Admin blocked latest",
+                "Auditor done early",
                 "Staff in progress late",
-                "Staff pending soon",
-                "Admin pending mid",
+                "Staff todo soon",
+                "Admin todo mid",
             ],
             "due_date": [
-                "Auditor completed early",
-                "Staff pending soon",
-                "Admin pending mid",
+                "Auditor done early",
+                "Staff todo soon",
+                "Admin todo mid",
                 "Staff in progress late",
-                "Admin blocked no date",
+                "Admin blocked latest",
             ],
         }
         for sort_name, expected_titles in expected_orders.items():
@@ -1687,7 +1691,11 @@ class PortalConnectorTests(unittest.TestCase):
         self.assertIn("corporate giving", session.get_calls[0]["params"]["q"])
 
     def test_live_connectors_log_and_degrade_on_remote_errors(self):
-        connector = CSRNetworkConnector(transport="http", request_session=object())
+        connector = CSRNetworkConnector(
+            transport="http",
+            credentials={"subscription_key": ""},
+            request_session=object(),
+        )
 
         with self.assertLogs("funding_bot.CSRNetworkConnector", level="WARNING") as logs:
             result = connector.fetch_result(["csr"])
@@ -2238,7 +2246,10 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
                         template_name,
                         donor_email,
                         "Matrix Donor",
-                        context=self.outreach_context,
+                        context={
+                            **self.outreach_context,
+                            "opt_out_url": "https://i4edu.org/opt-out",
+                        },
                         sent_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
                     )
 
@@ -2254,20 +2265,17 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
                     self.assertNotIn("{organization_name}", result["body"])
 
     def test_validate_outreach_template_catalogs_rejects_missing_segment_translations(self):
-        original_loader = FundingBot._load_outreach_template_catalog
+        broken_catalog = json.loads(json.dumps(FundingBot._load_outreach_template_catalog("en")))
+        localized_catalog = {
+            template_name: {
+                "en": json.loads(json.dumps(template)),
+                "bn": json.loads(json.dumps(template)),
+            }
+            for template_name, template in broken_catalog.items()
+        }
+        localized_catalog["intro"]["bn"]["segments"] = {}
 
-        def fake_loader(locale):
-            templates = original_loader(locale)
-            if locale == "bn":
-                broken = {
-                    name: json.loads(json.dumps(template))
-                    for name, template in templates.items()
-                }
-                broken["intro"]["segments"] = {}
-                return broken
-            return templates
-
-        with unittest.mock.patch.object(FundingBot, "_load_outreach_template_catalog", side_effect=fake_loader):
+        with unittest.mock.patch("funding_bot._load_localized_outreach_templates", return_value=localized_catalog):
             with self.assertRaises(FundingBotError):
                 FundingBot.validate_outreach_template_catalogs()
 
@@ -3395,6 +3403,93 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
         self.assertEqual({"name": "i4Edu"}, settings["organization_profile"])
         self.assertIn("smtp", table_output)
         self.assertIn("SMTP_PASSWORD", table_output)
+
+
+class TaskApiRequirementTests(unittest.TestCase):
+    def setUp(self):
+        self.db_path = Path(".test_task_requirements.db")
+        if self.db_path.exists():
+            self.db_path.unlink()
+        self.bot = FundingBot(db_path=self.db_path)
+
+    def tearDown(self):
+        self.bot.close()
+        if self.db_path.exists():
+            self.db_path.unlink()
+
+    def test_task_model_supports_required_fields(self):
+        task = self.bot.create_task(
+            title="Draft budget narrative",
+            assignee="staff",
+            description="Prepare the first donor-ready draft.",
+            status="pending",
+            due_date="2026-07-31",
+        )
+
+        model = Task.from_row(
+            self.bot.connection.execute("SELECT * FROM tasks WHERE id = ?", (task["id"],)).fetchone()
+        )
+
+        self.assertIsNotNone(model)
+        self.assertEqual("Draft budget narrative", model.title)
+        self.assertEqual("staff", model.assignee)
+        self.assertEqual("2026-07-31", model.due_date)
+
+    def test_task_list_supports_filters_and_sorting(self):
+        self.bot.create_task(
+            title="Later staff task",
+            assignee="staff",
+            description="Later due date",
+            status="pending",
+            due_date="2026-08-02",
+        )
+        self.bot.create_task(
+            title="Earlier staff task",
+            assignee="staff",
+            description="Earlier due date",
+            status="pending",
+            due_date="2026-07-25",
+        )
+        self.bot.create_task(
+            title="Blocked admin task",
+            assignee="admin",
+            description="Blocked",
+            status="blocked",
+            due_date="2026-07-26",
+        )
+
+        rows = self.bot.list_tasks(
+            assignee="staff",
+            status="pending",
+            due_after="2026-07-24",
+            sort_by="due_date",
+            sort_order="asc",
+        )
+
+        self.assertEqual(["Earlier staff task", "Later staff task"], [row["title"] for row in rows])
+
+    def test_task_update_changes_required_fields(self):
+        task = self.bot.create_task(
+            title="Initial title",
+            assignee="staff",
+            description="Initial description",
+            status="pending",
+            due_date="2026-07-21",
+        )
+
+        updated = self.bot.update_task(
+            task["id"],
+            title="Updated title",
+            description="Updated description",
+            assignee="auditor",
+            status="blocked",
+            due_date="2026-07-22",
+        )
+
+        self.assertEqual("Updated title", updated["title"])
+        self.assertEqual("auditor", updated["assignee"])
+        self.assertEqual("blocked", updated["status"])
+        self.assertEqual("2026-07-22", updated["due_date"])
 
 
 if __name__ == "__main__":

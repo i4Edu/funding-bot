@@ -8,8 +8,11 @@ The Nonprofit Funding Bot helps staff discover funding opportunities, prevent du
 
 For planned milestones and release scope, see [roadmap.md](roadmap.md).
 For connector implementation and keyword-mapping guidance, see [docs/CONNECTORS.md](docs/CONNECTORS.md).
+For the full Flask endpoint reference, example requests, authentication rules, and error formats, see [docs/API.md](docs/API.md).
 For collaboration workflow, permissions, and task API examples, see [docs/COLLABORATION.md](docs/COLLABORATION.md).
 For deployment and scaling guidance, see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+For a fast local setup guide, see [docs/QUICKSTART.md](docs/QUICKSTART.md).
+For the complete environment variable reference, see [docs/ENV_VARS.md](docs/ENV_VARS.md).
 For contributor setup, pull request expectations, and code review standards, see [CONTRIBUTING.md](CONTRIBUTING.md).
 For vulnerability reporting, disclosure timelines, incident response, and the penetration-testing checklist, see [docs/SECURITY.md](docs/SECURITY.md).
 For the operational breach runbook, see [docs/INCIDENT_RESPONSE.md](docs/INCIDENT_RESPONSE.md).
@@ -216,6 +219,8 @@ Kubernetes (scaled)
 - configurable data residency enforcement and privacy policy generation
 
 ## Installation
+
+For the fastest local setup path, start with [docs/QUICKSTART.md](docs/QUICKSTART.md). For a full list of supported configuration values, see [docs/ENV_VARS.md](docs/ENV_VARS.md).
 
 The core bot uses the Python standard library plus Babel for locale-aware document formatting, and the web/task-queue stack uses Flask and Celery:
 
@@ -636,7 +641,8 @@ Use one of these usernames as the role name:
 | `/dashboard` | `GET` | `staff`, `admin`, `auditor` | HTML operations dashboard (WCAG 2.1 accessible). |
 | `/dashboard/tasks` | `GET` | `staff`, `admin`, `auditor` | HTML task dashboard with assignee, status, due-date filters and assignee/status/due-date sorting. |
 | `/tasks` | `GET` | `staff`, `admin`, `auditor` | List tasks as JSON with assignee, status, due-date filtering and assignee/status/due-date sorting. |
-| `/tasks` | `POST` | `admin` | Create a task with an assignee, optional due date, and initial workflow status. |
+| `/tasks` | `POST` | `admin` | Create a task with `title`, `description`, `assignee`, `status`, and `due_date`. |
+| `/tasks/<id>` | `PUT` | `admin` | Update a task's title, description, assignee, status, or due date. |
 | `/tasks/<id>` | `GET` | `staff`, `admin`, `auditor` | Fetch one task as JSON. Staff users are limited to their own lane. |
 | `/tasks/<id>/assign` | `POST` | `admin` | Assign or reassign a task to another dashboard role. |
 | `/api/tasks/export` | `GET` | `admin`, `auditor` | Export tasks for external tools with the same filters used by the task directory. |
@@ -739,9 +745,10 @@ Add a scrape target pointing to `http://<host>:5000/metrics` in your Prometheus 
 | --- | --- | --- |
 | `assignee` | `staff` | Filter to an exact assignee. Staff users are restricted to their own role. |
 | `status` | `in-progress` | Filter by task status. Accepted values: `todo`, `pending`, `in-progress`, `in_progress`, `done`, `completed`, `blocked`. |
-| `due_date_before` | `2026-07-31` | Include only tasks due on or before the given UTC date. |
-| `due_date_after` | `2026-07-01` | Include only tasks due on or after the given UTC date. |
+| `due_date_before` / `due_before` | `2026-07-31` | Include only tasks due on or before the given UTC date. |
+| `due_date_after` / `due_after` | `2026-07-01` | Include only tasks due on or after the given UTC date. |
 | `sort` | `due_date` | Sort results by `assignee`, `status`, or `due_date`. Prefix with `-` for descending order (for example `-due_date` or `-assignee`). Default: `updated_at`. |
+| `sort_by` + `sort_order` | `sort_by=due_date&sort_order=asc` | Alternative explicit sorting syntax for API clients. |
 
 Example:
 
