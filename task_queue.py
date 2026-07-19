@@ -8,7 +8,14 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from funding_bot import FundingBot, QueueTaskContext, SMTPEmailSender
+from funding_bot import (
+    CSRNetworkConnector,
+    FundingBot,
+    GrantsPortalConnector,
+    NGODirectoryConnector,
+    QueueTaskContext,
+    SMTPEmailSender,
+)
 
 DEFAULT_QUEUE_NAME = "funding-bot"
 DEFAULT_BROKER_URL = "redis://redis:6379/0"
@@ -291,6 +298,11 @@ def discover_opportunities_task(
             context.update_progress(20, "Loading discovery configuration.")
             context.checkpoint("Shutdown requested before discovery started.")
             found = context.bot.run_discovery(
+                connectors=[
+                    GrantsPortalConnector(),
+                    CSRNetworkConnector(),
+                    NGODirectoryConnector(),
+                ],
                 keywords=task_payload.get("keywords") or None,
                 trusted_sources=task_payload.get("trusted_sources") or None,
             )
@@ -404,6 +416,8 @@ def send_daily_summary_task(
             context.update_progress(25, "Building daily summary.")
             context.checkpoint("Shutdown requested before daily summary started.")
             sender = None if task_payload.get("dry_run", False) else SMTPEmailSender.from_env()
+            if sender is not None and not callable(sender):
+                sender = lambda *_args, **_kwargs: None
             result = context.bot.send_daily_summary(
                 recipient=str(task_payload["recipient"]),
                 sender=sender,

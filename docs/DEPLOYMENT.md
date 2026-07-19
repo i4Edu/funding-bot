@@ -25,6 +25,15 @@ Hybrid mode is the recommended migration step because it lets operators verify q
 | `CELERY_RESULT_BACKEND` | `redis://redis:6379/1` | Result backend for task metadata. |
 | `CELERY_QUEUE_NAME` | `funding-bot` | Queue consumed by workers. |
 | `CELERY_TASK_ALWAYS_EAGER` | `0` | Local/test-only inline execution toggle. |
+| `FUNDING_BOT_DB_POOL_SIZE` | `5` | Base SQLAlchemy connection pool size for the SQLite engine. |
+| `FUNDING_BOT_DB_MAX_OVERFLOW` | `10` | Extra burst connections allowed beyond the base pool size. |
+| `FUNDING_BOT_DB_POOL_TIMEOUT_SECONDS` | `30` | Wait time before pool checkout fails. |
+| `FUNDING_BOT_DB_POOL_RECYCLE_SECONDS` | `1800` | Connection recycle interval for long-lived workers/web processes. |
+| `FUNDING_BOT_CACHE_BACKEND` | `redis` | Cache backend (`redis` or `memory`). |
+| `FUNDING_BOT_CACHE_URL` | `redis://redis:6379/2` | Shared Redis DB for donor/connector/profile caches. |
+| `FUNDING_BOT_DONOR_CACHE_TTL_SECONDS` | `300` | TTL for donor-record cache entries. |
+| `FUNDING_BOT_CONNECTOR_CACHE_TTL_SECONDS` | `60` | TTL for connector-state cache entries. |
+| `FUNDING_BOT_DEDUPED_PROFILE_CACHE_TTL_SECONDS` | `600` | TTL for deduplicated profile cache entries. |
 | `ADMIN_PASSWORD` / `STAFF_PASSWORD` / `AUDITOR_PASSWORD` | `...` | Dashboard authentication. |
 | SMTP settings | `SMTP_HOST`, `SMTP_PORT`, etc. | Required for real email delivery. |
 
@@ -110,6 +119,8 @@ Before increasing dashboard replicas or worker counts, run the concurrent admin-
   - active task count
   - queue depth / pending tasks
   - whether legacy cron is still enabled
+- `GET /health/database` returns SQLAlchemy pool status, configured sizing, and lifecycle counters
+- `GET /health/cache` returns cache backend/reachability details
 
 Use `/health/queue` for worker-specific alerts and `/health` for general readiness/liveness checks.
 
@@ -130,12 +141,14 @@ Flower should be protected behind authentication or a private network boundary. 
 
 ### Metrics and alerts
 
-The `/metrics` endpoint exports queue metrics alongside app metrics. Alert on:
+The `/metrics` endpoint exports queue metrics alongside app metrics, SQLAlchemy pool counters, and cache hit/miss/set/invalidation metrics. Alert on:
 
 - queue health status dropping to `0`
 - worker count dropping below the expected replica count
 - queue depth growing continuously over multiple scrape intervals
 - active tasks staying high with no drop in pending depth
+- database pool checked-out connections remaining near the configured size
+- cache miss ratios jumping unexpectedly for donor/profile lookups
 
 ## Scaling strategy
 

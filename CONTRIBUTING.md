@@ -157,10 +157,25 @@ python -m unittest tests.test_funding_bot -v
 python -m unittest tests.test_web_app -v
 python -m unittest tests.test_celery_tasks -v
 python -m unittest tests.test_signature_properties -v
+pytest tests/test_smoke.py -m quick -q
+pytest tests/test_smoke.py -m smoke -q
 npm run test:a11y
 ```
 
 For dashboard concurrency validation, follow [docs/LOAD_TESTING.md](docs/LOAD_TESTING.md).
+
+For release-critical coverage, run the smoke suite with flaky detection before merging:
+
+```bash
+mkdir -p test-results
+pytest tests/test_smoke.py -m smoke -q --reruns 2 --reruns-delay 1 \
+  --flaky-report=test-results/flaky-report.json \
+  --flaky-report-markdown=test-results/flaky-report.md \
+  --test-reliability-metrics=test-results/test-reliability.prom
+```
+
+Review `test-results/flaky-report.md` for rerun-backed passes and track the emitted
+reliability metrics in CI artifacts.
 
 Do not add new tooling solely for a contribution unless maintainers have agreed it is needed.
 

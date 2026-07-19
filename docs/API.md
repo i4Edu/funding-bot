@@ -30,11 +30,14 @@ Authorization: Basic base64("<role>:<password>")
 
 After a successful authenticated request, Flask also establishes a secure session cookie so browser users can navigate dashboard pages without resending the header on every request.
 
+Session-backed browser requests that use that cookie must also include the CSRF token emitted in the `X-CSRF-Token` response header (and rendered in dashboard forms). JSON form submissions should echo the token in the `X-CSRF-Token` request header. Requests that continue to send an explicit Basic `Authorization` header are treated as machine/API requests and are not blocked by the CSRF middleware.
+
 ## Common request/response conventions
 
 - Request bodies are JSON objects unless noted otherwise.
 - Successful API responses are JSON except `GET /metrics`, which returns Prometheus text.
 - Timestamps use ISO 8601 strings.
+- Authenticated responses include rate-limit headers (`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`). When a limit is exceeded, the API returns `429` plus `Retry-After` and a JSON recovery payload.
 - Validation, permission, and domain errors use the shared format:
 
 ```json
@@ -55,8 +58,19 @@ After a successful authenticated request, Flask also establishes a secure sessio
 | `401` | Missing/invalid authentication (`WWW-Authenticate` header included) |
 | `403` | Authenticated but insufficient role or scope |
 | `404` | Resource not found |
+| `429` | Rate limit exceeded; retry after the time in `Retry-After` |
 | `500` | Unexpected server error |
 | `503` | Queue health degraded/unavailable (`GET /health/queue`) |
+
+## Rate limiting
+
+The dashboard uses Flask-Limiter with configurable per-endpoint policies:
+
+- **auth/UI routes** such as `/dashboard`, `/settings`, and `/translations`: `30 per minute` by default
+- **general API routes** such as `/tasks`, `/donors`, and `/feedback`: `120 per minute` by default
+- **export routes** such as `/api/tasks/export`: `10 per minute` by default
+
+Override them with `WEB_AUTH_RATE_LIMIT`, `WEB_API_RATE_LIMIT`, `WEB_EXPORT_RATE_LIMIT`, and optionally `WEB_RATE_LIMIT_STORAGE_URI`.
 
 ### Example Python setup
 

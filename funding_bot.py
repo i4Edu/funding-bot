@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import csv
 import hashlib
+import inspect
 import io
 import json
 import logging
@@ -18,6 +20,7 @@ import threading
 import time
 import urllib.parse
 import zipfile
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, fields
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -31,6 +34,10 @@ import requests
 from jsonschema import ValidationError, validate
 from cache_manager import CacheManager
 from database import DatabaseManager
+try:
+    import aiohttp
+except ImportError:  # pragma: no cover - async HTTP is optional in some envs
+    aiohttp = None
 try:
     import requests
     from requests import exceptions as requests_exceptions
@@ -9982,211 +9989,226 @@ def main(argv: list[str] | None = None) -> None:
 
     bot = FundingBot(db_path=args.db)
     try:
-        if args.command == "send-daily-summary":
-            from tasks.celery_tasks import send_daily_summary_task
+        try:
+            if args.command == "send-daily-summary":
+                from tasks.celery_tasks import send_daily_summary_task
 
-            payload = _cli_payload(
-                "send-daily-summary",
-                **_queue_async_task(
+                payload = _cli_payload(
                     "send-daily-summary",
-                    send_daily_summary_task,
-                    task_kwargs={
-                        "db_path": args.db,
-                        "recipient": args.recipient,
-                        "dry_run": args.dry_run,
-                    },
-                ),
-            )
-            if args.json_output:
-                _emit_cli_json(payload)
-            else:
-                _print_queued_task(payload, ready_renderer=_render_daily_summary_task_result_text)
-        elif args.command == "list-opportunities":
-            rows = bot.list_opportunities(status=args.status)
-            if args.limit is not None:
-                rows = rows[: args.limit]
-            columns = ["signature", "source", "donor_name", "title", "status", "discovered_at"]
-            payload = _cli_payload(
-                "list-opportunities",
-                count=len(rows),
-                columns=columns,
-                rows=rows,
-            )
-            if args.json_output:
-                _emit_cli_json(payload)
-            else:
-                _print_rows(rows, columns)
-        elif args.command == "audit-log":
-            rows = bot.list_audit_logs(limit=args.limit, action=args.action)
-            columns = ["happened_at", "action", "details_json"]
-            payload = _cli_payload("audit-log", count=len(rows), columns=columns, rows=rows)
-            if args.json_output:
-                _emit_cli_json(payload)
-            else:
-                _print_rows(rows, columns)
-        elif args.command == "list-donors":
-            rows = bot.list_donors(segment=args.segment)
-            columns = ["email", "name", "segment", "locale", "opted_out", "last_contact_at"]
-            payload = _cli_payload("list-donors", count=len(rows), columns=columns, rows=rows)
-            if args.json_output:
-                _emit_cli_json(payload)
-            else:
-                _print_rows(rows, columns)
-        elif args.command == "monthly-audit-report":
-            report = bot.build_monthly_audit_report(year=args.year, month=args.month)
-            payload = _cli_payload(
-                "monthly-audit-report",
-                report=report,
-                output_path=args.output,
-            )
-            if args.output:
-                _write_json_report(args.output, report)
-            if args.json_output:
-                _emit_cli_json(payload)
-            elif args.output:
-                print(f"Monthly audit report written to {args.output}.")
-            else:
-                print(_json_dumps(report))
-        elif args.command == "set-data-retention-policy":
-            policy_updates = {
-                "audit_logs_days": args.audit_logs_days,
-                "communications_days": args.communications_days,
-                "documents_days": args.documents_days,
-                "submission_attempts_days": args.submission_attempts_days,
-                "completed_tasks_days": args.completed_tasks_days,
-            }
-            policy = bot.store_data_retention_policy(
-                {key: value for key, value in policy_updates.items() if value is not None}
-            )
-            payload = _cli_payload("set-data-retention-policy", policy=policy)
-            if args.json_output:
-                _emit_cli_json(payload)
-            else:
-                print(_json_dumps(policy))
-        elif args.command == "enforce-data-retention":
-            as_of = datetime.fromisoformat(args.as_of) if args.as_of else None
-            report = bot.enforce_data_retention(now=as_of, dry_run=args.dry_run)
-            payload = _cli_payload("enforce-data-retention", report=report)
-            if args.json_output:
-                _emit_cli_json(payload)
-            else:
-                print(_json_dumps(report))
-        elif args.command == "gdpr-self-check-report":
-            report = bot.build_gdpr_compliance_report(cadence=args.cadence)
-            payload = _cli_payload(
-                "gdpr-self-check-report",
-                report=report,
-                output_path=args.output,
-            )
-            if args.output:
-                _write_json_report(args.output, report)
-            if args.json_output:
-                _emit_cli_json(payload)
-            elif args.output:
-                print(f"GDPR self-check report written to {args.output}.")
-            else:
-                print(_json_dumps(report))
-        elif args.command == "discover":
-            from tasks.celery_tasks import discover_task
-
-            payload = _cli_payload(
-                "discover",
-                **_queue_async_task(
-                    "discover",
-                    discover_task,
-                    task_kwargs={
-                        "db_path": args.db,
-                        "keywords": _parse_csv_argument(args.keywords),
-                        "trusted_sources": _parse_csv_argument(args.trusted_sources),
-                    },
-                ),
-            )
-            if args.json_output:
-                _emit_cli_json(payload)
-            else:
-                _print_queued_task(payload, ready_renderer=_render_discover_task_result_text)
-        elif args.command == "test-connector":
-            connector = create_connector(args.connector)
-            validation = connector.validate_connectivity(
-                keywords=_parse_csv_argument(args.keywords),
-                sample_limit=max(args.limit, 0),
-            )
-            payload = _cli_payload("test-connector", validation=validation)
-            if args.json_output:
-                _emit_cli_json(payload)
-            else:
-                print(_json_dumps(validation))
-        elif args.command == "send-outreach":
-            from tasks.celery_tasks import send_outreach_task
-
-            payload = _cli_payload(
-                "send-outreach",
-                **_queue_async_task(
-                    "send-outreach",
-                    send_outreach_task,
-                    task_kwargs={
-                        "db_path": args.db,
-                        "donor_email": args.email,
-                        "donor_name": args.name,
-                        "template_name": args.template_name,
-                        "subject_template": args.subject,
-                        "body_template": args.body,
-                        "locale": args.locale,
-                        "dry_run": args.dry_run,
-                    },
-                ),
-            )
-            if args.json_output:
-                _emit_cli_json(payload)
-            else:
-                _print_queued_task(payload, ready_renderer=_render_outreach_task_result_text)
-        elif args.command == "set-organization-profile":
-            try:
-                raw_json = (
-                    Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
+                    **_queue_async_task(
+                        "send-daily-summary",
+                        send_daily_summary_task,
+                        task_kwargs={
+                            "db_path": args.db,
+                            "recipient": args.recipient,
+                            "dry_run": args.dry_run,
+                        },
+                    ),
                 )
-            except OSError as exc:
-                raise FundingBotError(f"Failed to read profile from {args.file!r}: {exc}") from exc
-            profile = json.loads(raw_json)
-            if not isinstance(profile, dict):
-                raise ValueError("Organization profile JSON must be an object.")
-            bot.store_organization_profile(profile)
-            payload = _cli_payload(
-                "set-organization-profile",
-                updated=True,
-                organization_profile=profile,
-                profile_keys=sorted(profile.keys()),
-            )
+                if args.json_output:
+                    _emit_cli_json(payload)
+                else:
+                    _print_queued_task(payload, ready_renderer=_render_daily_summary_task_result_text)
+            elif args.command == "list-opportunities":
+                rows = bot.list_opportunities(status=args.status)
+                if args.limit is not None:
+                    rows = rows[: args.limit]
+                columns = ["signature", "source", "donor_name", "title", "status", "discovered_at"]
+                payload = _cli_payload(
+                    "list-opportunities",
+                    count=len(rows),
+                    columns=columns,
+                    rows=rows,
+                )
+                if args.json_output:
+                    _emit_cli_json(payload)
+                else:
+                    _print_rows(rows, columns)
+            elif args.command == "audit-log":
+                rows = bot.list_audit_logs(limit=args.limit, action=args.action)
+                columns = ["happened_at", "action", "details_json"]
+                payload = _cli_payload("audit-log", count=len(rows), columns=columns, rows=rows)
+                if args.json_output:
+                    _emit_cli_json(payload)
+                else:
+                    _print_rows(rows, columns)
+            elif args.command == "list-donors":
+                rows = bot.list_donors(segment=args.segment)
+                columns = ["email", "name", "segment", "locale", "opted_out", "last_contact_at"]
+                payload = _cli_payload("list-donors", count=len(rows), columns=columns, rows=rows)
+                if args.json_output:
+                    _emit_cli_json(payload)
+                else:
+                    _print_rows(rows, columns)
+            elif args.command == "monthly-audit-report":
+                report = bot.build_monthly_audit_report(year=args.year, month=args.month)
+                payload = _cli_payload(
+                    "monthly-audit-report",
+                    report=report,
+                    output_path=args.output,
+                )
+                if args.output:
+                    _write_json_report(args.output, report)
+                if args.json_output:
+                    _emit_cli_json(payload)
+                elif args.output:
+                    print(f"Monthly audit report written to {args.output}.")
+                else:
+                    print(_json_dumps(report))
+            elif args.command == "set-data-retention-policy":
+                policy_updates = {
+                    "audit_logs_days": args.audit_logs_days,
+                    "communications_days": args.communications_days,
+                    "documents_days": args.documents_days,
+                    "submission_attempts_days": args.submission_attempts_days,
+                    "completed_tasks_days": args.completed_tasks_days,
+                }
+                policy = bot.store_data_retention_policy(
+                    {key: value for key, value in policy_updates.items() if value is not None}
+                )
+                payload = _cli_payload("set-data-retention-policy", policy=policy)
+                if args.json_output:
+                    _emit_cli_json(payload)
+                else:
+                    print(_json_dumps(policy))
+            elif args.command == "enforce-data-retention":
+                as_of = datetime.fromisoformat(args.as_of) if args.as_of else None
+                report = bot.enforce_data_retention(now=as_of, dry_run=args.dry_run)
+                payload = _cli_payload("enforce-data-retention", report=report)
+                if args.json_output:
+                    _emit_cli_json(payload)
+                else:
+                    print(_json_dumps(report))
+            elif args.command == "gdpr-self-check-report":
+                report = bot.build_gdpr_compliance_report(cadence=args.cadence)
+                payload = _cli_payload(
+                    "gdpr-self-check-report",
+                    report=report,
+                    output_path=args.output,
+                )
+                if args.output:
+                    _write_json_report(args.output, report)
+                if args.json_output:
+                    _emit_cli_json(payload)
+                elif args.output:
+                    print(f"GDPR self-check report written to {args.output}.")
+                else:
+                    print(_json_dumps(report))
+            elif args.command == "discover":
+                from tasks.celery_tasks import discover_task
+
+                payload = _cli_payload(
+                    "discover",
+                    **_queue_async_task(
+                        "discover",
+                        discover_task,
+                        task_kwargs={
+                            "db_path": args.db,
+                            "keywords": _parse_csv_argument(args.keywords),
+                            "trusted_sources": _parse_csv_argument(args.trusted_sources),
+                        },
+                    ),
+                )
+                if args.json_output:
+                    _emit_cli_json(payload)
+                else:
+                    _print_queued_task(payload, ready_renderer=_render_discover_task_result_text)
+            elif args.command == "test-connector":
+                connector = create_connector(args.connector)
+                validation = connector.validate_connectivity(
+                    keywords=_parse_csv_argument(args.keywords),
+                    sample_limit=max(args.limit, 0),
+                )
+                payload = _cli_payload("test-connector", validation=validation)
+                if args.json_output:
+                    _emit_cli_json(payload)
+                else:
+                    print(_json_dumps(validation))
+            elif args.command == "send-outreach":
+                from tasks.celery_tasks import send_outreach_task
+
+                payload = _cli_payload(
+                    "send-outreach",
+                    **_queue_async_task(
+                        "send-outreach",
+                        send_outreach_task,
+                        task_kwargs={
+                            "db_path": args.db,
+                            "donor_email": args.email,
+                            "donor_name": args.name,
+                            "template_name": args.template_name,
+                            "subject_template": args.subject,
+                            "body_template": args.body,
+                            "locale": args.locale,
+                            "dry_run": args.dry_run,
+                        },
+                    ),
+                )
+                if args.json_output:
+                    _emit_cli_json(payload)
+                else:
+                    _print_queued_task(payload, ready_renderer=_render_outreach_task_result_text)
+            elif args.command == "set-organization-profile":
+                try:
+                    raw_json = (
+                        Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
+                    )
+                except OSError as exc:
+                    raise FundingBotError(f"Failed to read profile from {args.file!r}: {exc}") from exc
+                profile = json.loads(raw_json)
+                if not isinstance(profile, dict):
+                    raise ValueError("Organization profile JSON must be an object.")
+                bot.store_organization_profile(profile)
+                payload = _cli_payload(
+                    "set-organization-profile",
+                    updated=True,
+                    organization_profile=profile,
+                    profile_keys=sorted(profile.keys()),
+                )
+                if args.json_output:
+                    _emit_cli_json(payload)
+                else:
+                    print("Organization profile updated.")
+            elif args.command == "register-credential":
+                payload = _run_register_credential(bot, args)
+                if args.json_output:
+                    _emit_cli_json(payload)
+                else:
+                    print(f"Registered credential alias {args.alias!r}.")
+            elif args.command == "completion":
+                script = _build_completion_script(args.shell)
+                payload = _cli_payload("completion", shell=args.shell, script=script)
+                if args.json_output:
+                    _emit_cli_json(payload)
+                else:
+                    print(script)
+            elif args.command == "doctor":
+                payload = _collect_doctor_report(
+                    db_path=args.db,
+                    connector_keywords=_parse_csv_argument(args.connector_keywords),
+                )
+                if args.json_output:
+                    _emit_cli_json(payload)
+                else:
+                    _print_doctor_report(payload)
+            elif args.command == "show-settings":
+                _run_show_settings(bot, json_output=args.json_output)
+                if not args.json_output:
+                    _print_credential_aliases(bot)
+        except Exception as exc:
             if args.json_output:
-                _emit_cli_json(payload)
-            else:
-                print("Organization profile updated.")
-        elif args.command == "register-credential":
-            payload = _run_register_credential(bot, args)
-            if args.json_output:
-                _emit_cli_json(payload)
-            else:
-                print(f"Registered credential alias {args.alias!r}.")
-        elif args.command == "completion":
-            script = _build_completion_script(args.shell)
-            payload = _cli_payload("completion", shell=args.shell, script=script)
-            if args.json_output:
-                _emit_cli_json(payload)
-            else:
-                print(script)
-        elif args.command == "doctor":
-            payload = _collect_doctor_report(
-                db_path=args.db,
-                connector_keywords=_parse_csv_argument(args.connector_keywords),
-            )
-            if args.json_output:
-                _emit_cli_json(payload)
-            else:
-                _print_doctor_report(payload)
-        elif args.command == "show-settings":
-            _run_show_settings(bot, json_output=args.json_output)
-            if not args.json_output:
-                _print_credential_aliases(bot)
+                _emit_cli_json(
+                    {
+                        "command": args.command,
+                        "ok": False,
+                        "error": {
+                            "type": type(exc).__name__,
+                            "message": str(exc),
+                        },
+                    }
+                )
+                raise SystemExit(1) from exc
+            raise
     finally:
         bot.close()
 

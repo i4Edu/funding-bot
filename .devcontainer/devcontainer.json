@@ -10,7 +10,7 @@
     "devcontainer",
     "web",
     "worker",
-    "redis",
+    "redis-dev",
     "postgres",
     "mock-connectors"
   ],

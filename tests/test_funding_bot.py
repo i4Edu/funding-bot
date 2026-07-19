@@ -2154,6 +2154,34 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual("corporate", json.loads(latest_upsert["details_json"])["segment"])
 
+    def test_donor_cache_tracks_hits_and_invalidates_after_updates(self):
+        self.bot.upsert_donor(
+            email="cache@example.org",
+            name="Cache Donor",
+            segment="corporate",
+        )
+
+        self.assertEqual("Cache Donor", self.bot.get_donor("cache@example.org")["name"])
+        self.assertEqual("Cache Donor", self.bot.get_donor("cache@example.org")["name"])
+        self.assertEqual(1, len(self.bot.list_donors(segment="corporate")))
+        self.assertEqual(1, len(self.bot.list_donors(segment="corporate")))
+
+        metrics = self.bot.get_cache_metrics()["namespaces"]["donor-records"]
+        self.assertGreaterEqual(metrics["hits"], 2)
+        self.assertGreaterEqual(metrics["misses"], 2)
+
+        self.bot.upsert_donor(
+            email="cache@example.org",
+            name="Cache Donor Updated",
+            segment="corporate",
+        )
+
+        self.assertEqual("Cache Donor Updated", self.bot.get_donor("cache@example.org")["name"])
+        self.assertEqual(
+            "Cache Donor Updated",
+            self.bot.list_donors(segment="corporate")[0]["name"],
+        )
+
     def test_send_outreach_from_template_prefers_segment_template_and_falls_back(self):
         calls = []
 
@@ -2760,6 +2788,27 @@ class CliExtensionTests(unittest.TestCase):
         output = stdout.getvalue()
         self.assertIn("signature\tsource\tdonor_name\ttitle\tstatus\tdiscovered_at", output)
         self.assertIn("UNICEF CSR Grant", output)
+
+    def test_list_opportunities_command_supports_json_output(self):
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(
+                [
+                    "--db",
+                    str(self.db_path),
+                    "list-opportunities",
+                    "--status",
+                    "new",
+                    "--limit",
+                    "1",
+                    "--json",
+                ]
+            )
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual("list-opportunities", payload["command"])
+        self.assertTrue(payload["ok"])
+        self.assertEqual(1, payload["count"])
+        self.assertEqual("UNICEF CSR Grant", payload["rows"][0]["title"])
 
     def test_audit_log_command_prints_filtered_rows(self):
         with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
@@ -3410,6 +3459,99 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
         self.assertEqual({"name": "i4Edu"}, settings["organization_profile"])
         self.assertIn("smtp", table_output)
         self.assertIn("SMTP_PASSWORD", table_output)
+
+    def test_show_settings_command_supports_json_output(self):
+        bot = FundingBot(db_path=self.db_path)
+        try:
+            bot.store_organization_profile({"name": "i4Edu"})
+            bot.register_credential("smtp", "SMTP_PASSWORD")
+        finally:
+            bot.close()
+
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(["--db", str(self.db_path), "show-settings", "--json"])
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual("show-settings", payload["command"])
+        self.assertEqual({"name": "i4Edu"}, payload["organization_profile"])
+        self.assertEqual([{"alias": "smtp", "env_var_name": "SMTP_PASSWORD"}], payload["credentials"])
+
+
+class CliEnhancementCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.db_path = Path(".test_cli_enhancements.db")
+        if self.db_path.exists():
+            self.db_path.unlink()
+        FundingBot(db_path=self.db_path).close()
+
+    def tearDown(self):
+        if self.db_path.exists():
+            self.db_path.unlink()
+
+    def test_completion_command_outputs_bash_script(self):
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(["--db", str(self.db_path), "completion", "--shell", "bash"])
+
+        script = stdout.getvalue()
+        self.assertIn("_funding_bot_completion()", script)
+        self.assertIn("complete -F _funding_bot_completion funding-bot", script)
+        self.assertIn("doctor", script)
+        self.assertIn("--json", script)
+
+    def test_doctor_command_supports_json_output(self):
+        queue_config = types.SimpleNamespace(
+            enable_task_queue=True,
+            enable_legacy_cron=False,
+            broker_url="redis://127.0.0.1:6379/0",
+            result_backend="redis://127.0.0.1:6379/1",
+            task_always_eager=False,
+            queue_name="funding-bot",
+            inspect_timeout_seconds=1.0,
+        )
+        fake_task_queue = types.SimpleNamespace(
+            celery_app=object(),
+            load_queue_config=lambda: queue_config,
+            get_queue_status=lambda **kwargs: {
+                "queue_enabled": True,
+                "legacy_cron_enabled": False,
+                "mode": "queue",
+                "active_modes": ["queue"],
+                "broker_transport": "redis",
+                "queue_name": "funding-bot",
+                "queue_depth": 0,
+                "active_tasks": 0,
+                "reserved_tasks": 0,
+                "scheduled_tasks": 0,
+                "worker_count": 1,
+                "workers": ["worker@local"],
+                "worker_status": "healthy",
+            },
+        )
+        with (
+            unittest.mock.patch.dict("sys.modules", {"task_queue": fake_task_queue}),
+            unittest.mock.patch(
+                "funding_bot._collect_redis_diagnostics",
+                return_value={"status": "ok", "checked": True, "targets": [{"role": "broker", "status": "ok"}]},
+            ),
+            unittest.mock.patch(
+                "funding_bot._collect_connector_diagnostics",
+                return_value={
+                    "status": "ok",
+                    "count": 1,
+                    "connectors": [{"connector": "csr-network", "status": "ok", "healthy": True}],
+                },
+            ),
+            unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+        ):
+            main(["--db", str(self.db_path), "doctor", "--json"])
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual("doctor", payload["command"])
+        self.assertEqual("ok", payload["overall_status"])
+        self.assertEqual("ok", payload["checks"]["database"]["status"])
+        self.assertEqual("ok", payload["checks"]["celery"]["status"])
+        self.assertEqual("ok", payload["checks"]["redis"]["status"])
+        self.assertEqual("ok", payload["checks"]["connectors"]["status"])
 
 
 class TaskApiRequirementTests(unittest.TestCase):

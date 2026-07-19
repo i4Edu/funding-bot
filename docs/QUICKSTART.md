@@ -106,8 +106,20 @@ Services:
 
 ```bash
 python3 -m unittest discover -s tests
+pytest tests/test_smoke.py -m quick -q
+pytest tests/test_smoke.py -m smoke -q
 python3 -m funding_bot list-opportunities
 python3 -m funding_bot send-daily-summary --dry-run
+```
+
+To capture flaky smoke-test tracking artifacts locally:
+
+```bash
+mkdir -p test-results
+pytest tests/test_smoke.py -m smoke -q --reruns 2 --reruns-delay 1 \
+  --flaky-report=test-results/flaky-report.json \
+  --flaky-report-markdown=test-results/flaky-report.md \
+  --test-reliability-metrics=test-results/test-reliability.prom
 ```
 
 Optional accessibility run:

@@ -15,6 +15,10 @@ This table documents the runtime environment variables used by the funding bot, 
 | Web | `DASHBOARD_SESSION_TIMEOUT_MINUTES` | No | `30` | `45` | Idle session timeout. |
 | Web | `SESSION_COOKIE_SECURE` | No | `true` | `0` | Set to `0` for local HTTP development; keep enabled in HTTPS deployments. |
 | Web | `SESSION_COOKIE_SAMESITE` | No | `Lax` | `Lax` | Flask session cookie SameSite value. |
+| Web | `WEB_AUTH_RATE_LIMIT` | No | `30 per minute` | `60 per minute` | Rate limit applied to authenticated dashboard HTML routes. |
+| Web | `WEB_API_RATE_LIMIT` | No | `120 per minute` | `300 per minute` | Rate limit applied to authenticated JSON/API routes. |
+| Web | `WEB_EXPORT_RATE_LIMIT` | No | `10 per minute` | `30 per minute` | Stricter rate limit for export endpoints such as `/api/tasks/export`. |
+| Web | `WEB_RATE_LIMIT_STORAGE_URI` | No | `memory://` | `redis://redis:6379/2` | Backend storage for Flask-Limiter counters in multi-process deployments. |
 | SMTP | `SMTP_HOST` | Optional | `localhost` | `smtp.example.org` | Mail server hostname. |
 | SMTP | `SMTP_PORT` | Optional | `587` | `587` | Mail server port. |
 | SMTP | `SMTP_USERNAME` | Optional | *(empty)* | `funding-bot@example.org` | SMTP username. |

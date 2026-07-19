@@ -39,7 +39,7 @@ and category names. Matching is case-insensitive.
 
 ## How keyword mapping works
 
-When `discover` or `test-connector` receives a keyword:
+When `discover`, `test-connector`, or `doctor --connector-keywords ...` receives a keyword:
 
 1. The connector normalizes the keyword.
 2. If it matches a canonical keyword, synonym, or mapped category, the connector
@@ -116,6 +116,15 @@ The command returns JSON with:
 
 If a connector raises an exception, the JSON response includes `status: "error"`
 and an `error` field for troubleshooting.
+
+For a full environment-wide check, run:
+
+```bash
+python -m funding_bot doctor --connector-keywords learning --json
+```
+
+The doctor report summarizes connector status alongside the database, Celery, and
+Redis checks so operators can quickly spot connector-specific outages.
 
 ## Live connector credentials
 

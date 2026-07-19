@@ -183,7 +183,7 @@ def _rate_limit_breach_response(request_limit: Any) -> Response:
         headers["Retry-After"] = str(retry_after)
     if reset_at is not None:
         payload["reset_at"] = reset_at
-    return _json_error(payload["error"], 429, headers=headers | ({"X-CSRF-Token": _csrf_token_value()} if session.get(SESSION_ROLE_KEY) else {})) if False else _build_json_response(payload, 429, headers=headers)
+    return _build_json_response(payload, 429, headers=headers)
 
 
 def _build_json_response(
@@ -234,11 +234,7 @@ def _mapping_or_default(value: Any, default: dict[str, Any]) -> dict[str, Any]:
 
 
 def _json_error(message: str, status_code: int, *, headers: dict[str, str] | None = None) -> Response:
-    response = jsonify({"error": message})
-    response.status_code = status_code
-    if headers:
-        response.headers.update(headers)
-    return response
+    return _build_json_response({"error": message}, status_code, headers=headers)
 
 
 def _auth_challenge(message: str = "Authentication required") -> Response:
@@ -270,6 +266,7 @@ def _clear_authenticated_session() -> None:
     session.pop(SESSION_ROLE_KEY, None)
     session.pop(SESSION_AUTHENTICATED_AT_KEY, None)
     session.pop(SESSION_LAST_SEEN_AT_KEY, None)
+    session.pop(SESSION_CSRF_TOKEN_KEY, None)
 
 
 def _establish_authenticated_session(role: str) -> None:
@@ -278,6 +275,7 @@ def _establish_authenticated_session(role: str) -> None:
     session[SESSION_ROLE_KEY] = role
     session.setdefault(SESSION_AUTHENTICATED_AT_KEY, now)
     session[SESSION_LAST_SEEN_AT_KEY] = now
+    session.setdefault(SESSION_CSRF_TOKEN_KEY, secrets.token_urlsafe(32))
 
 
 def _get_session_role() -> str | None:
@@ -326,6 +324,46 @@ def _get_authenticated_role() -> str:
 
     _establish_authenticated_session(role)
     return role
+
+
+def _csrf_error_response(message: str = "CSRF token missing or invalid.") -> Response:
+    return _build_json_response(
+        {"error": message, "csrf_token": _csrf_token_value()},
+        400,
+    )
+
+
+@app.context_processor
+def inject_csrf_token() -> dict[str, Callable[[], str]]:
+    return {"csrf_token": _csrf_token_value}
+
+
+@app.before_request
+def validate_csrf_token() -> Response | None:
+    if request.method not in CSRF_UNSAFE_METHODS:
+        return None
+    if _has_explicit_basic_auth():
+        return None
+    if not session.get(SESSION_ROLE_KEY):
+        return None
+    supplied_token = _csrf_token_from_request()
+    expected_token = session.get(SESSION_CSRF_TOKEN_KEY)
+    if (
+        not isinstance(expected_token, str)
+        or not expected_token
+        or not supplied_token
+        or not hmac.compare_digest(supplied_token, expected_token)
+    ):
+        session[SESSION_CSRF_TOKEN_KEY] = secrets.token_urlsafe(32)
+        return _csrf_error_response()
+    return None
+
+
+@app.after_request
+def attach_security_headers(response: Response) -> Response:
+    if session.get(SESSION_ROLE_KEY):
+        response.headers.setdefault("X-CSRF-Token", _csrf_token_value())
+    return response
 
 
 def require_role(*roles: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
@@ -823,6 +861,14 @@ def handle_not_found(_: Any) -> Response:
     return _json_error("Not found", 404)
 
 
+@app.errorhandler(429)
+def handle_rate_limited(_: Any) -> Response:
+    return _build_json_response(
+        {"error": "Rate limit exceeded. Retry the request after the limit window resets."},
+        429,
+    )
+
+
 @app.errorhandler(DuplicateSubmissionError)
 def handle_duplicate_submission(exc: DuplicateSubmissionError) -> Response:
     return _json_error(str(exc), 400)
@@ -878,12 +924,14 @@ def index() -> Response:
 
 
 @app.get("/dashboard")
+@auth_rate_limit
 @require_role("staff", "admin", "auditor")
 def dashboard() -> str:
     return render_template("dashboard.html", **_dashboard_context())
 
 
 @app.get("/dashboard/tasks")
+@auth_rate_limit
 @require_role("staff", "admin", "auditor")
 def dashboard_tasks() -> Response | str:
     filters, forbidden = _task_filter_args()
@@ -892,6 +940,7 @@ def dashboard_tasks() -> Response | str:
     return render_template("tasks.html", **_task_dashboard_context(filters))
 
 @app.get("/opportunities")
+@api_rate_limit
 @require_role("staff", "admin", "auditor")
 def list_opportunities() -> Response:
     opportunities = [_serialize_opportunity(row) for row in _bot().connection.execute(
@@ -901,6 +950,7 @@ def list_opportunities() -> Response:
 
 
 @app.get("/opportunities/<signature>")
+@api_rate_limit
 @require_role("staff", "admin", "auditor")
 def get_opportunity(signature: str) -> Response:
     opportunity = _fetch_opportunity(signature)
@@ -929,6 +979,7 @@ def get_opportunity(signature: str) -> Response:
 
 
 @app.post("/opportunities/<signature>/submit")
+@api_rate_limit
 @require_role("admin")
 def submit_opportunity(signature: str) -> Response:
     payload = _get_request_json()
@@ -955,12 +1006,14 @@ def submit_opportunity(signature: str) -> Response:
 
 
 @app.get("/donors")
+@api_rate_limit
 @require_role("admin", "auditor")
 def list_donors() -> Response:
     return jsonify(_bot().list_donors())
 
 
 @app.post("/donors")
+@api_rate_limit
 @require_role("admin")
 def upsert_donor() -> Response:
     payload = _get_request_json()
@@ -999,6 +1052,7 @@ def upsert_donor() -> Response:
 
 
 @app.post("/donors/<path:email>/opt-out")
+@api_rate_limit
 @require_role("admin")
 def opt_out_donor(email: str) -> Response:
     donor = _fetch_donor(email)
@@ -1011,6 +1065,7 @@ def opt_out_donor(email: str) -> Response:
 
 
 @app.get("/analytics")
+@api_rate_limit
 @require_role("admin", "auditor")
 def get_analytics() -> Response:
     stats = _bot().get_outreach_analytics()
@@ -1018,6 +1073,7 @@ def get_analytics() -> Response:
 
 
 @app.get("/audit-log")
+@api_rate_limit
 @require_role("admin", "auditor")
 def audit_log() -> Response:
     logs = [_serialize_audit_log(row) for row in _bot().connection.execute(
@@ -1032,6 +1088,7 @@ def audit_log() -> Response:
 
 
 @app.get("/settings")
+@auth_rate_limit
 @require_role("staff", "admin", "auditor")
 def settings_page() -> str:
     bot = _bot()
@@ -1052,6 +1109,7 @@ def settings_page() -> str:
 
 
 @app.get("/translations")
+@auth_rate_limit
 @require_role("staff", "admin", "auditor")
 def translation_review_dashboard() -> str:
     bot = _bot()
@@ -1082,12 +1140,14 @@ def translation_review_dashboard() -> str:
 
 
 @app.get("/translations/locales")
+@api_rate_limit
 @require_role("staff", "admin", "auditor")
 def translation_locales() -> Response:
     return jsonify({"locales": _bot().list_locale_definitions()})
 
 
 @app.get("/translations/reviews")
+@api_rate_limit
 @require_role("staff", "admin", "auditor")
 def list_translation_reviews() -> Response:
     status = request.args.get("status")
@@ -1103,6 +1163,7 @@ def list_translation_reviews() -> Response:
 
 
 @app.post("/translations/reviews")
+@api_rate_limit
 @require_role("staff", "admin")
 def create_translation_review() -> Response:
     payload = _get_request_json()
@@ -1118,6 +1179,7 @@ def create_translation_review() -> Response:
 
 
 @app.post("/translations/reviews/<int:review_id>/decision")
+@api_rate_limit
 @require_role("staff", "admin")
 def decide_translation_review(review_id: int) -> Response:
     payload = _get_request_json()
@@ -1131,6 +1193,7 @@ def decide_translation_review(review_id: int) -> Response:
 
 
 @app.post("/settings/organization")
+@api_rate_limit
 @require_role("admin")
 def update_organization_settings() -> Response:
     payload = _get_request_json()
@@ -1153,6 +1216,7 @@ def update_organization_settings() -> Response:
 
 
 @app.post("/settings/search")
+@api_rate_limit
 @require_role("admin")
 def update_search_settings() -> Response:
     payload = _get_request_json()
@@ -1164,6 +1228,7 @@ def update_search_settings() -> Response:
 
 
 @app.post("/settings/credentials")
+@api_rate_limit
 @require_role("admin")
 def register_credential_route() -> Response:
     payload = _get_request_json()
@@ -1179,6 +1244,7 @@ def register_credential_route() -> Response:
 
 
 @app.post("/settings/discover")
+@api_rate_limit
 @require_role("admin")
 def run_discovery_now() -> Response:
     """Trigger a live search across configured donation sources.
@@ -1205,6 +1271,7 @@ def run_discovery_now() -> Response:
 
 
 @app.post("/settings/privacy-policy")
+@api_rate_limit
 @require_role("admin")
 def generate_privacy_policy() -> Response:
     payload = _get_request_json()
@@ -1237,6 +1304,7 @@ def generate_privacy_policy() -> Response:
 
 
 @app.post("/settings/test-outreach")
+@api_rate_limit
 @require_role("admin")
 def send_test_outreach() -> Response:
     """Compose (and optionally send) a donor outreach email from the panel.
@@ -1295,6 +1363,7 @@ def send_test_outreach() -> Response:
 
 @app.get("/tasks")
 @app.get("/task-directory")
+@api_rate_limit
 @require_role("staff", "admin", "auditor")
 def list_tasks_route() -> Response:
     current_role = getattr(g, "current_role", None)
@@ -1321,6 +1390,7 @@ def list_tasks_route() -> Response:
 
 @app.post("/tasks")
 @app.post("/task-directory")
+@api_rate_limit
 @require_role("admin")
 def create_task_route() -> Response:
     payload = _get_request_json()
@@ -1352,6 +1422,7 @@ def create_task_route() -> Response:
 
 
 @app.put("/tasks/<int:task_id>")
+@api_rate_limit
 @require_role("admin")
 def update_task_route(task_id: int) -> Response:
     payload = _get_request_json()
@@ -1373,6 +1444,7 @@ def update_task_route(task_id: int) -> Response:
 
 @app.get("/tasks/<int:task_id>")
 @app.get("/task-directory/<int:task_id>")
+@api_rate_limit
 @require_role("staff", "admin", "auditor")
 def get_task_route(task_id: int) -> Response:
     task = _bot().get_task(task_id, viewer_email=request.args.get("viewer_email"))
@@ -1385,6 +1457,7 @@ def get_task_route(task_id: int) -> Response:
 
 
 @app.get("/api/tasks/export")
+@export_rate_limit
 @require_role("admin", "auditor")
 def export_tasks_route() -> Response:
     tasks = _bot().list_tasks(
@@ -1403,6 +1476,7 @@ def export_tasks_route() -> Response:
 
 
 @app.post("/api/tasks/sync")
+@api_rate_limit
 @require_role("admin")
 def sync_tasks_route() -> Response:
     payload = _get_request_json()
@@ -1414,6 +1488,7 @@ def sync_tasks_route() -> Response:
 
 
 @app.post("/api/tasks/import")
+@api_rate_limit
 @require_role("admin")
 def import_tasks_route() -> Response:
     csv_text = _read_task_import_csv()
@@ -1425,6 +1500,7 @@ def import_tasks_route() -> Response:
 @app.post("/tasks/<int:task_id>/assign")
 @app.post("/tasks/<int:task_id>/assignment")
 @app.post("/task-directory/<int:task_id>/assignment")
+@api_rate_limit
 @require_role("admin")
 def assign_task_route(task_id: int) -> Response:
     payload = _get_request_json()
@@ -1447,6 +1523,7 @@ def assign_task_route(task_id: int) -> Response:
 
 
 @app.get("/tasks/<int:task_id>/comments")
+@api_rate_limit
 @require_role("staff", "admin", "auditor")
 def list_task_comments_route(task_id: int) -> Response:
     payload = _bot().list_task_comments(task_id, viewer_email=request.args.get("viewer_email"))
@@ -1455,6 +1532,7 @@ def list_task_comments_route(task_id: int) -> Response:
 
 
 @app.post("/tasks/<int:task_id>/comments")
+@api_rate_limit
 @require_role("staff", "admin")
 def create_task_comment_route(task_id: int) -> Response:
     payload = _get_request_json()
@@ -1467,6 +1545,7 @@ def create_task_comment_route(task_id: int) -> Response:
 
 
 @app.patch("/tasks/<int:task_id>/comments/<int:comment_id>")
+@api_rate_limit
 @require_role("staff", "admin")
 def update_task_comment_route(task_id: int, comment_id: int) -> Response:
     payload = _get_request_json()
@@ -1478,6 +1557,7 @@ def update_task_comment_route(task_id: int, comment_id: int) -> Response:
 
 
 @app.delete("/tasks/<int:task_id>/comments/<int:comment_id>")
+@api_rate_limit
 @require_role("staff", "admin")
 def delete_task_comment_route(task_id: int, comment_id: int) -> Response:
     _bot().delete_task_comment(task_id, comment_id)
@@ -1485,6 +1565,7 @@ def delete_task_comment_route(task_id: int, comment_id: int) -> Response:
 
 
 @app.post("/tasks/<int:task_id>/comments/read")
+@api_rate_limit
 @require_role("staff", "admin", "auditor")
 def mark_task_comments_read_route(task_id: int) -> Response:
     payload = _get_request_json()
@@ -1496,6 +1577,7 @@ def mark_task_comments_read_route(task_id: int) -> Response:
 
 
 @app.post("/tasks/<int:task_id>/status")
+@api_rate_limit
 @require_role("staff", "admin", "auditor")
 def transition_task_status_route(task_id: int) -> Response:
     payload = _get_request_json()
@@ -1547,6 +1629,7 @@ def cache_health() -> Response:
 
 
 @app.get("/metrics")
+@api_rate_limit
 @require_role("admin", "auditor")
 def metrics() -> Response:
     """Prometheus-compatible text metrics endpoint.
@@ -1568,8 +1651,25 @@ def metrics() -> Response:
     communications_total = conn.execute("SELECT COUNT(*) FROM communications").fetchone()[0]
     tasks_total = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
     uptime_seconds = time.time() - _APP_START_TIME
-    task_counts = bot.get_task_status_counts()
+    task_counts = _mapping_or_default(bot.get_task_status_counts(), {})
     raw_queue_metrics = getattr(bot, "get_queue_metrics", lambda: {})()
+    database_metrics = _mapping_or_default(
+        getattr(bot, "get_database_pool_metrics", lambda: {})(),
+        {
+            "size": 0,
+            "checked_in": 0,
+            "checked_out": 0,
+            "overflow": 0,
+            "connects": 0,
+            "checkouts": 0,
+            "checkins": 0,
+            "invalidations": 0,
+        },
+    )
+    cache_metrics = _mapping_or_default(
+        getattr(bot, "get_cache_metrics", lambda: {})(),
+        {"namespaces": {}},
+    )
     queue_metrics = {
         "running": 0,
         "completed": 0,
@@ -1622,6 +1722,30 @@ def metrics() -> Response:
         "# HELP funding_bot_uptime_seconds Seconds since the web process started",
         "# TYPE funding_bot_uptime_seconds gauge",
         f"funding_bot_uptime_seconds {uptime_seconds:.3f}",
+        "# HELP funding_bot_db_pool_size SQLAlchemy connection pool size",
+        "# TYPE funding_bot_db_pool_size gauge",
+        f"funding_bot_db_pool_size {database_metrics['size']}",
+        "# HELP funding_bot_db_pool_checked_in SQLAlchemy connections currently idle in the pool",
+        "# TYPE funding_bot_db_pool_checked_in gauge",
+        f"funding_bot_db_pool_checked_in {database_metrics['checked_in']}",
+        "# HELP funding_bot_db_pool_checked_out SQLAlchemy connections currently checked out",
+        "# TYPE funding_bot_db_pool_checked_out gauge",
+        f"funding_bot_db_pool_checked_out {database_metrics['checked_out']}",
+        "# HELP funding_bot_db_pool_overflow SQLAlchemy overflow connections currently in use",
+        "# TYPE funding_bot_db_pool_overflow gauge",
+        f"funding_bot_db_pool_overflow {database_metrics['overflow']}",
+        "# HELP funding_bot_db_pool_connects_total SQLAlchemy physical database connections opened",
+        "# TYPE funding_bot_db_pool_connects_total counter",
+        f"funding_bot_db_pool_connects_total {database_metrics['connects']}",
+        "# HELP funding_bot_db_pool_checkouts_total SQLAlchemy pool checkout events",
+        "# TYPE funding_bot_db_pool_checkouts_total counter",
+        f"funding_bot_db_pool_checkouts_total {database_metrics['checkouts']}",
+        "# HELP funding_bot_db_pool_checkins_total SQLAlchemy pool checkin events",
+        "# TYPE funding_bot_db_pool_checkins_total counter",
+        f"funding_bot_db_pool_checkins_total {database_metrics['checkins']}",
+        "# HELP funding_bot_db_pool_invalidations_total SQLAlchemy pool invalidation events",
+        "# TYPE funding_bot_db_pool_invalidations_total counter",
+        f"funding_bot_db_pool_invalidations_total {database_metrics['invalidations']}",
         "# HELP funding_bot_queue_health_status Queue health status (1=ok, 0=disabled/degraded)",
         "# TYPE funding_bot_queue_health_status gauge",
         f"funding_bot_queue_health_status {queue_status_value}",
@@ -1682,6 +1806,34 @@ def metrics() -> Response:
         )
     lines.extend(
         [
+            "# HELP funding_bot_cache_hits_total Cache hits by namespace",
+            "# TYPE funding_bot_cache_hits_total counter",
+            "# HELP funding_bot_cache_misses_total Cache misses by namespace",
+            "# TYPE funding_bot_cache_misses_total counter",
+            "# HELP funding_bot_cache_sets_total Cache writes by namespace",
+            "# TYPE funding_bot_cache_sets_total counter",
+            "# HELP funding_bot_cache_invalidations_total Cache invalidations by namespace",
+            "# TYPE funding_bot_cache_invalidations_total counter",
+            "# HELP funding_bot_cache_entries Cache entries by namespace",
+            "# TYPE funding_bot_cache_entries gauge",
+            "# HELP funding_bot_cache_ttl_seconds Cache TTL configuration by namespace",
+            "# TYPE funding_bot_cache_ttl_seconds gauge",
+        ]
+    )
+    for namespace, namespace_metrics in sorted(cache_metrics.get("namespaces", {}).items()):
+        labels = f'cache="{namespace}",backend="{namespace_metrics.get("backend", "memory")}"'
+        lines.extend(
+            [
+                f"funding_bot_cache_hits_total{{{labels}}} {int(namespace_metrics.get('hits', 0))}",
+                f"funding_bot_cache_misses_total{{{labels}}} {int(namespace_metrics.get('misses', 0))}",
+                f"funding_bot_cache_sets_total{{{labels}}} {int(namespace_metrics.get('sets', 0))}",
+                f"funding_bot_cache_invalidations_total{{{labels}}} {int(namespace_metrics.get('invalidations', 0))}",
+                f"funding_bot_cache_entries{{{labels}}} {int(namespace_metrics.get('size', 0))}",
+                f"funding_bot_cache_ttl_seconds{{{labels}}} {float(namespace_metrics.get('ttl_seconds', 0.0))}",
+            ]
+        )
+    lines.extend(
+        [
             "# HELP funding_bot_connector_cache_hits_total Connector cache hits",
             "# TYPE funding_bot_connector_cache_hits_total counter",
             "# HELP funding_bot_connector_cache_misses_total Connector cache misses",
@@ -1710,6 +1862,7 @@ def metrics() -> Response:
 
 
 @app.post("/feedback")
+@api_rate_limit
 @require_role("staff", "admin")
 def submit_feedback() -> Response:
     """Accept partner feature-request feedback.

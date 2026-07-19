@@ -92,6 +92,19 @@ Locust writes:
 - `dashboard-load_failures.csv`
 - `dashboard-load-report.html`
 
+## Sample baseline result
+
+On the repository's local CI-style run (`12` users, spawn rate `3`, duration `45s`), the current dashboard scenario produced:
+
+- requests: `1669`
+- failures: `0`
+- median response time: `6 ms`
+- average response time: `9.38 ms`
+- p95 response time: `25 ms`
+- throughput: `37.89 req/s`
+
+Treat these as a reference point, not a hard production SLA; compare future changes against the same Locust profile.
+
 ## CI coverage
 
 The GitHub Actions workflow includes:

@@ -229,7 +229,10 @@
       async function moveTask(taskId, nextStatus) {
         const response = await fetch(`/tasks/${taskId}/status`, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            "X-CSRF-Token": document.querySelector('meta[name="csrf-token"]')?.content || "",
+          },
           body: JSON.stringify({ status: nextStatus }),
         });
         const payload = await response.json();

@@ -126,6 +126,8 @@ Operators and contributors should:
 - enforce strong unique passwords for `admin`, `staff`, and `auditor` roles
 - run the dashboard and Flower behind authentication and trusted network boundaries
 - use HTTPS/TLS in every non-local deployment
+- keep CSRF protection enabled for all session-backed dashboard forms and AJAX actions
+- tune `WEB_AUTH_RATE_LIMIT`, `WEB_API_RATE_LIMIT`, and `WEB_EXPORT_RATE_LIMIT` to match expected traffic
 - limit broker, database, and worker network access to required services only
 - review audit logs regularly for unusual discovery, outreach, and settings changes
 - back up the SQLite database and verify restore procedures
