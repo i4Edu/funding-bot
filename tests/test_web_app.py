@@ -629,7 +629,7 @@ class SettingsPanelTests(unittest.TestCase):
                     }
                 ],
                 keywords=["literacy"],
-                discovered_at="2026-06-22T08:00:00+00:00",
+                discovered_at=datetime(2026, 6, 22, 8, 0, tzinfo=timezone.utc),
             )
             signature = discovered[0]["signature"]
             task = bot.create_task(
@@ -651,7 +651,11 @@ class SettingsPanelTests(unittest.TestCase):
                 "SELECT id FROM communications WHERE donor_email = ?",
                 ("engaged@example.org",),
             ).fetchone()["id"]
-            bot.record_outreach_event(communication_id, "opened")
+            bot.record_outreach_event(
+                communication_id,
+                "opened",
+                happened_at=datetime(2026, 6, 22, 9, 30, tzinfo=timezone.utc),
+            )
             for day in range(1, 8):
                 bot.record_connector_call_metric(
                     connector_name="Grants Portal",

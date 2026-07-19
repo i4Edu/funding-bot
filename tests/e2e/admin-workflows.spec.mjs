@@ -68,7 +68,7 @@ test("admin can run settings, connector, task, and export workflows", async ({ b
   await expect(exportPage.locator("body")).toContainText("Playwright edited task");
 
   await page.getByRole("link", { name: "Open dashboard page" }).click();
-  await expect(page.getByText("Education Innovation Grant")).toBeVisible();
+  await expect(page.getByRole("cell", { name: "Education Innovation Grant" })).toBeVisible();
 
   await context.close();
 });

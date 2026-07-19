@@ -168,6 +168,19 @@ Secret donor preferences and organization-profile payloads are encrypted at rest
   - deduplicated organization profile payloads: 10 minutes
 - Donor/profile writes invalidate related cache keys immediately; connector caches refresh through TTL expiration.
 
+### Funnel analytics, attribution, and cost tracking
+
+- `/analytics` now returns the legacy outreach stats plus a dashboard payload with attribution, funnel, cost, and anomaly data.
+- Funnel APIs:
+  - `/analytics/funnel` — stage counts and conversion rates for `discover → dedupe → match → outreach → response`
+  - `/analytics/attribution` — per-connector attribution for discovered opportunities, matched records, tasks, outreach, responses, and submitted applications
+- Cost and alerting APIs:
+  - `/analytics/costs` — per-connector API call counts, request volume, latency, error rate, and estimated USD cost totals
+  - `/analytics/anomalies` — baseline-vs-current anomaly detection for unusual connector error rates, latency spikes, and cost spikes
+  - `/analytics/dashboard` — combined dashboard-ready analytics payload
+- Connector call history is stored in `connector_call_metrics`; funnel stage transitions are stored in `funnel_events`.
+- Task and communication records now keep connector attribution fields so successful outreach and application outcomes can be traced back to the originating connector.
+
 ### Deployment topology
 
 ```text

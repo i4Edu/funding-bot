@@ -66,8 +66,10 @@ class CeleryTaskDefinitionTests(unittest.TestCase):
 
 class CeleryTaskExecutionTests(unittest.TestCase):
     def setUp(self):
-        self.db_path = Path(f".test_queue_{self._testMethodName}.db")
-        self.export_dir = Path(f".test_queue_exports_{self._testMethodName}")
+        self.artifacts_dir = Path(".test-artifacts")
+        self.artifacts_dir.mkdir(exist_ok=True)
+        self.db_path = self.artifacts_dir / f"queue_{self._testMethodName}.db"
+        self.export_dir = self.artifacts_dir / f"queue_exports_{self._testMethodName}"
         if self.db_path.exists():
             self.db_path.unlink()
         if self.export_dir.exists():
@@ -107,6 +109,10 @@ class CeleryTaskExecutionTests(unittest.TestCase):
             self.assertEqual("on_success", task_run["callback_name"])
             self.assertEqual("completed", task_run["callback_payload"]["state"])
             self.assertEqual(1, len(bot.list_opportunities()))
+            self.assertGreaterEqual(
+                {row["name"]: row for row in bot.get_slo_summary()}["task_queue_throughput"]["samples"],
+                1,
+            )
         finally:
             bot.close()
 
@@ -194,7 +200,7 @@ class CeleryTaskExecutionTests(unittest.TestCase):
         finally:
             bot.close()
 
-        result = task_queue.export_data_warehouse_task(
+        result = task_queue.export_data_warehouse_task.run(
             datasets=["donors"],
             export_format="json",
             output_dir=str(self.export_dir),
@@ -267,6 +273,7 @@ class DispatchDiscoveryTests(unittest.TestCase):
         self.assertEqual("hybrid", payload["mode"])
         self.assertTrue(payload["legacy_cron_enabled"])
         delayed.assert_called_once()
+        self.assertIn("traceparent", delayed.call_args.kwargs["trace_context"])
 
 
 class QueueHealthTests(unittest.TestCase):

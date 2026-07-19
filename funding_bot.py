@@ -8224,6 +8224,7 @@ class FundingBot:
         export_format: str = "json",
         output_dir: str | os.PathLike[str] = "generated/exports",
         archive: bool = False,
+        dry_run: bool = False,
         archive_manager: ArchiveManager | None = None,
         progress_callback: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
@@ -8232,6 +8233,7 @@ class FundingBot:
             export_format=export_format,
             output_dir=output_dir,
             archive=archive,
+            dry_run=dry_run,
             archive_manager=archive_manager,
             progress_callback=progress_callback,
         )
@@ -11000,7 +11002,13 @@ class FundingBot:
         result["template_name"] = template_name
         return result
 
-    def record_outreach_event(self, communication_id: int, event_type: str) -> None:
+    def record_outreach_event(
+        self,
+        communication_id: int,
+        event_type: str,
+        *,
+        happened_at: datetime | None = None,
+    ) -> None:
         """Store an outreach engagement event."""
         allowed = {"sent", "opened", "clicked", "bounced", "unsubscribed"}
         normalized_event = event_type.strip().lower()
@@ -11023,7 +11031,7 @@ class FundingBot:
             INSERT INTO outreach_events (communication_id, event_type, happened_at)
             VALUES (?, ?, ?)
             """,
-            (communication_id, normalized_event, self._to_iso()),
+            (communication_id, normalized_event, self._to_iso(happened_at)),
         )
         self.connection.commit()
         self._log_action(
@@ -11044,6 +11052,7 @@ class FundingBot:
                 task_id=communication["related_task_id"],
                 communication_id=communication_id,
                 event_type=normalized_event,
+                happened_at=happened_at,
                 metadata={"donor_email": communication["donor_email"]},
             )
 

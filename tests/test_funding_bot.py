@@ -34,6 +34,7 @@ from funding_bot import (
     validate_credential_alias,
     validate_env_var_name,
 )
+from observability import start_span
 from warehouse_exports import ArchiveManager
 
 TEST_ARTIFACTS_DIR = Path(".test-artifacts")
@@ -1355,6 +1356,24 @@ class PortalConnectorTests(unittest.TestCase):
             rows[0]["portal_url"],
         )
 
+    def test_connector_http_client_receives_traceparent_when_span_active(self):
+        seen_headers = []
+
+        def fake_http_client(url, payload, credentials=None, headers=None):
+            seen_headers.append(dict(headers or {}))
+            return {
+                "organizations": [],
+                "total_results": 0,
+                "per_page": 25,
+            }
+
+        connector = NGODirectoryConnector(http_client=fake_http_client, transport="http")
+        with start_span("test.connector.trace"):
+            connector.fetch_opportunities(["housing"])
+
+        self.assertEqual(1, len(seen_headers))
+        self.assertIn("traceparent", seen_headers[0])
+
     def test_foundation_directory_connector_uses_registered_credentials_for_live_results(self):
         calls = []
         bot = FundingBot()
@@ -2662,7 +2681,11 @@ class OutreachAnalyticsAndGdprTests(unittest.TestCase):
             "SELECT id FROM communications WHERE donor_email = ?",
             ("privacy@example.org",),
         ).fetchone()["id"]
-        self.bot.record_outreach_event(communication_id, "opened")
+        self.bot.record_outreach_event(
+            communication_id,
+            "opened",
+            happened_at=datetime(2026, 6, 22, 9, 30, tzinfo=timezone.utc),
+        )
 
         export = self.bot.gdpr_export("privacy@example.org")
 
@@ -2734,7 +2757,11 @@ class OutreachAnalyticsAndGdprTests(unittest.TestCase):
             "SELECT id FROM communications WHERE donor_email = ?",
             ("engaged@example.org",),
         ).fetchone()["id"]
-        self.bot.record_outreach_event(communication_id, "opened")
+        self.bot.record_outreach_event(
+            communication_id,
+            "opened",
+            happened_at=datetime(2026, 6, 22, 9, 30, tzinfo=timezone.utc),
+        )
         application = self.bot.submit_application(
             signature,
             submission_reference="ref-123",
@@ -3502,13 +3529,20 @@ class CliLoggingAndInteractiveTests(unittest.TestCase):
         cases = (
             (
                 ["--verbose", "--db", str(self.db_path), "list-opportunities"],
-                {"verbose": True, "quiet": False},
+                {"verbose": True, "quiet": False, "no_color": False},
             ),
             (
                 ["--quiet", "--db", str(self.db_path), "list-opportunities"],
-                {"verbose": False, "quiet": True},
+                {"verbose": False, "quiet": True, "no_color": False},
             ),
-            (["--db", str(self.db_path), "list-opportunities"], {"verbose": False, "quiet": False}),
+            (
+                ["--db", str(self.db_path), "list-opportunities"],
+                {"verbose": False, "quiet": False, "no_color": False},
+            ),
+            (
+                ["--no-color", "--db", str(self.db_path), "list-opportunities"],
+                {"verbose": False, "quiet": False, "no_color": True},
+            ),
         )
         for argv, expected in cases:
             with self.subTest(argv=argv):
@@ -3518,6 +3552,16 @@ class CliLoggingAndInteractiveTests(unittest.TestCase):
                 ):
                     main(argv)
                 configure_logging.assert_called_once_with(**expected)
+
+    def test_no_color_flag_disables_ansi_styling(self):
+        with (
+            unittest.mock.patch("funding_bot._stream_supports_color", return_value=True),
+            unittest.mock.patch.dict("os.environ", {}, clear=False),
+        ):
+            _configure_cli_output(no_color=False, json_output=False)
+            self.assertNotEqual("ok", _style_cli_text("ok", level="success"))
+            _configure_cli_output(no_color=True, json_output=False)
+            self.assertEqual("ok", _style_cli_text("ok", level="success"))
 
     def test_send_outreach_prompts_for_missing_required_arguments(self):
         with (
@@ -3641,6 +3685,24 @@ class SearchSettingsAndDiscoveryTests(unittest.TestCase):
             found = self.bot.run_discovery(keywords=["literacy"])
         self.assertEqual(1, len(found))
         self.assertEqual("NGO Directory", found[0]["source"])
+
+    def test_run_discovery_reports_connector_and_bulk_progress(self):
+        events = []
+
+        found = self.bot.run_discovery(
+            [GrantsPortalConnector(), CSRNetworkConnector()],
+            keywords=["education"],
+            progress_callback=events.append,
+        )
+
+        self.assertEqual(1, len(found))
+        stages = {event["stage"] for event in events}
+        self.assertIn("connector-discovery", stages)
+        self.assertIn("bulk-persist", stages)
+        connector_event = next(event for event in events if event["stage"] == "connector-discovery")
+        bulk_event = next(event for event in events if event["stage"] == "bulk-persist")
+        self.assertEqual(2, connector_event["total"])
+        self.assertGreaterEqual(bulk_event["total"], 1)
 
 
 class CliSearchAndSettingsCommandsTests(unittest.TestCase):
@@ -4233,6 +4295,7 @@ class DatabaseIndexingTests(unittest.TestCase):
                 "idx_donors_name_email",
                 "idx_tasks_status",
                 "idx_tasks_created_at_status",
+                "idx_tasks_status_created_at",
                 "idx_tasks_assigned_to_status",
                 "idx_connector_result_cache_lookup",
                 "idx_connector_result_cache_status_fetched_at",
@@ -4247,7 +4310,7 @@ class DatabaseIndexingTests(unittest.TestCase):
         self.assertIn("idx_donors_name_email", plans["donor-directory"]["indexes"])
         self.assertTrue(plans["donor-email-lookup"]["uses_index"])
         self.assertIn("idx_tasks_assigned_to_status", plans["task-assignee-status"]["indexes"])
-        self.assertTrue(plans["task-status-created-at"]["uses_index"])
+        self.assertIn("idx_tasks_status_created_at", plans["task-status-created-at"]["indexes"])
         self.assertTrue(plans["connector-response-lookup"]["uses_index"])
         self.assertIn(
             "idx_connector_result_cache_status_fetched_at",
