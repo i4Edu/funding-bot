@@ -12,11 +12,26 @@ For the full Flask endpoint reference, example requests, authentication rules, a
 For collaboration workflow, permissions, and task API examples, see [docs/COLLABORATION.md](docs/COLLABORATION.md).
 For the complete JSON/text API contract, schemas, diagrams, and curl examples, see [docs/API_REFERENCE.md](docs/API_REFERENCE.md).
 For deployment and scaling guidance, see [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md).
+For Kubernetes rollout details, see [docs/KUBERNETES.md](docs/KUBERNETES.md).
+For release/versioning rules, see [docs/VERSIONING.md](docs/VERSIONING.md).
 For a fast local setup guide, see [docs/QUICKSTART.md](docs/QUICKSTART.md).
 For the complete environment variable reference, see [docs/ENV_VARS.md](docs/ENV_VARS.md).
+For a shared vocabulary of product and workflow terms, see [docs/GLOSSARY.md](docs/GLOSSARY.md).
+For training and onboarding recordings, see [docs/VIDEOS.md](docs/VIDEOS.md).
 For contributor setup, pull request expectations, and code review standards, see [CONTRIBUTING.md](CONTRIBUTING.md).
 For vulnerability reporting, disclosure timelines, incident response, and the penetration-testing checklist, see [docs/SECURITY.md](docs/SECURITY.md).
 For the operational breach runbook, see [docs/INCIDENT_RESPONSE.md](docs/INCIDENT_RESPONSE.md).
+
+## Documentation Navigation
+
+- [Quickstart](docs/QUICKSTART.md)
+- [Glossary](docs/GLOSSARY.md)
+- [Video walkthroughs](docs/VIDEOS.md)
+- [Connector guide](docs/CONNECTORS.md)
+- [API reference](docs/API.md)
+- [Collaboration guide](docs/COLLABORATION.md)
+- [Deployment guide](docs/DEPLOYMENT.md)
+- [Environment variable reference](docs/ENV_VARS.md)
 
 ## Overview
 
@@ -288,6 +303,21 @@ npm install
 npm run test:a11y
 ```
 
+### Run dashboard load tests
+
+```bash
+python tests/load/seed_dashboard_data.py --db-path .load-test-dashboard.db
+BOT_DB_PATH=.load-test-dashboard.db ADMIN_PASSWORD=admin-secret STAFF_PASSWORD=staff-secret AUDITOR_PASSWORD=auditor-secret SESSION_COOKIE_SECURE=0 \
+  python -m flask --app web.app run --host 127.0.0.1 --port 5001
+```
+
+```bash
+LOAD_TEST_PASSWORD=admin-secret \
+  locust -f tests/load/locustfile.py --host http://127.0.0.1:5001 --headless -u 12 -r 3 -t 45s \
+  --html dashboard-load-report.html --csv dashboard-load
+python tests/load/assert_dashboard_load.py --csv-prefix dashboard-load --max-failures 0 --max-p95-ms 750 --min-rps 5
+```
+
 ### Run the CLI
 
 ```bash
@@ -335,7 +365,35 @@ python -m funding_bot list-donors --segment corporate
 ### Run the web dashboard
 
 ```bash
-python -m flask --app web.app run
+python scripts/run_dev_web.py
+```
+
+### VS Code devcontainer development
+
+Use the checked-in devcontainer for remote development with Python, PostgreSQL,
+Redis, a Celery worker, and a mock connector server:
+
+```bash
+cp .env.example .env
+docker compose up --build
+```
+
+Then open the repository in VS Code and choose **Dev Containers: Reopen in
+Container**. The devcontainer starts these services from
+`docker-compose.override.yml`:
+
+- `devcontainer` for editing and running Python commands
+- `web` with Werkzeug hot reload via `python scripts/run_dev_web.py`
+- `worker` with `watchmedo auto-restart` for Celery code changes
+- `redis` and `postgres` for local dependencies
+- `mock-connectors` on `http://localhost:8080` for connector testing
+
+Useful commands inside the container:
+
+```bash
+python -m unittest discover -s tests
+python scripts/mock_connector_server.py --host 0.0.0.0 --port 8080
+python scripts/run_dev_web.py
 ```
 
 ## CLI Reference
@@ -931,7 +989,8 @@ For pull request workflow, review standards, setup steps, and contributor etique
 
 ## Docker Deployment
 
-The repository includes a `Dockerfile` and `docker-compose.yml`.
+The repository includes a `Dockerfile`, `docker-compose.yml`, and
+`docker-compose.override.yml`.
 
 1. Copy environment settings:
 
@@ -940,10 +999,16 @@ The repository includes a `Dockerfile` and `docker-compose.yml`.
    ```
 
 2. Update values in `.env` for SMTP credentials, database path, dashboard passwords, and queue flags.
-3. Start the stack:
+3. Start the default stack:
 
    ```bash
    docker compose --profile queue up --build
+   ```
+
+4. For local development with hot reload, mock connectors, and PostgreSQL:
+
+   ```bash
+   docker compose up --build
    ```
 
 The Compose stack runs:
@@ -953,11 +1018,18 @@ The Compose stack runs:
 - a Celery `worker` and optional `flower` monitoring UI on `http://localhost:5555`
 - a shared volume for SQLite data at `/app/data`
 
+The development override additionally starts:
+- `devcontainer` as the VS Code workspace container
+- `postgres` on `localhost:5432`
+- `mock-connectors` on `http://localhost:8080`
+- hot reload for the Flask dashboard and Celery worker via Werkzeug + watchdog
+
 ## Kubernetes Deployment
 
 Kubernetes is the v0.5.0+ deployment target.
 
 ```bash
+kubectl apply -f k8s/namespace.yaml
 kubectl apply -f k8s/
 ```
 
@@ -967,7 +1039,7 @@ Recommended secret/config inputs:
 - dashboard auth: `ADMIN_PASSWORD`, `STAFF_PASSWORD`, `AUDITOR_PASSWORD`
 - persistence/runtime: `BOT_DB_PATH`, `ENABLE_TASK_QUEUE`, `ENABLE_LEGACY_CRON`, `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND`
 
-Use a `CronJob` for scheduled summary delivery, a second `CronJob` for retention cleanup (`python -m funding_bot enforce-data-retention`), and a `Deployment`/`Service` pair for the dashboard. If the `k8s/` manifests are not yet present in your branch, treat this as the target structure for the scaling release.
+Use a `CronJob` for scheduled summary delivery, a second `CronJob` for retention cleanup (`python -m funding_bot enforce-data-retention`), and a `Deployment`/`Service`/`Ingress` set for the dashboard. Horizontal scaling is defined in `k8s/hpa.yaml`, vertical sizing recommendations live in `k8s/vpa.yaml`, and the full rollout checklist is documented in [docs/KUBERNETES.md](docs/KUBERNETES.md).
 
 ## Compliance Documentation
 

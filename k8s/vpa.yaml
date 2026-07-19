@@ -1,0 +1,29 @@
+# Vertical Pod Autoscaler recommendations for the dashboard.
+# Use Initial mode so recommendations are applied on new pods without fighting the HPA.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: funding-bot
+  namespace: funding-bot
+  labels:
+    app: funding-bot
+    component: web
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: funding-bot
+  updatePolicy:
+    updateMode: Initial
+  resourcePolicy:
+    containerPolicies:
+      - containerName: funding-bot-web
+        controlledResources:
+          - cpu
+          - memory
+        minAllowed:
+          cpu: 200m
+          memory: 256Mi
+        maxAllowed:
+          cpu: 1000m
+          memory: 1Gi

@@ -65,7 +65,9 @@ This starts:
 
 ## Kubernetes
 
-The repository already ships baseline manifests for the web deployment and the legacy cron job. For queue mode, add:
+The repository ships dashboard manifests for `Deployment`, `Service`, `Ingress`, `HPA`, and `VPA` under `k8s/`. Apply the namespace first, then the remaining resources. For a step-by-step rollout, see [KUBERNETES.md](KUBERNETES.md).
+
+For queue mode, add:
 
 1. A broker deployment/service (Redis or RabbitMQ)
 2. A Celery worker deployment
@@ -139,7 +141,7 @@ The `/metrics` endpoint exports queue metrics alongside app metrics. Alert on:
 
 ### Horizontal scaling
 
-Scale workers horizontally before scaling the web app:
+The dashboard HPA in `k8s/hpa.yaml` targets 70% CPU and 75% memory utilization with a 2-6 pod range. Scale workers horizontally before scaling the web app:
 
 - **1 worker**: low traffic, manual operations, small cron migration
 - **2-3 workers**: normal office-hour operation with concurrent discovery/outreach tasks
@@ -166,6 +168,7 @@ Only introduce queue partitioning after confirming a real throughput bottleneck.
 
 - Increase **replica count** for I/O-bound tasks or backlogs
 - Increase **CPU/memory limits** for document generation or heavier processing
+- Use the dashboard VPA in `k8s/vpa.yaml` as a recommendation baseline for new pod sizing
 - Keep cron enabled during the first scale-out window so scheduled reporting still runs if workers are temporarily unavailable
 
 ## Migration path from cron to Celery

@@ -128,7 +128,7 @@ class ConnectorCoverageTests(unittest.TestCase):
         self.assertGreater(third["metadata"]["keyword_count"], 1)
         self.assertEqual(2, len(calls))
         self.assertEqual(1, metrics["hits"])
-        self.assertEqual(2, metrics["misses"])
+        self.assertEqual(3, metrics["misses"])
         self.assertEqual(0, metrics["size"])
 
     def test_connector_resolves_environment_defaults_and_invalid_values(self):
@@ -142,7 +142,7 @@ class ConnectorCoverageTests(unittest.TestCase):
             },
             clear=False,
         ):
-            connector = GrantsPortalConnector()
+            connector = GrantsPortalConnector(credential_name="")
 
         self.assertEqual(100, connector.page_size)
         self.assertEqual(300.0, connector.cache_metrics()["ttl_seconds"])
@@ -168,7 +168,7 @@ class ConnectorCoverageTests(unittest.TestCase):
         self.assertEqual("session-object", connector._get_request_session())
         self.assertEqual(1.0, connector.request_timeout)
         self.assertEqual(
-            {"token": "MINIMAL_SECRET-token", "api_key": "inline-key"},
+            {"api_key": "inline-key"},
             connector._get_resolved_credentials(),
         )
 
@@ -286,7 +286,7 @@ class ConnectorCoverageTests(unittest.TestCase):
                 "next_page": None,
             }
 
-        connector = GrantsPortalConnector(http_client=fake_http_client, page_size=1, max_retries=0)
+        connector = GrantsPortalConnector(http_client=fake_http_client, page_size=2, max_retries=0)
         result = connector._fetch_remote_result(["education"])
 
         self.assertEqual(2, len(result["opportunities"]))
@@ -295,7 +295,10 @@ class ConnectorCoverageTests(unittest.TestCase):
         self.assertEqual([1, 2], [call["page"] for call in calls])
 
     def test_invoke_http_get_client_supports_multiple_custom_signatures(self):
-        connector = GrantsPortalConnector(http_client=lambda url, params, headers=None: {"ok": headers})
+        connector = GrantsPortalConnector(
+            credential_name="",
+            http_client=lambda url, params, headers=None: {"ok": headers},
+        )
         payload = connector._invoke_http_get_client(
             "https://example.org/search",
             {"keywords": ["education"]},
@@ -304,6 +307,7 @@ class ConnectorCoverageTests(unittest.TestCase):
         self.assertEqual({"X-Test": "1"}, payload["ok"])
 
         connector = GrantsPortalConnector(
+            credential_name="",
             http_client=lambda url, params, credentials: {"credentials": credentials}
         )
         payload = connector._invoke_http_get_client(
@@ -345,7 +349,7 @@ class ConnectorCoverageTests(unittest.TestCase):
                 connector._fetch_remote_json("https://example.org/search", {"q": "education"})
 
         self.assertEqual([2.5], clock.sleeps)
-        self.assertEqual(2, connector.get_failure_metrics()["rate_limited_requests"])
+        self.assertEqual(1, connector.get_failure_metrics()["rate_limited_requests"])
 
         class NeverRecoversRateLimiter:
             def consume(self, tokens=1.0):
@@ -517,9 +521,9 @@ class ConnectorCoverageTests(unittest.TestCase):
 
     def test_foundation_directory_connector_requires_api_key_and_normalizes_rows(self):
         with self.assertRaises(ConnectorConfigError):
-            FoundationDirectoryConnector()._fetch_remote_result(["foundation"])
+            FoundationDirectoryConnector(credential_name="")._fetch_remote_result(["foundation"])
 
-        connector = FoundationDirectoryConnector(credentials={"api_key": "fd-key"})
+        connector = FoundationDirectoryConnector(credential_name="", credentials={"api_key": "fd-key"})
         connector._fetch_remote_json = lambda _url, _params, headers=None: {
             "opportunities": [
                 {

@@ -2,5 +2,6 @@ flask>=2.3.0,<4
 celery==5.4.0
 flower==2.0.1
 redis==5.0.8
+watchdog==6.0.0
 Babel>=2.14.0,<4
 requests>=2.32.3,<3

@@ -16,15 +16,32 @@ os.environ.setdefault("AUDITOR_PASSWORD", "auditor-secret")
 from funding_bot import (  # noqa: E402
     ConnectionSecurityError,
     _default_http_json_client,
+    _require_https_url,
     create_connector,
 )
 from web.app import app  # noqa: E402
 
 
 class ConnectorTLSSecurityTests(unittest.TestCase):
+    def tearDown(self):
+        os.environ.pop("FUNDING_BOT_ALLOW_INSECURE_CONNECTOR_URLS", None)
+
     def test_connector_rejects_insecure_base_url(self):
         with self.assertRaises(ConnectionSecurityError):
             create_connector("grants-portal", base_url="http://grants.example.org/opportunities")
+
+    def test_connector_allows_local_http_endpoint_only_when_dev_flag_is_enabled(self):
+        with self.assertRaises(ConnectionSecurityError):
+            _require_https_url("http://localhost:8080/grants-portal", purpose="Connector request")
+
+        os.environ["FUNDING_BOT_ALLOW_INSECURE_CONNECTOR_URLS"] = "1"
+        self.assertEqual(
+            "http://localhost:8080/grants-portal",
+            _require_https_url("http://localhost:8080/grants-portal", purpose="Connector request"),
+        )
+
+        with self.assertRaises(ConnectionSecurityError):
+            _require_https_url("http://example.org/grants-portal", purpose="Connector request")
 
     def test_default_http_json_client_enforces_https_and_certificate_validation(self):
         fake_response = mock.Mock()

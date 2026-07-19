@@ -47,8 +47,11 @@ This exercises the main dashboard pages and supporting JSON/metrics endpoints un
    export STAFF_PASSWORD=staff-secret
    export AUDITOR_PASSWORD=auditor-secret
    export BOT_DB_PATH=.load-test-dashboard.db
+   export SESSION_COOKIE_SECURE=0
    python -m flask --app web.app run --host 127.0.0.1 --port 5001
    ```
+
+   `SESSION_COOKIE_SECURE=0` is only for local/plain-HTTP load-test runs so the authenticated session cookie can be reused by Locust.
 
 4. Run the headless load test from another shell:
 

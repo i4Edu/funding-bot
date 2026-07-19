@@ -26,10 +26,10 @@ WORKDIR /app
 # Keep the build context lean with .dockerignore entries such as:
 # __pycache__/, *.pyc, .git/, *.db, tests/, and .env.
 COPY funding_bot.py /app/funding_bot.py
-COPY celery_tasks.py /app/celery_tasks.py
 COPY task_queue.py /app/task_queue.py
 COPY celery_app.py /app/celery_app.py
 COPY tasks /app/tasks
+COPY scripts /app/scripts
 COPY web /app/web
 
 RUN mkdir -p /app/data && chown -R botuser:botuser /app

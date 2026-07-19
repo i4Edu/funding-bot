@@ -106,4 +106,6 @@ If a privacy or security issue is suspected:
 ## Related docs
 
 - [Accessibility status](ACCESSIBILITY.md)
+- [Glossary of key terms](GLOSSARY.md)
+- [Video walkthroughs](VIDEOS.md)
 - [Repository overview](../README.md)

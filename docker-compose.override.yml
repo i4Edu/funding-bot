@@ -1,0 +1,143 @@
+services:
+  bot:
+    profiles: ["manual"]
+    command: ["sleep", "infinity"]
+    volumes:
+      - .:/app
+      - bot_data:/app/data
+
+  devcontainer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: funding-bot:dev
+    command: ["sleep", "infinity"]
+    env_file:
+      - .env
+    environment:
+      BOT_DB_PATH: /app/data/funding_bot.db
+      FUNDING_BOT_ALLOW_INSECURE_CONNECTOR_URLS: "1"
+      FUNDING_BOT_CONNECTORS: >-
+        {"connectors":[
+          {"type":"grants-portal","transport":"http","base_url":"http://mock-connectors:8080/grants-portal"},
+          {"type":"csr-network","transport":"http","base_url":"http://mock-connectors:8080/csr-network","credentials":{"subscription_key":"mock-csr-key"}},
+          {"type":"ngo-directory","transport":"demo"},
+          {"type":"foundation-directory","transport":"demo","credentials":{"api_key":"mock-foundation-key"}},
+          {"type":"globalgiving","transport":"demo"},
+          {"type":"kickstarter-for-good","transport":"demo"}
+        ]}
+    depends_on:
+      - postgres
+      - redis
+      - mock-connectors
+    volumes:
+      - .:/app
+      - bot_data:/app/data
+
+  web:
+    command: ["python", "scripts/run_dev_web.py"]
+    environment:
+      FLASK_DEBUG: "1"
+      BOT_DB_PATH: /app/data/funding_bot.db
+      FUNDING_BOT_ALLOW_INSECURE_CONNECTOR_URLS: "1"
+      FUNDING_BOT_CONNECTORS: >-
+        {"connectors":[
+          {"type":"grants-portal","transport":"http","base_url":"http://mock-connectors:8080/grants-portal"},
+          {"type":"csr-network","transport":"http","base_url":"http://mock-connectors:8080/csr-network","credentials":{"subscription_key":"mock-csr-key"}},
+          {"type":"ngo-directory","transport":"demo"},
+          {"type":"foundation-directory","transport":"demo","credentials":{"api_key":"mock-foundation-key"}},
+          {"type":"globalgiving","transport":"demo"},
+          {"type":"kickstarter-for-good","transport":"demo"}
+        ]}
+    depends_on:
+      - redis
+      - postgres
+      - mock-connectors
+    volumes:
+      - .:/app
+      - bot_data:/app/data
+
+  worker:
+    profiles: []
+    command:
+      [
+        "watchmedo",
+        "auto-restart",
+        "--directory=.",
+        "--patterns=*.py;*.html",
+        "--recursive",
+        "--",
+        "celery",
+        "-A",
+        "celery_app:celery_app",
+        "worker",
+        "--loglevel=info",
+        "--queues",
+        "funding-bot"
+      ]
+    environment:
+      BOT_DB_PATH: /app/data/funding_bot.db
+      FUNDING_BOT_ALLOW_INSECURE_CONNECTOR_URLS: "1"
+      FUNDING_BOT_CONNECTORS: >-
+        {"connectors":[
+          {"type":"grants-portal","transport":"http","base_url":"http://mock-connectors:8080/grants-portal"},
+          {"type":"csr-network","transport":"http","base_url":"http://mock-connectors:8080/csr-network","credentials":{"subscription_key":"mock-csr-key"}},
+          {"type":"ngo-directory","transport":"demo"},
+          {"type":"foundation-directory","transport":"demo","credentials":{"api_key":"mock-foundation-key"}},
+          {"type":"globalgiving","transport":"demo"},
+          {"type":"kickstarter-for-good","transport":"demo"}
+        ]}
+    depends_on:
+      - redis
+      - postgres
+      - mock-connectors
+    volumes:
+      - .:/app
+      - bot_data:/app/data
+
+  mock-connectors:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: funding-bot:dev
+    command:
+      [
+        "watchmedo",
+        "auto-restart",
+        "--directory=.",
+        "--patterns=*.py",
+        "--recursive",
+        "--",
+        "python",
+        "scripts/mock_connector_server.py",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8080"
+      ]
+    environment:
+      PYTHONUNBUFFERED: "1"
+    ports:
+      - "8080:8080"
+    volumes:
+      - .:/app
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: funding_bot
+      POSTGRES_USER: funding_bot
+      POSTGRES_PASSWORD: funding_bot
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    profiles: []
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:

@@ -154,5 +154,7 @@ Start the queue profile and optionally set `FLOWER_BASIC_AUTH` in `.env` before 
 ## Related docs
 
 - [Environment variable reference](ENV_VARS.md)
+- [Glossary of key terms](GLOSSARY.md)
+- [Video walkthroughs](VIDEOS.md)
 - [Deployment guide](DEPLOYMENT.md)
 - [Security guide](SECURITY.md)

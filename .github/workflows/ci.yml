@@ -68,6 +68,7 @@ jobs:
           STAFF_PASSWORD: staff-secret
           AUDITOR_PASSWORD: auditor-secret
           BOT_DB_PATH: .ci-dashboard-load.db
+          SESSION_COOKIE_SECURE: "0"
         run: |
           python -m flask --app web.app run --host 127.0.0.1 --port 5001 > flask.log 2>&1 &
           echo $! > flask.pid

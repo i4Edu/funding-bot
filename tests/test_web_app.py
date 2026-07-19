@@ -423,40 +423,23 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn(b"Overdue", response.data)
 
     def _seed_task_filter_data(self):
-        bot = FundingBot(db_path=str(self.db_path))
-        tasks = [
-            bot.create_task(
-                title="Staff todo soon",
-                assigned_to="staff",
-                status="todo",
-                due_date="2026-07-20",
-            ),
-            bot.create_task(
-                title="Staff in progress late",
-                assigned_to="staff",
-                status="in-progress",
-                due_date="2026-07-25",
-            ),
-            bot.create_task(
-                title="Admin todo mid",
-                assigned_to="admin",
-                status="todo",
-                due_date="2026-07-22",
-            ),
-            bot.create_task(
-                title="Auditor done early",
-                assigned_to="auditor",
-                status="done",
-                due_date="2026-07-18",
-            ),
-            bot.create_task(
-                title="Admin blocked latest",
-                assigned_to="admin",
-                status="blocked",
-                due_date="2026-08-01",
-            ),
+        payloads = [
+            {"title": "Staff todo soon", "assigned_to": "staff", "status": "todo", "due_date": "2026-07-20"},
+            {
+                "title": "Staff in progress late",
+                "assigned_to": "staff",
+                "status": "in-progress",
+                "due_date": "2026-07-25",
+            },
+            {"title": "Admin todo mid", "assigned_to": "admin", "status": "todo", "due_date": "2026-07-22"},
+            {"title": "Auditor done early", "assigned_to": "auditor", "status": "done", "due_date": "2026-07-18"},
+            {"title": "Admin blocked latest", "assigned_to": "admin", "status": "blocked", "due_date": "2026-08-01"},
         ]
-        bot.close()
+        tasks = []
+        for payload in payloads:
+            response = self.client.post("/tasks", json=payload, headers=self.admin_headers)
+            self.assertEqual(201, response.status_code)
+            tasks.append(response.get_json()["task"])
         return tasks
 
     def test_tasks_api_supports_all_filter_combinations(self):

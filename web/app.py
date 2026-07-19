@@ -6,6 +6,7 @@ import hmac
 import importlib
 import json
 import os
+import secrets
 import sys
 import time
 from datetime import datetime, timedelta, timezone
@@ -14,6 +15,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from flask import Flask, Response, g, jsonify, redirect, render_template, request, session, url_for
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -65,6 +68,8 @@ DEFAULT_SESSION_TIMEOUT_MINUTES = 30
 SESSION_ROLE_KEY = "authenticated_role"
 SESSION_AUTHENTICATED_AT_KEY = "authenticated_at"
 SESSION_LAST_SEEN_AT_KEY = "last_seen_at"
+SESSION_CSRF_TOKEN_KEY = "csrf_token"
+CSRF_UNSAFE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 # Track server start time for the uptime metric.
 _APP_START_TIME = time.time()
@@ -114,12 +119,118 @@ def _configure_session_security(flask_app: Flask) -> None:
 _configure_session_security(app)
 
 
+def _configure_request_protection(flask_app: Flask) -> None:
+    flask_app.config.setdefault(
+        "RATE_LIMIT_AUTH",
+        os.environ.get("WEB_AUTH_RATE_LIMIT", "30 per minute"),
+    )
+    flask_app.config.setdefault(
+        "RATE_LIMIT_API",
+        os.environ.get("WEB_API_RATE_LIMIT", "120 per minute"),
+    )
+    flask_app.config.setdefault(
+        "RATE_LIMIT_EXPORT",
+        os.environ.get("WEB_EXPORT_RATE_LIMIT", "10 per minute"),
+    )
+    flask_app.config.setdefault(
+        "RATE_LIMIT_STORAGE_URI",
+        os.environ.get("WEB_RATE_LIMIT_STORAGE_URI", "memory://"),
+    )
+
+
+_configure_request_protection(app)
+
+
+def _csrf_token_value() -> str:
+    token = session.get(SESSION_CSRF_TOKEN_KEY)
+    if isinstance(token, str) and token:
+        return token
+    token = secrets.token_urlsafe(32)
+    session[SESSION_CSRF_TOKEN_KEY] = token
+    return token
+
+
+def _csrf_token_from_request() -> str:
+    token = request.headers.get("X-CSRF-Token") or request.headers.get("X-CSRFToken")
+    if token:
+        return token
+    return request.form.get("csrf_token", "")
+
+
+def _has_explicit_basic_auth() -> bool:
+    return request.headers.get("Authorization", "").startswith("Basic ")
+
+
+def _format_rate_limit_reset(reset_at: Any) -> tuple[str | None, int | None]:
+    if isinstance(reset_at, datetime):
+        reset_time = reset_at if reset_at.tzinfo else reset_at.replace(tzinfo=timezone.utc)
+    elif isinstance(reset_at, (int, float)):
+        reset_time = datetime.fromtimestamp(float(reset_at), tz=timezone.utc)
+    else:
+        return None, None
+    retry_after = max(int(reset_time.timestamp() - time.time()), 0)
+    return reset_time.isoformat(), retry_after
+
+
+def _rate_limit_breach_response(request_limit: Any) -> Response:
+    reset_at, retry_after = _format_rate_limit_reset(getattr(request_limit, "reset_at", None))
+    payload: dict[str, Any] = {
+        "error": "Rate limit exceeded. Retry the request after the limit window resets.",
+    }
+    headers: dict[str, str] = {}
+    if retry_after is not None:
+        payload["retry_after"] = retry_after
+        headers["Retry-After"] = str(retry_after)
+    if reset_at is not None:
+        payload["reset_at"] = reset_at
+    return _json_error(payload["error"], 429, headers=headers | ({"X-CSRF-Token": _csrf_token_value()} if session.get(SESSION_ROLE_KEY) else {})) if False else _build_json_response(payload, 429, headers=headers)
+
+
+def _build_json_response(
+    payload: dict[str, Any],
+    status_code: int,
+    *,
+    headers: dict[str, str] | None = None,
+) -> Response:
+    response = jsonify(payload)
+    response.status_code = status_code
+    if headers:
+        response.headers.update(headers)
+    return response
+
+
+def _rate_limit_value(config_key: str) -> Callable[[], str]:
+    def _resolver() -> str:
+        return str(app.config[config_key])
+
+    return _resolver
+
+
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=[],
+    headers_enabled=True,
+    storage_uri=str(app.config["RATE_LIMIT_STORAGE_URI"]),
+    on_breach=_rate_limit_breach_response,
+    retry_after="delta-seconds",
+)
+
+auth_rate_limit = limiter.limit(_rate_limit_value("RATE_LIMIT_AUTH"), override_defaults=False)
+api_rate_limit = limiter.limit(_rate_limit_value("RATE_LIMIT_API"), override_defaults=False)
+export_rate_limit = limiter.limit(_rate_limit_value("RATE_LIMIT_EXPORT"), override_defaults=False)
+
+
 def _bot() -> FundingBot:
     bot = g.get("_bot")
     if bot is None:
         bot = FundingBot(db_path=os.environ.get("BOT_DB_PATH", "funding_bot.db"))
         g._bot = bot
     return bot
+
+
+def _mapping_or_default(value: Any, default: dict[str, Any]) -> dict[str, Any]:
+    return value if isinstance(value, dict) else dict(default)
 
 
 def _json_error(message: str, status_code: int, *, headers: dict[str, str] | None = None) -> Response:
@@ -186,13 +297,14 @@ def _get_session_role() -> str | None:
 
 
 def _get_authenticated_role() -> str:
-    session_role = _get_session_role()
-    if session_role is not None:
-        return session_role
-
     header = request.headers.get("Authorization", "")
-    if not header.startswith("Basic "):
+    if not header:
+        session_role = _get_session_role()
+        if session_role is not None:
+            return session_role
         raise PermissionError("Authentication required")
+    if not header.startswith("Basic "):
+        raise PermissionError("Invalid authentication credentials")
 
     token = header.split(" ", 1)[1].strip()
     try:
@@ -411,7 +523,12 @@ def _task_status_counts(tasks: list[dict[str, Any]]) -> dict[str, int]:
 
 def _task_assignee_options() -> list[str]:
     rows = _bot().connection.execute(
-        "SELECT DISTINCT assignee FROM tasks WHERE assignee != '' ORDER BY assignee COLLATE NOCASE ASC"
+        """
+        SELECT DISTINCT COALESCE(assignee, assigned_to) AS assignee
+        FROM tasks
+        WHERE COALESCE(assignee, assigned_to) != ''
+        ORDER BY COALESCE(assignee, assigned_to) COLLATE NOCASE ASC
+        """
     ).fetchall()
     return [str(row["assignee"]) for row in rows]
 
@@ -1401,7 +1518,15 @@ def transition_task_status_route(task_id: int) -> Response:
 
 @app.get("/health")
 def health() -> Response:
-    return jsonify({"status": "ok", "queue": _get_queue_health_snapshot()})
+    bot = _bot()
+    return jsonify(
+        {
+            "status": "ok",
+            "queue": _get_queue_health_snapshot(),
+            "database": bot.get_database_pool_metrics(),
+            "cache": bot.get_cache_metrics()["health"],
+        }
+    )
 
 
 @app.get("/health/queue")
@@ -1409,6 +1534,16 @@ def queue_health() -> Response:
     snapshot = _get_queue_health_snapshot()
     status_code = 200 if snapshot["status"] in {"ok", "disabled"} else 503
     return jsonify(snapshot), status_code
+
+
+@app.get("/health/database")
+def database_health() -> Response:
+    return jsonify(_bot().get_database_pool_metrics())
+
+
+@app.get("/health/cache")
+def cache_health() -> Response:
+    return jsonify(_bot().get_cache_metrics()["health"])
 
 
 @app.get("/metrics")
@@ -1450,7 +1585,12 @@ def metrics() -> Response:
     queue_health = _get_queue_health_snapshot()
     queue_status_value = 1 if queue_health["status"] == "ok" else 0
     task_assignments = conn.execute(
-        "SELECT assignee, COUNT(*) AS total FROM tasks GROUP BY assignee ORDER BY assignee ASC"
+        """
+        SELECT COALESCE(assignee, assigned_to) AS assignee, COUNT(*) AS total
+        FROM tasks
+        GROUP BY COALESCE(assignee, assigned_to)
+        ORDER BY COALESCE(assignee, assigned_to) ASC
+        """
     ).fetchall()
 
     lines = [
@@ -1514,10 +1654,10 @@ def metrics() -> Response:
         f"funding_bot_queue_task_runs_cancelled {queue_metrics['cancelled']}",
         "# HELP funding_bot_queue_task_retries_total Retry attempts scheduled with exponential backoff",
         "# TYPE funding_bot_queue_task_retries_total counter",
-        f"funding_bot_queue_task_retries_total {queue_metrics['retries_scheduled']}",
+        f"funding_bot_queue_task_retries_total {queue_metrics.get('retries_scheduled', 0)}",
         "# HELP funding_bot_dead_letter_queue_total Queue task runs stored in the dead-letter queue",
         "# TYPE funding_bot_dead_letter_queue_total gauge",
-        f"funding_bot_dead_letter_queue_total {queue_metrics['dead_lettered']}",
+        f"funding_bot_dead_letter_queue_total {queue_metrics.get('dead_lettered', 0)}",
         "# HELP funding_bot_queue_duplicate_preventions_total Duplicate queue executions prevented by idempotency keys",
         "# TYPE funding_bot_queue_duplicate_preventions_total counter",
         f"funding_bot_queue_duplicate_preventions_total {queue_metrics['duplicate_preventions']}",

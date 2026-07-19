@@ -144,3 +144,10 @@ Legacy upstream payloads are migrated before use. For example, older rows using
 fields such as `funder`, `link`, `description`, `type`, or `topics` are mapped
 to the current normalized fields (`donor_name`, `portal_url`, `summary`,
 `category`, and `tags`).
+
+## Related docs
+
+- [Glossary: connector](GLOSSARY.md#connector)
+- [Glossary: deduplication](GLOSSARY.md#deduplication)
+- [Video walkthroughs](VIDEOS.md)
+- [Repository overview](../README.md)

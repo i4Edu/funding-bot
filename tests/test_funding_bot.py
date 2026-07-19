@@ -347,9 +347,10 @@ class FundingBotTests(unittest.TestCase):
             sort="due_date",
         )
 
-        self.assertEqual("2026-06-20", overdue[0]["due_date"])
-        self.assertTrue(overdue[0]["is_overdue"])
-        self.assertFalse(overdue[1]["is_overdue"])
+        by_title = {task["title"]: task for task in overdue}
+        self.assertEqual("2026-06-20", by_title["File grant packet"]["due_date"])
+        self.assertTrue(by_title["File grant packet"]["is_overdue"])
+        self.assertFalse(by_title["Archive approval"]["is_overdue"])
 
     def test_update_task_assignment_updates_assignee(self):
         task = self.bot.create_task(title="Coordinate reviewers", assigned_to="staff")

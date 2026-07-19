@@ -223,6 +223,17 @@ def _read_numeric_env(
 
 def _require_https_url(url: str, *, purpose: str = "Outbound request") -> str:
     parsed = urllib.parse.urlparse(url)
+    allowed_insecure_hosts = {
+        "localhost",
+        "127.0.0.1",
+        "0.0.0.0",
+        "host.docker.internal",
+        "mock-connectors",
+    }
+    allow_insecure = os.environ.get("FUNDING_BOT_ALLOW_INSECURE_CONNECTOR_URLS", "").strip().lower()
+    if parsed.scheme.lower() == "http" and allow_insecure in {"1", "true", "yes", "on"}:
+        if (parsed.hostname or "").lower() in allowed_insecure_hosts:
+            return url
     if parsed.scheme.lower() != "https":
         raise ConnectionSecurityError(f"{purpose} must use an https:// URL: {url!r}")
     if not parsed.netloc:
@@ -2677,7 +2688,7 @@ class KickstarterForGoodConnector(CrowdfundingConnector):
 _DEFAULT_CONNECTORS: list[PortalConnector] | None = None
 
 
-def default_connectors() -> list[PortalConnector]:
+def default_connectors(cache_manager: CacheManager | None = None) -> list[PortalConnector]:
     """Return the built-in portal connectors used by ``run_discovery``.
 
     Grants Portal and CSR Network default to live HTTP transports so
@@ -2686,13 +2697,14 @@ def default_connectors() -> list[PortalConnector]:
     """
     global _DEFAULT_CONNECTORS
     if _DEFAULT_CONNECTORS is None:
+        shared_cache_manager = cache_manager or default_cache_manager()
         _DEFAULT_CONNECTORS = [
-            GrantsPortalConnector(transport="http"),
-            CSRNetworkConnector(transport="http"),
-            NGODirectoryConnector(),
-            FoundationDirectoryConnector(),
-            GlobalGivingConnector(),
-            KickstarterForGoodConnector(),
+            GrantsPortalConnector(transport="http", cache_manager=shared_cache_manager),
+            CSRNetworkConnector(transport="http", cache_manager=shared_cache_manager),
+            NGODirectoryConnector(cache_manager=shared_cache_manager),
+            FoundationDirectoryConnector(cache_manager=shared_cache_manager),
+            GlobalGivingConnector(cache_manager=shared_cache_manager),
+            KickstarterForGoodConnector(cache_manager=shared_cache_manager),
         ]
     return list(_DEFAULT_CONNECTORS)
 
@@ -2855,6 +2867,7 @@ class ConnectorRegistry:
         configs: Iterable[dict[str, Any]],
         *,
         credential_resolver: Callable[[str], dict[str, Any]],
+        cache_manager: CacheManager | None = None,
     ) -> list[PortalConnector]:
         built: list[PortalConnector] = []
         for config in configs:
@@ -2873,6 +2886,7 @@ class ConnectorRegistry:
                     transport=config.get("transport", "demo"),
                     cache_ttl=config.get("cache_ttl"),
                     rate_limit_config=config.get("rate_limit"),
+                    cache_manager=cache_manager or default_cache_manager(),
                     **settings,
                 )
             )
@@ -3226,6 +3240,7 @@ class FundingBot:
         connector_configs: dict[str, Any] | list[dict[str, Any]] | None = None,
         oauth_token_http_client: Callable[[str, dict[str, Any], dict[str, str]], Any] | None = None,
         oauth_refresh_skew_seconds: float | None = None,
+        cache_manager: CacheManager | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.trusted_sources = {source.lower() for source in (trusted_sources or [])}
@@ -3244,10 +3259,21 @@ class FundingBot:
         self.connector_registry = connector_registry or DEFAULT_CONNECTOR_REGISTRY
         self._data_residency_status = self.validate_data_storage_location()
         self._active_queue_controllers: dict[str, GracefulShutdownController] = {}
-        self.connection = sqlite3.connect(self.db_path)
-        self.connection.execute("PRAGMA foreign_keys = ON")
-        self.connection.execute("PRAGMA busy_timeout = 5000")
-        self.connection.row_factory = sqlite3.Row
+        self.cache_manager = cache_manager or default_cache_manager()
+        if self.db_path == ":memory:":
+            self._cache_scope = f"memory-{id(self)}"
+        else:
+            self._cache_scope = hashlib.sha256(self.db_path.encode("utf-8")).hexdigest()[:12]
+        self._database = DatabaseManager(self.db_path)
+        self.connection = self._database.connection
+        self._donor_cache = self.cache_manager.make_region(
+            "donor-records",
+            scope=self._cache_scope,
+        )
+        self._deduped_profile_cache = self.cache_manager.make_region(
+            "deduped-profiles",
+            scope=self._cache_scope,
+        )
         self._create_schema()
         self._apply_migrations()
         self._ensure_tasks_schema()
@@ -3255,7 +3281,7 @@ class FundingBot:
         self._validate_connector_configs()
 
     def close(self) -> None:
-        self.connection.close()
+        self._database.close()
 
     def _create_schema(self) -> None:
         self.connection.executescript(
@@ -5073,6 +5099,48 @@ class FundingBot:
             "retries_scheduled": int(history_counts["retries_scheduled"] or 0),
         }
 
+    def get_database_pool_metrics(self) -> dict[str, Any]:
+        return self._database.get_pool_metrics()
+
+    def get_cache_metrics(self) -> dict[str, Any]:
+        namespaces: dict[str, dict[str, Any]] = {}
+        for entry in self.cache_manager.all_stats():
+            bucket = namespaces.setdefault(
+                entry["namespace"],
+                {
+                    "namespace": entry["namespace"],
+                    "hits": 0,
+                    "misses": 0,
+                    "sets": 0,
+                    "invalidations": 0,
+                    "size": 0,
+                    "backend": entry.get("backend", "memory"),
+                    "ttl_seconds": entry.get("ttl_seconds", 0.0),
+                    "scopes": [],
+                },
+            )
+            bucket["hits"] += int(entry.get("hits", 0))
+            bucket["misses"] += int(entry.get("misses", 0))
+            bucket["sets"] += int(entry.get("sets", 0))
+            bucket["invalidations"] += int(entry.get("invalidations", 0))
+            bucket["size"] += int(entry.get("size", 0))
+            bucket["ttl_seconds"] = float(entry.get("ttl_seconds", bucket["ttl_seconds"]))
+            bucket["scopes"].append(
+                {
+                    "scope": entry.get("scope", "default"),
+                    "hits": int(entry.get("hits", 0)),
+                    "misses": int(entry.get("misses", 0)),
+                    "sets": int(entry.get("sets", 0)),
+                    "invalidations": int(entry.get("invalidations", 0)),
+                    "size": int(entry.get("size", 0)),
+                }
+            )
+        return {
+            "backend": self.cache_manager.backend_name,
+            "health": self.cache_manager.health_snapshot(),
+            "namespaces": namespaces,
+        }
+
     def execute_queue_task(
         self,
         task_name: str,
@@ -5504,6 +5572,8 @@ class FundingBot:
             ),
         )
         self.connection.commit()
+        if key == "profile":
+            self._deduped_profile_cache.invalidate("organization-profile")
         self._log_action(
             "generic_setting_updated",
             key=key,
@@ -5545,7 +5615,16 @@ class FundingBot:
         self.store_setting("profile", profile)
 
     def load_organization_profile(self) -> dict[str, Any]:
-        return self.load_setting("profile")
+        cached, profile = self._deduped_profile_cache.get("organization-profile")
+        if cached:
+            return dict(profile)
+        profile = self.load_setting("profile")
+        self._deduped_profile_cache.set(
+            "organization-profile",
+            profile,
+            tags=["organization-profile"],
+        )
+        return profile
 
     def store_search_settings(
         self,
@@ -5969,6 +6048,14 @@ class FundingBot:
         env_var_name = row["env_var_name"]
         return self.vault.resolve_credentials(env_var_name)
 
+    def _donor_cache_key(self, email: str) -> str:
+        return _validate_email(email).lower()
+
+    def _invalidate_donor_cache(self, email: str) -> None:
+        normalized_email = self._donor_cache_key(email)
+        self._donor_cache.invalidate(normalized_email)
+        self._donor_cache.invalidate_tags("donors", f"donor:{normalized_email}")
+
     def upsert_donor(
         self,
         *,
@@ -6074,6 +6161,7 @@ class FundingBot:
             ),
         )
         self.connection.commit()
+        self._invalidate_donor_cache(email)
         logged_profile = self.connection.execute(
             "SELECT segment, locale, data_classification, field_classifications_json FROM donors WHERE email = ?",
             (email,),
@@ -6119,8 +6207,12 @@ class FundingBot:
 
     def list_donors(self, segment: str | None = None) -> list[dict[str, Any]]:
         """Return donor records, optionally filtered by segment."""
-        if segment is not None:
-            normalized_segment = self._validate_segment(segment)
+        normalized_segment = self._validate_segment(segment) if segment is not None else None
+        list_cache_key = {"segment": normalized_segment or "all"}
+        hit, cached = self._donor_cache.get(list_cache_key)
+        if hit:
+            return [dict(donor) for donor in cached]
+        if normalized_segment is not None:
             rows = self.connection.execute(
                 "SELECT * FROM donors WHERE segment = ? ORDER BY name, email",
                 (normalized_segment,),
@@ -6129,11 +6221,24 @@ class FundingBot:
             rows = self.connection.execute(
                 "SELECT * FROM donors ORDER BY name, email"
             ).fetchall()
-        return [donor for donor in (self._deserialize_donor_row(row) for row in rows) if donor]
+        donors = [donor for donor in (self._deserialize_donor_row(row) for row in rows) if donor]
+        tags = ["donors", f"segment:{normalized_segment or 'all'}"]
+        self._donor_cache.set(list_cache_key, donors, tags=tags)
+        return donors
 
     def get_donor(self, email: str) -> dict[str, Any] | None:
+        normalized_email = self._donor_cache_key(email)
+        hit, cached = self._donor_cache.get(normalized_email)
+        if hit:
+            return dict(cached) if cached is not None else None
         row = self.connection.execute("SELECT * FROM donors WHERE email = ?", (email,)).fetchone()
-        return self._deserialize_donor_row(row)
+        donor = self._deserialize_donor_row(row)
+        self._donor_cache.set(
+            normalized_email,
+            donor,
+            tags=["donors", f"donor:{normalized_email}"],
+        )
+        return donor
 
     def _insert_consent_record(
         self,
@@ -6316,6 +6421,7 @@ class FundingBot:
             (int(opted_out), normalized_email),
         )
         self.connection.commit()
+        self._invalidate_donor_cache(normalized_email)
         self._log_action("donor_opt_out_updated", email=normalized_email, opted_out=opted_out)
 
     def discover_opportunities(
@@ -6419,9 +6525,10 @@ class FundingBot:
             active_connectors = self.connector_registry.build_connectors(
                 self.connector_configs,
                 credential_resolver=self.resolve_credential,
+                cache_manager=self.cache_manager,
             )
         else:
-            active_connectors = default_connectors()
+            active_connectors = default_connectors(cache_manager=self.cache_manager)
         fallback_mode = self._load_fallback_mode()
 
         candidates: list[dict[str, Any]] = []
@@ -6746,14 +6853,15 @@ class FundingBot:
         cursor = self.connection.execute(
             """
             INSERT INTO tasks (
-                external_id, title, description, assignee, assignee_email, assignee_name,
+                external_id, title, description, assignee, assigned_to, assignee_email, assignee_name,
                 status, due_date, source, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 normalized_external_id,
                 normalized_title,
                 str(description or "").strip(),
+                normalized_assignee,
                 normalized_assignee,
                 normalized_assignee_email,
                 normalized_assignee_name,
@@ -6844,7 +6952,7 @@ class FundingBot:
         clauses: list[str] = []
         effective_assignee = assignee if assignee is not None else assigned_to
         if effective_assignee:
-            clauses.append("assignee = ?")
+            clauses.append("COALESCE(assignee, assigned_to) = ?")
             params.append(str(effective_assignee).strip().lower())
         if assignee_email:
             clauses.append("assignee_email = ?")
@@ -6911,8 +7019,8 @@ class FundingBot:
             "": "updated_at DESC, id DESC",
             "updated_at": "updated_at DESC, id DESC",
             "-updated_at": "updated_at ASC, id ASC",
-            "assignee": "assignee COLLATE NOCASE ASC, due_date ASC, id ASC",
-            "-assignee": "assignee COLLATE NOCASE DESC, due_date DESC, id DESC",
+            "assignee": "COALESCE(assignee, assigned_to) COLLATE NOCASE ASC, due_date ASC, id ASC",
+            "-assignee": "COALESCE(assignee, assigned_to) COLLATE NOCASE DESC, due_date DESC, id DESC",
             "title": "title COLLATE NOCASE ASC, due_date ASC, id ASC",
             "-title": "title COLLATE NOCASE DESC, due_date DESC, id DESC",
             "status": "status COLLATE NOCASE ASC, due_date IS NULL ASC, due_date ASC, id ASC",
@@ -6940,7 +7048,7 @@ class FundingBot:
         params: list[Any] = []
         effective_assignee = assignee if assignee is not None else assigned_to
         if effective_assignee:
-            query += " WHERE assignee = ?"
+            query += " WHERE COALESCE(assignee, assigned_to) = ?"
             params.append(str(effective_assignee).strip().lower())
         query += " GROUP BY status"
         counts = {status: 0 for status in self.TASK_STATUSES}
@@ -7040,10 +7148,11 @@ class FundingBot:
             self.connection.execute(
                 """
                 UPDATE tasks
-                SET assignee = ?, assignee_email = ?, assignee_name = ?, updated_at = ?
+                SET assignee = ?, assigned_to = ?, assignee_email = ?, assignee_name = ?, updated_at = ?
                 WHERE id = ?
                 """,
                 (
+                    normalized_assigned_to,
                     normalized_assigned_to,
                     normalized_assignee_email,
                     normalized_assignee_name,
@@ -7313,7 +7422,7 @@ class FundingBot:
         self.connection.execute(
             """
             UPDATE tasks
-            SET external_id = ?, title = ?, description = ?, assignee = ?, status = ?,
+            SET external_id = ?, title = ?, description = ?, assignee = ?, assigned_to = ?, status = ?,
                 due_date = ?, source = ?, updated_at = ?
             WHERE id = ?
             """,
@@ -7321,6 +7430,7 @@ class FundingBot:
                 updated_external_id,
                 updated_title,
                 updated_description,
+                updated_assigned_to,
                 updated_assigned_to,
                 updated_status,
                 updated_due_date,
@@ -7696,6 +7806,7 @@ class FundingBot:
                 (requested_locale, donor_email),
             )
             self.connection.commit()
+            self._invalidate_donor_cache(donor_email)
             donor = self.connection.execute(
                 "SELECT * FROM donors WHERE email = ?",
                 (donor_email,),
@@ -7785,6 +7896,7 @@ class FundingBot:
             (sent_iso, donor_email),
         )
         self.connection.commit()
+        self._invalidate_donor_cache(donor_email)
         self._log_action(
             "outreach_sent",
             donor_email=donor_email,
@@ -8051,6 +8163,7 @@ class FundingBot:
                 """,
                 (donor_email, donor["name"], f"%{donor_email}%", f"%{donor['name']}%"),
             )
+        self._invalidate_donor_cache(donor_email)
         self._log_action(
             "gdpr_deleted",
             donor_hash=hashlib.sha256(donor_email.encode("utf-8")).hexdigest(),
@@ -8939,6 +9052,476 @@ def _configure_cli_logging(*, verbose: bool = False, quiet: bool = False) -> int
     return level
 
 
+def _json_default(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode("ascii")
+    if hasattr(value, "to_dict") and callable(value.to_dict):
+        return value.to_dict()
+    return str(value)
+
+
+def _json_dumps(payload: Any) -> str:
+    return json.dumps(payload, indent=2, sort_keys=True, default=_json_default)
+
+
+def _emit_cli_json(payload: dict[str, Any]) -> None:
+    print(_json_dumps(payload))
+
+
+def _cli_payload(command: str, **payload: Any) -> dict[str, Any]:
+    return {"command": command, "ok": True, **payload}
+
+
+def _write_json_report(path_value: str, payload: dict[str, Any]) -> None:
+    output_path = Path(path_value)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(_json_dumps(payload), encoding="utf-8")
+
+
+def _queue_async_task(
+    task_label: str,
+    task_callable: Any,
+    *,
+    task_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    async_result = task_callable.delay(**task_kwargs)
+    payload: dict[str, Any] = {
+        "task": {
+            "label": task_label,
+            "id": async_result.id,
+            "status": async_result.status,
+            "ready": bool(async_result.ready()),
+        }
+    }
+    if async_result.ready():
+        payload["result"] = async_result.get(propagate=True)
+    else:
+        payload["tracking_hint"] = (
+            "Track progress in the task_runs table or the configured Celery result backend."
+        )
+    return payload
+
+
+def _print_queued_task(payload: dict[str, Any], *, ready_renderer: Callable[[dict[str, Any]], None] | None = None) -> None:
+    task = payload["task"]
+    print(f"Queued {task['label']} task {task['id']}.")
+    print(f"Task status: {task['status']}.")
+    result = payload.get("result")
+    if isinstance(result, dict) and ready_renderer is not None:
+        ready_renderer(result)
+    elif payload.get("tracking_hint"):
+        print(payload["tracking_hint"])
+
+
+def _render_discover_task_result_text(result: dict[str, Any]) -> None:
+    found = result.get("new_opportunities", [])
+    if found:
+        _print_rows(found, ["signature", "source", "donor_name", "title", "category"])
+    else:
+        print("No new opportunities found.")
+
+
+def _render_outreach_task_result_text(result: dict[str, Any]) -> None:
+    if result.get("template_name"):
+        print(f"Template: {result['template_name']}")
+    if result.get("locale"):
+        print(f"Locale: {result['locale']}")
+    print(f"Subject: {result['subject']}\n")
+    print(result["body"])
+    if result.get("dry_run"):
+        print("\n(dry run: no email was actually sent)")
+    else:
+        print(f"\nOutreach email sent to {result['email']}.")
+
+
+def _render_daily_summary_task_result_text(result: dict[str, Any]) -> None:
+    print(f"Subject: {result['subject']}\n")
+    print(result["body"])
+    if result.get("dry_run"):
+        print("\n(dry run: no email was actually sent)")
+    else:
+        print(f"\nDaily summary sent to {result['recipient']}.")
+
+
+def _redact_service_url(url: str | None) -> str | None:
+    if not url:
+        return url
+    parsed = urllib.parse.urlparse(url)
+    if parsed.hostname is None:
+        return url
+    netloc = parsed.hostname
+    if parsed.port is not None:
+        netloc = f"{netloc}:{parsed.port}"
+    if parsed.username:
+        netloc = f"{parsed.username}:***@{netloc}"
+    return urllib.parse.urlunparse(parsed._replace(netloc=netloc))
+
+
+def _redis_ping(url: str, *, timeout: float = 1.0) -> dict[str, Any]:
+    parsed = urllib.parse.urlparse(url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or 6379
+    payload = {
+        "url": _redact_service_url(url),
+        "host": host,
+        "port": port,
+        "scheme": parsed.scheme or "redis",
+        "database": (parsed.path or "/0").lstrip("/") or "0",
+        "timeout_seconds": timeout,
+    }
+    try:
+        connection = socket.create_connection((host, port), timeout=timeout)
+        try:
+            if parsed.scheme == "rediss":
+                connection = ssl.create_default_context().wrap_socket(connection, server_hostname=host)
+            connection.sendall(b"*1\r\n$4\r\nPING\r\n")
+            response = connection.recv(16)
+        finally:
+            connection.close()
+    except Exception as exc:
+        return {**payload, "status": "error", "reachable": False, "error": str(exc)}
+    if response.startswith(b"+PONG"):
+        return {**payload, "status": "ok", "reachable": True}
+    return {
+        **payload,
+        "status": "error",
+        "reachable": False,
+        "error": f"Unexpected Redis response: {response!r}",
+    }
+
+
+def _collect_redis_diagnostics(*, broker_url: str, result_backend: str) -> dict[str, Any]:
+    redis_targets: list[tuple[str, str]] = []
+    for label, url in (("broker", broker_url), ("result_backend", result_backend)):
+        scheme = urllib.parse.urlparse(url).scheme
+        if scheme in {"redis", "rediss"}:
+            redis_targets.append((label, url))
+    if not redis_targets:
+        return {
+            "status": "disabled",
+            "checked": False,
+            "targets": [],
+            "message": "Redis is not configured for the current Celery broker/result backend.",
+        }
+
+    checks = []
+    for label, url in redis_targets:
+        checks.append({"role": label, **_redis_ping(url)})
+    statuses = {entry["status"] for entry in checks}
+    status = "error" if "error" in statuses else "ok"
+    return {
+        "status": status,
+        "checked": True,
+        "targets": checks,
+    }
+
+
+def _collect_connector_diagnostics(*, keywords: Iterable[str] | None = None) -> dict[str, Any]:
+    connectors = []
+    for connector_name in sorted(connector_registry().keys()):
+        try:
+            connector = create_connector(connector_name)
+            health = connector.check_health()
+            validation = connector.validate_connectivity(keywords, sample_limit=0)
+            status = str(validation.get("status", "ok"))
+            if health.get("healthy") is False and status == "ok":
+                status = "degraded"
+            connectors.append(
+                {
+                    "connector": connector_name,
+                    "status": status,
+                    "healthy": bool(health.get("healthy", status == "ok")),
+                    "health": health,
+                    "validation": validation,
+                }
+            )
+        except Exception as exc:
+            connectors.append(
+                {
+                    "connector": connector_name,
+                    "status": "error",
+                    "healthy": False,
+                    "error": str(exc),
+                }
+            )
+    statuses = {entry["status"] for entry in connectors}
+    if "error" in statuses:
+        status = "error"
+    elif "degraded" in statuses:
+        status = "degraded"
+    else:
+        status = "ok"
+    return {
+        "status": status,
+        "count": len(connectors),
+        "connectors": connectors,
+    }
+
+
+def _collect_doctor_report(*, db_path: str, connector_keywords: Iterable[str] | None = None) -> dict[str, Any]:
+    from task_queue import celery_app, get_queue_status, load_queue_config
+
+    configuration = {
+        "database_path": db_path,
+        "bot_db_path_env": os.environ.get("BOT_DB_PATH"),
+        "task_queue_enabled": os.environ.get("ENABLE_TASK_QUEUE"),
+        "legacy_cron_enabled": os.environ.get("ENABLE_LEGACY_CRON"),
+        "celery_broker_url": _redact_service_url(os.environ.get("CELERY_BROKER_URL")),
+        "celery_result_backend": _redact_service_url(os.environ.get("CELERY_RESULT_BACKEND")),
+        "celery_queue_name": os.environ.get("CELERY_QUEUE_NAME"),
+        "smtp_host": os.environ.get("SMTP_HOST"),
+        "smtp_port": os.environ.get("SMTP_PORT"),
+        "smtp_username": os.environ.get("SMTP_USERNAME"),
+        "smtp_password_set": bool(os.environ.get("SMTP_PASSWORD")),
+        "encryption_key_set": bool(os.environ.get("FUNDING_BOT_ENCRYPTION_KEY")),
+    }
+
+    database_exists = Path(db_path).exists() if db_path != ":memory:" else True
+    try:
+        bot = FundingBot(db_path=db_path)
+        try:
+            table_count = bot.connection.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'"
+            ).fetchone()[0]
+        finally:
+            bot.close()
+        database_check = {
+            "status": "ok",
+            "connected": True,
+            "database_path": db_path,
+            "exists_before_check": database_exists,
+            "table_count": int(table_count),
+            "sqlite_version": sqlite3.sqlite_version,
+        }
+    except Exception as exc:
+        database_check = {
+            "status": "error",
+            "connected": False,
+            "database_path": db_path,
+            "exists_before_check": database_exists,
+            "error": str(exc),
+            "sqlite_version": sqlite3.sqlite_version,
+        }
+
+    queue_config = load_queue_config()
+    celery_status = get_queue_status(config=queue_config, app=celery_app)
+    celery_status = {
+        **celery_status,
+        "broker_url": _redact_service_url(queue_config.broker_url),
+        "result_backend": _redact_service_url(queue_config.result_backend),
+        "task_always_eager": queue_config.task_always_eager,
+        "inspect_timeout_seconds": queue_config.inspect_timeout_seconds,
+        "status": (
+            "disabled"
+            if not queue_config.enable_task_queue
+            else ("ok" if celery_status.get("worker_status") == "healthy" or queue_config.task_always_eager else "degraded")
+        ),
+    }
+
+    checks = {
+        "database": database_check,
+        "celery": celery_status,
+        "redis": _collect_redis_diagnostics(
+            broker_url=queue_config.broker_url,
+            result_backend=queue_config.result_backend,
+        ),
+        "connectors": _collect_connector_diagnostics(keywords=connector_keywords),
+    }
+    severity = {"ok": 0, "disabled": 0, "degraded": 1, "error": 2}
+    overall_status = max((check.get("status", "ok") for check in checks.values()), key=lambda value: severity.get(value, 2))
+    return _cli_payload("doctor", overall_status=overall_status, configuration=configuration, checks=checks)
+
+
+def _print_doctor_report(report: dict[str, Any]) -> None:
+    print("Funding Bot doctor")
+    print(f"Overall status: {report['overall_status']}")
+    print()
+    configuration = report["configuration"]
+    print("Configuration")
+    print(f"- Database path: {configuration['database_path']}")
+    print(f"- Celery broker: {configuration.get('celery_broker_url') or '(default)'}")
+    print(f"- Celery result backend: {configuration.get('celery_result_backend') or '(default)'}")
+    print(f"- Encryption key configured: {'yes' if configuration['encryption_key_set'] else 'no'}")
+    print()
+    print("Checks")
+    database_check = report["checks"]["database"]
+    print(
+        f"- database: {database_check['status']} "
+        f"(connected={database_check.get('connected', False)}, tables={database_check.get('table_count', 0)})"
+    )
+    celery_check = report["checks"]["celery"]
+    print(
+        f"- celery: {celery_check['status']} "
+        f"(mode={celery_check['mode']}, workers={celery_check['worker_count']}, queue={celery_check['queue_name']})"
+    )
+    redis_check = report["checks"]["redis"]
+    if not redis_check.get("checked"):
+        print(f"- redis: {redis_check['status']} ({redis_check['message']})")
+    else:
+        redis_statuses = ", ".join(
+            f"{entry['role']}={entry['status']}" for entry in redis_check.get("targets", [])
+        )
+        print(f"- redis: {redis_check['status']} ({redis_statuses})")
+    connector_check = report["checks"]["connectors"]
+    connector_statuses = ", ".join(
+        f"{entry['connector']}={entry['status']}" for entry in connector_check["connectors"]
+    )
+    print(f"- connectors: {connector_check['status']} ({connector_statuses})")
+
+
+def _cli_completion_spec() -> dict[str, Any]:
+    import argparse
+
+    parser = _build_arg_parser()
+    global_options: set[str] = set()
+    subcommands: dict[str, dict[str, Any]] = {}
+    for action in parser._actions:
+        global_options.update(action.option_strings)
+        if isinstance(action, argparse._SubParsersAction):
+            for command_name, subparser in action.choices.items():
+                options: set[str] = set()
+                value_choices: dict[str, list[str]] = {}
+                for sub_action in subparser._actions:
+                    options.update(sub_action.option_strings)
+                    if sub_action.option_strings and sub_action.choices is not None:
+                        value_choices[sub_action.option_strings[-1]] = [
+                            str(choice) for choice in sub_action.choices
+                        ]
+                subcommands[command_name] = {
+                    "options": sorted(option for option in options if option),
+                    "value_choices": value_choices,
+                }
+    return {
+        "global_options": sorted(option for option in global_options if option),
+        "subcommands": subcommands,
+    }
+
+
+def _build_completion_script(shell: str) -> str:
+    spec = _cli_completion_spec()
+    global_tokens = sorted(set(spec["global_options"]) | set(spec["subcommands"].keys()))
+    all_value_choices: dict[str, list[str]] = {}
+    for data in spec["subcommands"].values():
+        for option, values in data["value_choices"].items():
+            all_value_choices.setdefault(option, [])
+            all_value_choices[option] = sorted(set(all_value_choices[option]) | set(values))
+
+    if shell == "bash":
+        lines = [
+            "_funding_bot_completion() {",
+            "  local cur prev command",
+            "  COMPREPLY=()",
+            "  cur=\"${COMP_WORDS[COMP_CWORD]}\"",
+            "  prev=\"${COMP_WORDS[COMP_CWORD-1]}\"",
+            "  command=\"\"",
+            "  for word in \"${COMP_WORDS[@]:1}\"; do",
+            "    if [[ \"$word\" != -* ]]; then",
+            "      command=\"$word\"",
+            "      break",
+            "    fi",
+            "  done",
+            "  case \"$prev\" in",
+        ]
+        for option, values in sorted(all_value_choices.items()):
+            lines.extend(
+                [
+                    f"    {option})",
+                    f"      COMPREPLY=( $(compgen -W \"{' '.join(values)}\" -- \"$cur\") )",
+                    "      return 0",
+                    "      ;;",
+                ]
+            )
+        lines.extend(
+            [
+                "  esac",
+                "  if [[ -z \"$command\" ]]; then",
+                f"    COMPREPLY=( $(compgen -W \"{' '.join(global_tokens)}\" -- \"$cur\") )",
+                "    return 0",
+                "  fi",
+                "  case \"$command\" in",
+            ]
+        )
+        for command_name, data in sorted(spec["subcommands"].items()):
+            command_tokens = " ".join(sorted(set(data["options"])))
+            lines.extend(
+                [
+                    f"    {command_name})",
+                    f"      COMPREPLY=( $(compgen -W \"{command_tokens}\" -- \"$cur\") )",
+                    "      return 0",
+                    "      ;;",
+                ]
+            )
+        lines.extend(
+            [
+                "  esac",
+                "  return 0",
+                "}",
+                "complete -F _funding_bot_completion funding-bot",
+            ]
+        )
+        return "\n".join(lines)
+
+    if shell == "zsh":
+        lines = [
+            "#compdef funding-bot",
+            "_funding_bot_completion() {",
+            "  local command=\"\"",
+            "  local word",
+            "  for word in ${words[@]:2}; do",
+            "    if [[ \"$word\" != -* ]]; then",
+            "      command=\"$word\"",
+            "      break",
+            "    fi",
+            "  done",
+            "  case \"$words[CURRENT-1]\" in",
+        ]
+        for option, values in sorted(all_value_choices.items()):
+            lines.extend(
+                [
+                    f"    {option})",
+                    f"      compadd -- {' '.join(values)}",
+                    "      return 0",
+                    "      ;;",
+                ]
+            )
+        lines.extend(
+            [
+                "  esac",
+                "  if [[ -z \"$command\" ]]; then",
+                f"    compadd -- {' '.join(global_tokens)}",
+                "    return 0",
+                "  fi",
+                "  case \"$command\" in",
+            ]
+        )
+        for command_name, data in sorted(spec["subcommands"].items()):
+            command_tokens = " ".join(sorted(set(data["options"])))
+            lines.extend(
+                [
+                    f"    {command_name})",
+                    f"      compadd -- {command_tokens}",
+                    "      return 0",
+                    "      ;;",
+                ]
+            )
+        lines.extend(
+            [
+                "  esac",
+                "}",
+                "compdef _funding_bot_completion funding-bot",
+            ]
+        )
+        return "\n".join(lines)
+
+    raise FundingBotError(f"Unsupported completion shell {shell!r}.")
+
+
 def _missing_required_cli_args(args: Any) -> list[tuple[str, dict[str, Any]]]:
     missing: list[tuple[str, dict[str, Any]]] = []
     for spec in getattr(args, "_required_cli_args", ()):
@@ -8983,54 +9566,6 @@ def _prompt_for_missing_cli_args(
     return args
 
 
-def _queue_async_task(
-    task_label: str,
-    task_callable: Any,
-    *,
-    task_kwargs: dict[str, Any],
-    ready_renderer: Callable[[dict[str, Any]], None] | None = None,
-) -> None:
-    async_result = task_callable.delay(**task_kwargs)
-    print(f"Queued {task_label} task {async_result.id}.")
-    print(f"Task status: {async_result.status}.")
-    if async_result.ready():
-        result = async_result.get(propagate=True)
-        if isinstance(result, dict) and ready_renderer is not None:
-            ready_renderer(result)
-    else:
-        print("Track progress in the task_runs table or the configured Celery result backend.")
-
-
-def _render_discover_task_result(result: dict[str, Any]) -> None:
-    found = result.get("new_opportunities", [])
-    if found:
-        _print_rows(found, ["signature", "source", "donor_name", "title", "category"])
-    else:
-        print("No new opportunities found.")
-
-
-def _render_outreach_task_result(result: dict[str, Any]) -> None:
-    if result.get("template_name"):
-        print(f"Template: {result['template_name']}")
-    if result.get("locale"):
-        print(f"Locale: {result['locale']}")
-    print(f"Subject: {result['subject']}\n")
-    print(result["body"])
-    if result.get("dry_run"):
-        print("\n(dry run: no email was actually sent)")
-    else:
-        print(f"\nOutreach email sent to {result['email']}.")
-
-
-def _render_daily_summary_task_result(result: dict[str, Any]) -> None:
-    print(f"Subject: {result['subject']}\n")
-    print(result["body"])
-    if result.get("dry_run"):
-        print("\n(dry run: no email was actually sent)")
-    else:
-        print(f"\nDaily summary sent to {result['recipient']}.")
-
-
 def _build_arg_parser() -> "argparse.ArgumentParser":
     import argparse
 
@@ -9065,12 +9600,26 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
         action="store_true",
         help="Fail instead of prompting when required command options are missing.",
     )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Print structured JSON output for programmatic use.",
+    )
+    command_parent = argparse.ArgumentParser(add_help=False)
+    command_parent.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="Print structured JSON output for programmatic use.",
+    )
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
 
     # send-daily-summary
     summary_parser = subparsers.add_parser(
         "send-daily-summary",
         help="Build and email the daily funding report.",
+        parents=[command_parent],
     )
     summary_parser.add_argument(
         "--recipient",
@@ -9087,6 +9636,7 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     opportunities_parser = subparsers.add_parser(
         "list-opportunities",
         help="List stored funding opportunities.",
+        parents=[command_parent],
     )
     opportunities_parser.add_argument(
         "--status",
@@ -9103,6 +9653,7 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     audit_parser = subparsers.add_parser(
         "audit-log",
         help="List recent audit log entries.",
+        parents=[command_parent],
     )
     audit_parser.add_argument(
         "--limit",
@@ -9120,6 +9671,7 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     donors_parser = subparsers.add_parser(
         "list-donors",
         help="List donor records.",
+        parents=[command_parent],
     )
     donors_parser.add_argument(
         "--segment",
@@ -9131,6 +9683,7 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     monthly_parser = subparsers.add_parser(
         "monthly-audit-report",
         help="Generate a monthly GDPR/compliance audit report.",
+        parents=[command_parent],
     )
     monthly_parser.add_argument(
         "--year",
@@ -9154,6 +9707,7 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     gdpr_parser = subparsers.add_parser(
         "gdpr-self-check-report",
         help="Generate a GDPR compliance self-check report.",
+        parents=[command_parent],
     )
     gdpr_parser.add_argument(
         "--cadence",
@@ -9170,6 +9724,7 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     discover_parser = subparsers.add_parser(
         "discover",
         help="Search configured donation sources and store new opportunities.",
+        parents=[command_parent],
     )
     discover_parser.add_argument(
         "--keywords",
@@ -9185,6 +9740,7 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     test_connector_parser = subparsers.add_parser(
         "test-connector",
         help="Validate one connector and print sample results.",
+        parents=[command_parent],
     )
     test_connector_parser.add_argument(
         "--connector",
@@ -9218,6 +9774,7 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     outreach_parser = subparsers.add_parser(
         "send-outreach",
         help="Compose and send (or preview) a personalized donor outreach email.",
+        parents=[command_parent],
     )
     outreach_parser.add_argument("--email", metavar="EMAIL", help="Donor email address.")
     outreach_parser.add_argument("--name", metavar="NAME", help="Donor name.")
@@ -9262,6 +9819,7 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     profile_parser = subparsers.add_parser(
         "set-organization-profile",
         help="Store the nonprofit's organization profile from a JSON file (or stdin).",
+        parents=[command_parent],
     )
     profile_parser.add_argument(
         "--file",
@@ -9272,6 +9830,7 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     credential_parser = subparsers.add_parser(
         "register-credential",
         help="Register a credential alias that resolves to an environment variable.",
+        parents=[command_parent],
     )
     credential_parser.add_argument("--alias", metavar="ALIAS", help="Credential alias name.")
     credential_parser.add_argument(
@@ -9293,6 +9852,7 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     retention_policy_parser = subparsers.add_parser(
         "set-data-retention-policy",
         help="Persist retention windows for operational data cleanup.",
+        parents=[command_parent],
     )
     retention_policy_parser.add_argument("--audit-logs-days", type=int, metavar="DAYS")
     retention_policy_parser.add_argument("--communications-days", type=int, metavar="DAYS")
@@ -9303,6 +9863,7 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     retention_enforcement_parser = subparsers.add_parser(
         "enforce-data-retention",
         help="Delete records that exceed the configured retention windows.",
+        parents=[command_parent],
     )
     retention_enforcement_parser.add_argument(
         "--dry-run",
@@ -9315,12 +9876,39 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
         help="Evaluate retention as of the provided UTC timestamp.",
     )
 
-    subparsers.add_parser("show-settings", help="Print the organization profile, search settings, and credentials.")
+    completion_parser = subparsers.add_parser(
+        "completion",
+        help="Print bash or zsh shell completion scripts.",
+        parents=[command_parent],
+    )
+    completion_parser.add_argument(
+        "--shell",
+        choices=("bash", "zsh"),
+        default="bash",
+        help="Shell dialect to generate (default: bash).",
+    )
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Run configuration and health diagnostics.",
+        parents=[command_parent],
+    )
+    doctor_parser.add_argument(
+        "--connector-keywords",
+        metavar="KEYWORDS",
+        help="Comma-separated keywords to use for connector validation checks.",
+    )
+
+    subparsers.add_parser(
+        "show-settings",
+        help="Print the organization profile, search settings, and credentials.",
+        parents=[command_parent],
+    )
 
     return parser
 
 
-def _run_register_credential(bot: "FundingBot", args: "argparse.Namespace") -> None:
+def _run_register_credential(bot: "FundingBot", args: "argparse.Namespace") -> dict[str, Any]:
     """Handle the ``register-credential`` CLI command.
 
     Kept as a standalone function (rather than inline in ``main``) so that
@@ -9329,23 +9917,40 @@ def _run_register_credential(bot: "FundingBot", args: "argparse.Namespace") -> N
     ``main`` (e.g. ``show-settings``).
     """
     bot.register_credential(args.alias, args.env_var)
-    print(f"Registered credential alias {args.alias!r}.")
+    return _cli_payload(
+        "register-credential",
+        registered=True,
+        alias=args.alias,
+        env_var_name=args.env_var,
+    )
 
 
-def _run_show_settings(bot: "FundingBot") -> None:
+def _collect_settings_payload(bot: "FundingBot") -> dict[str, Any]:
+    return {
+        "organization_profile": bot.load_organization_profile(),
+        "search_settings": bot.load_search_settings(),
+        "data_retention_policy": bot.load_data_retention_policy(),
+        "credentials": bot.list_credentials(),
+    }
+
+
+def _run_show_settings(bot: "FundingBot", *, json_output: bool = False) -> None:
     """Handle the ``show-settings`` CLI command.
 
     Prints the organization profile and search settings as JSON. Credential
     aliases are printed separately by :func:`_print_credential_aliases` so
     this function never touches credential metadata.
     """
-    settings_json = json.dumps(
+    payload = _collect_settings_payload(bot)
+    if json_output:
+        _emit_cli_json(_cli_payload("show-settings", **payload))
+        return
+    settings_json = _json_dumps(
         {
-            "organization_profile": bot.load_organization_profile(),
-            "search_settings": bot.load_search_settings(),
-            "data_retention_policy": bot.load_data_retention_policy(),
-        },
-        indent=2,
+            "organization_profile": payload["organization_profile"],
+            "search_settings": payload["search_settings"],
+            "data_retention_policy": payload["data_retention_policy"],
+        }
     )
     print(settings_json)
 
@@ -9380,44 +9985,68 @@ def main(argv: list[str] | None = None) -> None:
         if args.command == "send-daily-summary":
             from tasks.celery_tasks import send_daily_summary_task
 
-            _queue_async_task(
+            payload = _cli_payload(
                 "send-daily-summary",
-                send_daily_summary_task,
-                task_kwargs={
-                    "db_path": args.db,
-                    "recipient": args.recipient,
-                    "dry_run": args.dry_run,
-                },
-                ready_renderer=_render_daily_summary_task_result,
+                **_queue_async_task(
+                    "send-daily-summary",
+                    send_daily_summary_task,
+                    task_kwargs={
+                        "db_path": args.db,
+                        "recipient": args.recipient,
+                        "dry_run": args.dry_run,
+                    },
+                ),
             )
+            if args.json_output:
+                _emit_cli_json(payload)
+            else:
+                _print_queued_task(payload, ready_renderer=_render_daily_summary_task_result_text)
         elif args.command == "list-opportunities":
             rows = bot.list_opportunities(status=args.status)
             if args.limit is not None:
                 rows = rows[: args.limit]
-            _print_rows(
-                rows,
-                ["signature", "source", "donor_name", "title", "status", "discovered_at"],
+            columns = ["signature", "source", "donor_name", "title", "status", "discovered_at"]
+            payload = _cli_payload(
+                "list-opportunities",
+                count=len(rows),
+                columns=columns,
+                rows=rows,
             )
+            if args.json_output:
+                _emit_cli_json(payload)
+            else:
+                _print_rows(rows, columns)
         elif args.command == "audit-log":
-            _print_rows(
-                bot.list_audit_logs(limit=args.limit, action=args.action),
-                ["happened_at", "action", "details_json"],
-            )
+            rows = bot.list_audit_logs(limit=args.limit, action=args.action)
+            columns = ["happened_at", "action", "details_json"]
+            payload = _cli_payload("audit-log", count=len(rows), columns=columns, rows=rows)
+            if args.json_output:
+                _emit_cli_json(payload)
+            else:
+                _print_rows(rows, columns)
         elif args.command == "list-donors":
-            _print_rows(
-                bot.list_donors(segment=args.segment),
-                ["email", "name", "segment", "locale", "opted_out", "last_contact_at"],
-            )
+            rows = bot.list_donors(segment=args.segment)
+            columns = ["email", "name", "segment", "locale", "opted_out", "last_contact_at"]
+            payload = _cli_payload("list-donors", count=len(rows), columns=columns, rows=rows)
+            if args.json_output:
+                _emit_cli_json(payload)
+            else:
+                _print_rows(rows, columns)
         elif args.command == "monthly-audit-report":
             report = bot.build_monthly_audit_report(year=args.year, month=args.month)
-            report_json = json.dumps(report, indent=2)
+            payload = _cli_payload(
+                "monthly-audit-report",
+                report=report,
+                output_path=args.output,
+            )
             if args.output:
-                output_path = Path(args.output)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                output_path.write_text(report_json, encoding="utf-8")
+                _write_json_report(args.output, report)
+            if args.json_output:
+                _emit_cli_json(payload)
+            elif args.output:
                 print(f"Monthly audit report written to {args.output}.")
             else:
-                print(report_json)
+                print(_json_dumps(report))
         elif args.command == "set-data-retention-policy":
             policy_updates = {
                 "audit_logs_days": args.audit_logs_days,
@@ -9429,59 +10058,88 @@ def main(argv: list[str] | None = None) -> None:
             policy = bot.store_data_retention_policy(
                 {key: value for key, value in policy_updates.items() if value is not None}
             )
-            print(json.dumps(policy, indent=2, sort_keys=True))
+            payload = _cli_payload("set-data-retention-policy", policy=policy)
+            if args.json_output:
+                _emit_cli_json(payload)
+            else:
+                print(_json_dumps(policy))
         elif args.command == "enforce-data-retention":
             as_of = datetime.fromisoformat(args.as_of) if args.as_of else None
             report = bot.enforce_data_retention(now=as_of, dry_run=args.dry_run)
-            print(json.dumps(report, indent=2, sort_keys=True))
+            payload = _cli_payload("enforce-data-retention", report=report)
+            if args.json_output:
+                _emit_cli_json(payload)
+            else:
+                print(_json_dumps(report))
         elif args.command == "gdpr-self-check-report":
             report = bot.build_gdpr_compliance_report(cadence=args.cadence)
-            report_json = json.dumps(report, indent=2)
+            payload = _cli_payload(
+                "gdpr-self-check-report",
+                report=report,
+                output_path=args.output,
+            )
             if args.output:
-                output_path = Path(args.output)
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                output_path.write_text(report_json, encoding="utf-8")
+                _write_json_report(args.output, report)
+            if args.json_output:
+                _emit_cli_json(payload)
+            elif args.output:
                 print(f"GDPR self-check report written to {args.output}.")
             else:
-                print(report_json)
+                print(_json_dumps(report))
         elif args.command == "discover":
             from tasks.celery_tasks import discover_task
 
-            _queue_async_task(
+            payload = _cli_payload(
                 "discover",
-                discover_task,
-                task_kwargs={
-                    "db_path": args.db,
-                    "keywords": _parse_csv_argument(args.keywords),
-                    "trusted_sources": _parse_csv_argument(args.trusted_sources),
-                },
-                ready_renderer=_render_discover_task_result,
+                **_queue_async_task(
+                    "discover",
+                    discover_task,
+                    task_kwargs={
+                        "db_path": args.db,
+                        "keywords": _parse_csv_argument(args.keywords),
+                        "trusted_sources": _parse_csv_argument(args.trusted_sources),
+                    },
+                ),
             )
+            if args.json_output:
+                _emit_cli_json(payload)
+            else:
+                _print_queued_task(payload, ready_renderer=_render_discover_task_result_text)
         elif args.command == "test-connector":
             connector = create_connector(args.connector)
             validation = connector.validate_connectivity(
                 keywords=_parse_csv_argument(args.keywords),
                 sample_limit=max(args.limit, 0),
             )
-            print(json.dumps(validation, indent=2))
+            payload = _cli_payload("test-connector", validation=validation)
+            if args.json_output:
+                _emit_cli_json(payload)
+            else:
+                print(_json_dumps(validation))
         elif args.command == "send-outreach":
             from tasks.celery_tasks import send_outreach_task
 
-            _queue_async_task(
+            payload = _cli_payload(
                 "send-outreach",
-                send_outreach_task,
-                task_kwargs={
-                    "db_path": args.db,
-                    "donor_email": args.email,
-                    "donor_name": args.name,
-                    "template_name": args.template_name,
-                    "subject_template": args.subject,
-                    "body_template": args.body,
-                    "locale": args.locale,
-                    "dry_run": args.dry_run,
-                },
-                ready_renderer=_render_outreach_task_result,
+                **_queue_async_task(
+                    "send-outreach",
+                    send_outreach_task,
+                    task_kwargs={
+                        "db_path": args.db,
+                        "donor_email": args.email,
+                        "donor_name": args.name,
+                        "template_name": args.template_name,
+                        "subject_template": args.subject,
+                        "body_template": args.body,
+                        "locale": args.locale,
+                        "dry_run": args.dry_run,
+                    },
+                ),
             )
+            if args.json_output:
+                _emit_cli_json(payload)
+            else:
+                _print_queued_task(payload, ready_renderer=_render_outreach_task_result_text)
         elif args.command == "set-organization-profile":
             try:
                 raw_json = (
@@ -9493,12 +10151,42 @@ def main(argv: list[str] | None = None) -> None:
             if not isinstance(profile, dict):
                 raise ValueError("Organization profile JSON must be an object.")
             bot.store_organization_profile(profile)
-            print("Organization profile updated.")
+            payload = _cli_payload(
+                "set-organization-profile",
+                updated=True,
+                organization_profile=profile,
+                profile_keys=sorted(profile.keys()),
+            )
+            if args.json_output:
+                _emit_cli_json(payload)
+            else:
+                print("Organization profile updated.")
         elif args.command == "register-credential":
-            _run_register_credential(bot, args)
+            payload = _run_register_credential(bot, args)
+            if args.json_output:
+                _emit_cli_json(payload)
+            else:
+                print(f"Registered credential alias {args.alias!r}.")
+        elif args.command == "completion":
+            script = _build_completion_script(args.shell)
+            payload = _cli_payload("completion", shell=args.shell, script=script)
+            if args.json_output:
+                _emit_cli_json(payload)
+            else:
+                print(script)
+        elif args.command == "doctor":
+            payload = _collect_doctor_report(
+                db_path=args.db,
+                connector_keywords=_parse_csv_argument(args.connector_keywords),
+            )
+            if args.json_output:
+                _emit_cli_json(payload)
+            else:
+                _print_doctor_report(payload)
         elif args.command == "show-settings":
-            _run_show_settings(bot)
-            _print_credential_aliases(bot)
+            _run_show_settings(bot, json_output=args.json_output)
+            if not args.json_output:
+                _print_credential_aliases(bot)
     finally:
         bot.close()
 

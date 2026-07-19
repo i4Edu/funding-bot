@@ -264,13 +264,17 @@ def _queue_result_payload(task_run: dict[str, Any], *, mode: str = "queue", **ex
     return payload
 
 
-@celery_app.task(
-    bind=True,
-    name="funding_bot.discover",
-    queue=load_queue_config().queue_name,
-)
+def _current_worker_hostname() -> str | None:
+    try:
+        from celery import current_task
+    except ImportError:
+        return None
+    request = getattr(current_task, "request", None)
+    return getattr(request, "hostname", None)
+
+
+@celery_app.task(name="funding_bot.discover", queue=load_queue_config().queue_name)
 def discover_opportunities_task(
-    self: Any,
     *,
     keywords: list[str] | None = None,
     trusted_sources: list[str] | None = None,
@@ -302,20 +306,15 @@ def discover_opportunities_task(
             payload,
             _task,
             idempotency_key=idempotency_key,
-            worker_id=getattr(getattr(self, "request", None), "hostname", None),
+            worker_id=_current_worker_hostname(),
         )
         return _queue_result_payload(task_run)
 
     return _with_bot(db_path, _run)
 
 
-@celery_app.task(
-    bind=True,
-    name="funding_bot.send_outreach",
-    queue=load_queue_config().queue_name,
-)
+@celery_app.task(name="funding_bot.send_outreach", queue=load_queue_config().queue_name)
 def send_outreach_task(
-    self: Any,
     *,
     donor_email: str,
     donor_name: str,
@@ -383,20 +382,15 @@ def send_outreach_task(
             payload,
             _task,
             idempotency_key=idempotency_key,
-            worker_id=getattr(getattr(self, "request", None), "hostname", None),
+            worker_id=_current_worker_hostname(),
         )
         return _queue_result_payload(task_run, dry_run=dry_run)
 
     return _with_bot(db_path, _run)
 
 
-@celery_app.task(
-    bind=True,
-    name="funding_bot.send_daily_summary",
-    queue=load_queue_config().queue_name,
-)
+@celery_app.task(name="funding_bot.send_daily_summary", queue=load_queue_config().queue_name)
 def send_daily_summary_task(
-    self: Any,
     *,
     recipient: str = "lupael@i4e.com.bd",
     dry_run: bool = False,
@@ -423,7 +417,7 @@ def send_daily_summary_task(
             payload,
             _task,
             idempotency_key=idempotency_key,
-            worker_id=getattr(getattr(self, "request", None), "hostname", None),
+            worker_id=_current_worker_hostname(),
         )
         return _queue_result_payload(task_run, recipient=recipient, dry_run=dry_run)
 
