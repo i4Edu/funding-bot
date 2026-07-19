@@ -15,12 +15,45 @@ services:
       context: .
       dockerfile: Dockerfile
     image: funding-bot:latest
-    command: ["celery", "-A", "celery_app:celery_app", "worker", "--loglevel=info", "--queues", "funding-bot"]
+    profiles: ["queue"]
+    command:
+      [
+        "celery",
+        "--app",
+        "task_queue.celery_app",
+        "worker",
+        "--loglevel=info",
+        "--queues",
+        "funding-bot",
+      ]
     env_file:
       - .env
     depends_on:
       - redis
-      - rabbitmq
+    volumes:
+      - bot_data:/app/data
+
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: funding-bot:latest
+    profiles: ["queue"]
+    command:
+      [
+        "celery",
+        "--app",
+        "task_queue.celery_app",
+        "flower",
+        "--port=5555",
+      ]
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - worker
+    ports:
+      - "5555:5555"
     volumes:
       - bot_data:/app/data
 
@@ -46,7 +79,6 @@ services:
       - .env
     depends_on:
       - bot
-      - worker
     ports:
       - "5000:5000"
     volumes:
@@ -54,14 +86,9 @@ services:
 
   redis:
     image: redis:7-alpine
+    profiles: ["queue"]
     ports:
       - "6379:6379"
-
-  rabbitmq:
-    image: rabbitmq:3-management
-    ports:
-      - "5672:5672"
-      - "15672:15672"
 
 volumes:
   bot_data:

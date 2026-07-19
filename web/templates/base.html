@@ -70,11 +70,11 @@
       <div class="container-fluid">
         <span class="navbar-brand mb-0 h1">Nonprofit Funding Bot</span>
         {% block nav_links %}{% endblock %}
-        <span class="navbar-text text-white-50">Role: {{ current_role }}</span>
+        <span class="navbar-text text-white-50" aria-label="Signed in as {{ current_role }}">Role: {{ current_role }}</span>
       </div>
     </nav>
 
-    <main id="main-content" class="{% block main_class %}container py-4{% endblock %}">
+    <main id="main-content" class="{% block main_class %}container py-4{% endblock %}" tabindex="-1">
       {% block main_content %}{% endblock %}
     </main>
 

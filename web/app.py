@@ -28,6 +28,7 @@ from funding_bot import (  # noqa: E402
     SMTPEmailSender,
     TaskTransitionError,
     _validate_email,
+    default_connectors,
 )
 from task_queue import dispatch_discovery, get_queue_status, load_queue_config  # noqa: E402
 
@@ -184,6 +185,30 @@ def _serialize_task(row: Any) -> dict[str, Any]:
     return dict(row)
 
 
+def _read_task_import_csv() -> str:
+    upload = request.files.get("file")
+    if upload is not None:
+        return upload.stream.read().decode("utf-8-sig")
+    return request.get_data(cache=False, as_text=True)
+
+
+def _task_scope_for_role(role: str | None) -> str | None:
+    if role in {"admin", "auditor"}:
+        return None
+    return role
+
+
+def _group_tasks_by_status(tasks: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped = {status: [] for status in FundingBot.TASK_STATUSES}
+    for task in tasks:
+        grouped.setdefault(task["status"], []).append(task)
+    return grouped
+
+
+def _can_move_task(role: str | None, task: dict[str, Any]) -> bool:
+    return role == "admin" or (role == "staff" and task.get("assigned_to") == role)
+
+
 def _serialize_translation_review(review: Any) -> dict[str, Any]:
     data = dict(review)
     if "locale_metadata" not in data:
@@ -270,6 +295,7 @@ def _dashboard_context() -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     recent_cutoff = (now - timedelta(days=7)).isoformat()
     current_role = getattr(g, "current_role", None)
+    task_scope = _task_scope_for_role(current_role)
 
     new_opportunities_count = _bot().connection.execute(
         "SELECT COUNT(*) FROM opportunities WHERE discovered_at >= ?",
@@ -314,7 +340,16 @@ def _dashboard_context() -> dict[str, Any]:
             """
         ).fetchall()
     ]
-    my_task_counts = _bot().get_task_status_counts(assigned_to=current_role) if current_role else {}
+    my_task_counts = _bot().get_task_status_counts(assigned_to=task_scope) if current_role else {}
+    overdue_tasks = [
+        _serialize_task(task)
+        for task in _bot().list_tasks(
+            assigned_to=task_scope,
+            due_date_before=now.date().isoformat(),
+            sort="due_date",
+        )
+        if task.get("is_overdue")
+    ][:5]
 
     return {
         "current_role": current_role,
@@ -327,6 +362,8 @@ def _dashboard_context() -> dict[str, Any]:
         "my_open_tasks_count": sum(
             count for status, count in my_task_counts.items() if status != "done"
         ),
+        "overdue_tasks": overdue_tasks,
+        "overdue_tasks_count": len(overdue_tasks),
         "recent_opportunities": recent_opportunities,
         "recent_applications": recent_applications,
         "ui_locale": _resolve_ui_locale(),
@@ -345,22 +382,29 @@ def _task_dashboard_context(filters: dict[str, str | None]) -> dict[str, Any]:
             sort=filters["sort"],
         )
     ]
+    for task in tasks:
+        task["can_move"] = _can_move_task(current_role, task)
     counts = _task_status_counts(tasks)
     return {
         "current_role": current_role,
         "tasks": tasks,
+        "task_columns": _group_tasks_by_status(tasks),
         "task_counts": counts,
         "total_tasks": len(tasks),
         "task_filters": filters,
         "task_sort_options": TASK_SORT_OPTIONS,
         "task_assignee_options": _task_assignee_options(),
         "can_filter_all_assignees": current_role in {"admin", "auditor"},
+        "can_reassign_tasks": current_role == "admin",
         "ui_locale": _resolve_ui_locale(),
     }
 
 
 def _queue_health_timeout_seconds() -> float:
-    configured = os.environ.get("CELERY_HEALTH_TIMEOUT_SECONDS", str(DEFAULT_CELERY_HEALTH_TIMEOUT_SECONDS))
+    configured = os.environ.get(
+        "CELERY_HEALTH_TIMEOUT_SECONDS",
+        os.environ.get("CELERY_INSPECT_TIMEOUT_SECONDS", str(DEFAULT_CELERY_HEALTH_TIMEOUT_SECONDS)),
+    )
     try:
         timeout = float(configured)
     except ValueError:
@@ -375,7 +419,8 @@ def _count_tasks_by_worker(task_map: Any) -> int:
 
 
 def _create_celery_health_app() -> Any:
-    broker_url = os.environ.get("CELERY_BROKER_URL")
+    queue_config = load_queue_config()
+    broker_url = queue_config.broker_url
     if not broker_url:
         raise RuntimeError("CELERY_BROKER_URL is not configured.")
 
@@ -383,12 +428,12 @@ def _create_celery_health_app() -> Any:
     return celery_module.Celery(
         "funding-bot-health",
         broker=broker_url,
-        backend=os.environ.get("CELERY_RESULT_BACKEND") or None,
+        backend=queue_config.result_backend or None,
     )
 
 
 def _fetch_celery_queue_snapshot() -> dict[str, Any]:
-    queue_name = os.environ.get("CELERY_QUEUE_NAME", "funding-bot")
+    queue_name = load_queue_config().queue_name
     timeout_seconds = _queue_health_timeout_seconds()
     celery_app = _create_celery_health_app()
     inspect = celery_app.control.inspect(timeout=timeout_seconds)
@@ -599,6 +644,59 @@ def list_tasks_route() -> Response:
         sort=filters["sort"],
     )
     return jsonify([_serialize_task(task) for task in tasks])
+
+
+@app.post("/tasks")
+@require_role("admin")
+def create_task_route() -> Response:
+    payload = _get_request_json()
+    title = str(payload.get("title", "")).strip()
+    assigned_to = str(payload.get("assigned_to", "")).strip()
+    description = str(payload.get("description", "")).strip()
+    status = str(payload.get("status", "todo")).strip() or "todo"
+    due_date = payload.get("due_date")
+
+    if not title:
+        raise ValueError("Field 'title' is required.")
+    if not assigned_to:
+        raise ValueError("Field 'assigned_to' is required.")
+    if due_date is not None and not isinstance(due_date, str):
+        raise ValueError("Field 'due_date' must be a string or null.")
+
+    task = _bot().create_task(
+        title=title,
+        assigned_to=assigned_to,
+        description=description,
+        status=status,
+        due_date=due_date,
+    )
+    return jsonify({"task": _serialize_task(task)}), 201
+
+
+@app.get("/tasks/<int:task_id>")
+@require_role("staff", "admin", "auditor")
+def get_task_route(task_id: int) -> Response:
+    task = _bot().get_task(task_id)
+    current_role = getattr(g, "current_role", None)
+    if current_role not in {"admin", "auditor"} and task["assigned_to"] != current_role:
+        return _json_error("Forbidden", 403)
+    return jsonify({"task": _serialize_task(task)})
+
+
+@app.post("/tasks/<int:task_id>/assign")
+@require_role("admin")
+def assign_task_route(task_id: int) -> Response:
+    payload = _get_request_json()
+    assigned_to = str(payload.get("assigned_to", "")).strip()
+    if not assigned_to:
+        raise ValueError("Field 'assigned_to' is required.")
+
+    task = _bot().assign_task(
+        task_id,
+        assigned_to=assigned_to,
+        changed_by=getattr(g, "current_role", None) or "unknown",
+    )
+    return jsonify({"task": _serialize_task(task)})
 
 
 @app.get("/opportunities")

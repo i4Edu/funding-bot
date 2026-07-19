@@ -1,4 +1,5 @@
 import io
+import itertools
 import json
 import os
 import tempfile
@@ -182,6 +183,92 @@ class FundingBotTests(unittest.TestCase):
                 sent_at=datetime(2026, 6, 25),
             )
 
+    def test_consent_records_track_outreach_and_opt_out_history(self):
+        sent = self.bot.send_outreach(
+            donor_email="consent@example.org",
+            donor_name="Consent Donor",
+            subject_template="Support {organization_name}",
+            body_template="Hello {donor_name}",
+            context={
+                "consent_source": "donor_webform",
+                "consent_proof": "checkbox",
+                "consent_notes": "Captured from donor preferences form.",
+            },
+            sent_at=datetime(2026, 6, 22, tzinfo=timezone.utc),
+        )
+        self.assertEqual("consent@example.org", sent["email"])
+
+        consent_records = self.bot.list_consent_records("consent@example.org")
+        self.assertEqual(1, len(consent_records))
+        self.assertEqual("granted", consent_records[0]["status"])
+        self.assertEqual("donor_webform", consent_records[0]["source"])
+        self.assertEqual("checkbox", consent_records[0]["proof"])
+
+        self.bot.set_donor_opt_out(
+            "consent@example.org",
+            True,
+            source="unsubscribe_link",
+            recorded_at=datetime(2026, 6, 29, tzinfo=timezone.utc),
+            notes="Donor clicked unsubscribe.",
+        )
+        latest_record = self.bot.get_latest_consent_record("consent@example.org")
+        self.assertIsNotNone(latest_record)
+        self.assertEqual("withdrawn", latest_record["status"])
+        self.assertEqual("unsubscribe_link", latest_record["source"])
+        self.assertEqual("2026-06-29T00:00:00+00:00", latest_record["withdrawn_at"])
+
+        export = self.bot.gdpr_export("consent@example.org")
+        self.assertEqual(2, len(export["consent_records"]))
+
+        with self.assertRaises(OptOutError):
+            self.bot.send_outreach(
+                donor_email="consent@example.org",
+                donor_name="Consent Donor",
+                subject_template="Support {organization_name}",
+                body_template="Hello {donor_name}",
+                sent_at=datetime(2026, 7, 7, tzinfo=timezone.utc),
+            )
+
+    def test_gdpr_self_check_report_summarizes_retention_deletions_and_exports(self):
+        self.bot.send_outreach(
+            donor_email="archive@example.org",
+            donor_name="Archive Donor",
+            subject_template="Support {organization_name}",
+            body_template="Hello {donor_name}",
+            sent_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+        )
+        self.bot.send_outreach(
+            donor_email="privacy@example.org",
+            donor_name="Privacy Donor",
+            subject_template="Support {organization_name}",
+            body_template="Hello {donor_name}",
+            context={"consent_source": "crm_import"},
+            sent_at=datetime(2026, 6, 22, tzinfo=timezone.utc),
+        )
+        self.bot.gdpr_export("privacy@example.org")
+        self.bot.set_donor_opt_out(
+            "privacy@example.org",
+            True,
+            source="privacy_portal",
+            recorded_at=datetime(2026, 6, 29, tzinfo=timezone.utc),
+        )
+        self.bot.gdpr_delete("privacy@example.org")
+
+        report = self.bot.build_gdpr_compliance_report(
+            cadence="monthly",
+            as_of=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        )
+        self.assertEqual("gdpr_compliance_self_check", report["report_type"])
+        self.assertEqual("monthly", report["cadence"])
+        self.assertGreaterEqual(report["data_subject_requests"]["exports_in_period"], 1)
+        self.assertGreaterEqual(report["data_subject_requests"]["deletions_in_period"], 1)
+        self.assertGreaterEqual(report["data_retention"]["communications_past_retention_count"], 1)
+        self.assertIn("consent_summary", report)
+        self.assertIn("checks", report)
+        self.assertTrue(
+            any(check["name"] == "opt_out_records" for check in report["checks"])
+        )
+
     def test_update_application_status_requires_existing_application(self):
         signature = self._discover_sample_opportunity()
 
@@ -279,6 +366,116 @@ class FundingBotTests(unittest.TestCase):
         self.assertIn("Daily Nonprofit Funding Report – 2026-06-22", summary["subject"])
         self.assertIn("UNICEF CSR Grant", summary["body"])
         self.assertIn("Pending Applications: 1", summary["body"])
+
+    def _task_filter_fixtures(self):
+        return [
+            self.bot.create_task(
+                title="Staff todo soon",
+                assigned_to="staff",
+                status="todo",
+                due_date="2026-07-20",
+            ),
+            self.bot.create_task(
+                title="Staff in progress late",
+                assigned_to="staff",
+                status="in-progress",
+                due_date="2026-07-25",
+            ),
+            self.bot.create_task(
+                title="Admin todo mid",
+                assigned_to="admin",
+                status="todo",
+                due_date="2026-07-22",
+            ),
+            self.bot.create_task(
+                title="Auditor done early",
+                assigned_to="auditor",
+                status="done",
+                due_date="2026-07-18",
+            ),
+            self.bot.create_task(
+                title="Admin blocked no date",
+                assigned_to="admin",
+                status="blocked",
+            ),
+        ]
+
+    def test_list_tasks_supports_all_filter_combinations(self):
+        tasks = self._task_filter_fixtures()
+        filter_values = {
+            "assigned_to": "staff",
+            "status": "todo",
+            "due_date_after": "2026-07-20",
+            "due_date_before": "2026-07-22",
+        }
+
+        def matches(task, active_filters):
+            due_date = task["due_date"][:10] if task["due_date"] else None
+            return all(
+                (
+                    task["assigned_to"] == filter_values["assigned_to"]
+                    if name == "assigned_to"
+                    else task["status"] == filter_values["status"]
+                    if name == "status"
+                    else due_date is not None and due_date >= filter_values["due_date_after"]
+                    if name == "due_date_after"
+                    else due_date is not None and due_date <= filter_values["due_date_before"]
+                )
+                for name in active_filters
+            )
+
+        for size in range(1, len(filter_values) + 1):
+            for active_filters in itertools.combinations(filter_values, size):
+                expected_titles = [
+                    task["title"]
+                    for task in tasks
+                    if matches(task, active_filters)
+                ]
+                rows = self.bot.list_tasks(
+                    assigned_to=filter_values["assigned_to"] if "assigned_to" in active_filters else None,
+                    status=filter_values["status"] if "status" in active_filters else None,
+                    due_date_after=(
+                        filter_values["due_date_after"] if "due_date_after" in active_filters else None
+                    ),
+                    due_date_before=(
+                        filter_values["due_date_before"] if "due_date_before" in active_filters else None
+                    ),
+                    sort="due_date",
+                )
+                self.assertEqual(
+                    expected_titles,
+                    [task["title"] for task in rows],
+                    msg=f"Unexpected results for filters {active_filters!r}",
+                )
+
+    def test_list_tasks_supports_sorting_by_assignee_status_and_due_date(self):
+        self._task_filter_fixtures()
+        expected_orders = {
+            "assignee": [
+                "Admin todo mid",
+                "Admin blocked no date",
+                "Auditor done early",
+                "Staff todo soon",
+                "Staff in progress late",
+            ],
+            "status": [
+                "Admin blocked no date",
+                "Auditor done early",
+                "Staff in progress late",
+                "Staff todo soon",
+                "Admin todo mid",
+            ],
+            "due_date": [
+                "Auditor done early",
+                "Staff todo soon",
+                "Admin todo mid",
+                "Staff in progress late",
+                "Admin blocked no date",
+            ],
+        }
+        for sort_name, expected_titles in expected_orders.items():
+            rows = self.bot.list_tasks(sort=sort_name)
+            self.assertEqual(expected_titles, [task["title"] for task in rows])
 
     def test_generate_document_falls_back_to_english_translations(self):
         documents = self.bot.generate_document(
@@ -623,6 +820,148 @@ class PortalConnectorTests(unittest.TestCase):
 
         self.assertEqual(1, len(found))
         self.assertEqual("CSR Network", found[0]["source"])
+
+
+class ConnectorFallbackAndVersioningTests(unittest.TestCase):
+    def setUp(self):
+        self.db_path = Path(".test_connector_fallback.db")
+        if self.db_path.exists():
+            self.db_path.unlink()
+        os.environ.pop("PORTAL_FALLBACK_MODE", None)
+
+    def tearDown(self):
+        if self.db_path.exists():
+            self.db_path.unlink()
+        os.environ.pop("PORTAL_FALLBACK_MODE", None)
+
+    def test_connector_detects_and_migrates_legacy_schema(self):
+        def legacy_http_client(url, payload):
+            return {
+                "schema_version": 1,
+                "opportunities": [
+                    {
+                        "source": "CSR Network",
+                        "funder": "Legacy Donor",
+                        "title": "Legacy CSR Grant",
+                        "link": "https://csr.example.org/opportunities/legacy",
+                        "description": "Legacy schema payload.",
+                        "type": "Corporate Partnerships",
+                        "topics": ["csr", "education"],
+                    }
+                ],
+            }
+
+        connector = CSRNetworkConnector(http_client=legacy_http_client, max_retries=0)
+
+        result = connector.fetch_result(["csr"])
+
+        self.assertEqual(connector.result_schema_version, result["schema_version"])
+        self.assertEqual(1, result["metadata"]["detected_schema_version"])
+        self.assertEqual(1, result["metadata"]["upstream_schema_version"])
+        self.assertEqual("Legacy Donor", result["opportunities"][0]["donor_name"])
+        self.assertEqual(
+            "https://csr.example.org/opportunities/legacy",
+            result["opportunities"][0]["portal_url"],
+        )
+
+    def test_run_discovery_uses_default_fallback_and_logs_activation(self):
+        def failing_http_client(url, payload):
+            raise ConnectionError("connector offline")
+
+        connector = GrantsPortalConnector(http_client=failing_http_client, max_retries=0)
+        bot = FundingBot(db_path=self.db_path, trusted_sources={"Grants Portal"})
+        try:
+            with self.assertLogs("funding_bot", level="WARNING") as logs:
+                found = bot.run_discovery([connector], keywords=["education"])
+
+            self.assertEqual(1, len(found))
+            self.assertEqual("Education Innovation Grant", found[0]["title"])
+            cache_row = bot.connection.execute(
+                """
+                SELECT schema_version, source_status, metadata_json
+                FROM connector_result_cache
+                WHERE connector_name = ?
+                """,
+                ("Grants Portal",),
+            ).fetchone()
+            metadata = json.loads(cache_row["metadata_json"])
+            self.assertEqual(connector.result_schema_version, cache_row["schema_version"])
+            self.assertEqual("default", cache_row["source_status"])
+            self.assertEqual("default", metadata["fallback_mode"])
+            self.assertTrue(
+                any("fallback activated" in message.lower() for message in logs.output)
+            )
+        finally:
+            bot.close()
+
+    def test_run_discovery_migrates_cached_results_before_fallback(self):
+        connector = CSRNetworkConnector(http_client=lambda url, payload: (_ for _ in ()).throw(ConnectionError("unreachable")), max_retries=0)
+        seeded_bot = FundingBot(db_path=self.db_path, trusted_sources={"CSR Network"})
+        try:
+            seeded_bot.connection.execute(
+                """
+                INSERT INTO connector_result_cache (
+                    connector_name, cache_key, schema_version, fetched_at,
+                    source_status, metadata_json, result_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "CSR Network",
+                    connector.build_cache_key(["csr"]),
+                    1,
+                    seeded_bot._to_iso(),
+                    "remote",
+                    json.dumps({"seeded": True}, sort_keys=True),
+                    json.dumps(
+                        [
+                            {
+                                "source": "CSR Network",
+                                "funder": "Cached Legacy Donor",
+                                "title": "Cached Legacy Grant",
+                                "link": "https://csr.example.org/opportunities/cached-legacy",
+                                "description": "Cached legacy schema payload.",
+                                "type": "Corporate Partnerships",
+                                "topics": ["csr", "education"],
+                            }
+                        ],
+                        sort_keys=True,
+                    ),
+                ),
+            )
+            seeded_bot.connection.commit()
+        finally:
+            seeded_bot.close()
+
+        bot = FundingBot(db_path=self.db_path, trusted_sources={"CSR Network"})
+        try:
+            found = bot.run_discovery([connector], keywords=["csr"])
+            self.assertEqual(1, len(found))
+            self.assertEqual("Cached Legacy Donor", found[0]["donor_name"])
+            self.assertEqual(
+                "https://csr.example.org/opportunities/cached-legacy",
+                found[0]["portal_url"],
+            )
+
+            cache_row = bot.connection.execute(
+                """
+                SELECT schema_version, source_status, metadata_json, result_json
+                FROM connector_result_cache
+                WHERE connector_name = ?
+                """,
+                ("CSR Network",),
+            ).fetchone()
+            metadata = json.loads(cache_row["metadata_json"])
+            payload = json.loads(cache_row["result_json"])
+            self.assertEqual(connector.result_schema_version, cache_row["schema_version"])
+            self.assertEqual("cached", cache_row["source_status"])
+            self.assertEqual(1, metadata["migrated_from_schema_version"])
+            self.assertEqual("cached", metadata["fallback_mode"])
+            self.assertEqual(
+                "https://csr.example.org/opportunities/cached-legacy",
+                payload[0]["portal_url"],
+            )
+        finally:
+            bot.close()
 
 
 class DonorSegmentationAndTemplateTests(unittest.TestCase):

@@ -1,0 +1,112 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from flask import Flask, jsonify, render_template, request
+
+app = Flask(
+    __name__,
+    template_folder=str(Path(__file__).resolve().parents[2] / "web" / "templates"),
+)
+
+
+@app.get("/dashboard", endpoint="dashboard")
+def dashboard_page() -> str:
+    return render_template(
+        "dashboard.html",
+        current_role="admin",
+        new_opportunities_count=3,
+        applications_submitted_count=4,
+        pending_applications_count=2,
+        donor_communications_count=5,
+        my_tasks_count=6,
+        my_open_tasks_count=2,
+        recent_opportunities=[
+            {
+                "title": "Education Innovation Grant",
+                "donor_name": "Future Fund",
+                "status": "new",
+                "discovered_at": "2026-07-18T10:00:00Z",
+            }
+        ],
+        recent_applications=[
+            {
+                "title": "Community Learning Fund",
+                "donor_name": "Civic Foundation",
+                "status": "pending_review",
+                "submitted_at": "2026-07-17T09:00:00Z",
+                "next_action": "Awaiting confirmation",
+            }
+        ],
+    )
+
+
+@app.get("/dashboard/tasks", endpoint="dashboard_tasks")
+def tasks_page() -> str:
+    return render_template(
+        "tasks.html",
+        current_role="admin",
+        total_tasks=3,
+        task_counts={"todo": 1, "in-progress": 1, "done": 1},
+        can_filter_all_assignees=True,
+        task_assignee_options=["admin", "staff"],
+        task_filters={
+            "assignee": "",
+            "status": "",
+            "due_date_after": "",
+            "due_date_before": "",
+            "sort": "updated_at_desc",
+        },
+        task_sort_options=[
+            ("updated_at_desc", "Recently updated"),
+            ("due_date_asc", "Due date"),
+        ],
+        tasks=[
+            {
+                "title": "Review grant checklist",
+                "description": "Validate the next submission batch.",
+                "assigned_to": "admin",
+                "status": "in-progress",
+                "due_date": "2026-07-20",
+                "updated_at": "2026-07-18T11:00:00Z",
+            }
+        ],
+    )
+
+
+@app.get("/settings", endpoint="settings_page")
+def settings_page() -> str:
+    return render_template(
+        "settings.html",
+        current_role="admin",
+        ui_locale={"code": "en", "direction": "ltr", "is_rtl": False},
+        organization_profile={"name": "i4Edu", "mission": "Expand access"},
+        search_settings={"keywords": ["education", "csr"], "trusted_sources": ["fund.example"]},
+        credentials=[{"alias": "smtp", "env_var_name": "SMTP_PASSWORD"}],
+        smtp_configured=False,
+        smtp_host="",
+    )
+
+
+@app.get("/translations", endpoint="translation_review_dashboard")
+def translation_review_dashboard() -> str:
+    return render_template(
+        "base.html",
+        current_role="admin",
+    )
+
+
+@app.get("/tasks", endpoint="list_tasks_route")
+def list_tasks_route():
+    return jsonify(
+        {
+            "filters": request.args.to_dict(),
+            "tasks": [
+                {
+                    "title": "Review grant checklist",
+                    "assigned_to": "admin",
+                    "status": "in-progress",
+                }
+            ],
+        }
+    )

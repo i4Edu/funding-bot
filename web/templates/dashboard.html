@@ -3,16 +3,16 @@
 {% block title %}Nonprofit Funding Bot Dashboard{% endblock %}
 
 {% block nav_links %}
-        <a class="nav-link text-white" href="{{ url_for('translation_review_dashboard') }}">Translations</a>
-        <a class="nav-link text-white" href="{{ url_for('dashboard_tasks') }}">My Tasks</a>
-        <a class="nav-link text-white" href="{{ url_for('settings_page') }}">Settings</a>
+        <a class="nav-link text-white" href="{{ url_for('translation_review_dashboard') }}" aria-label="Open translation review dashboard">Translations</a>
+        <a class="nav-link text-white" href="{{ url_for('dashboard_tasks') }}" aria-label="Open my tasks dashboard">My Tasks</a>
+        <a class="nav-link text-white" href="{{ url_for('settings_page') }}" aria-label="Open settings page">Settings</a>
 {% endblock %}
 
 {% block main_content %}
       <h1 class="visually-hidden">Operations Dashboard</h1>
       <div class="row g-4 mb-4" role="region" aria-label="Summary statistics">
         <div class="col-md-6 col-xl-3">
-          <div class="card border-0 shadow-sm h-100">
+          <div class="card border-0 shadow-sm h-100" role="group" aria-labelledby="stat-new-opps" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted" id="stat-new-opps">New Opportunities</h2>
               <p class="display-6 mb-1" aria-labelledby="stat-new-opps">{{ new_opportunities_count }}</p>
@@ -21,7 +21,7 @@
           </div>
         </div>
         <div class="col-md-6 col-xl-3">
-          <div class="card border-0 shadow-sm h-100">
+          <div class="card border-0 shadow-sm h-100" role="group" aria-labelledby="stat-apps-submitted" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted" id="stat-apps-submitted">Applications Submitted</h2>
               <p class="display-6 mb-1" aria-labelledby="stat-apps-submitted">{{ applications_submitted_count }}</p>
@@ -30,7 +30,7 @@
           </div>
         </div>
         <div class="col-md-6 col-xl-3">
-          <div class="card border-0 shadow-sm h-100">
+          <div class="card border-0 shadow-sm h-100" role="group" aria-labelledby="stat-pending-apps" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted" id="stat-pending-apps">Pending Applications</h2>
               <p class="display-6 mb-1" aria-labelledby="stat-pending-apps">{{ pending_applications_count }}</p>
@@ -39,7 +39,7 @@
           </div>
         </div>
         <div class="col-md-6 col-xl-3">
-          <div class="card border-0 shadow-sm h-100">
+          <div class="card border-0 shadow-sm h-100" role="group" aria-labelledby="stat-donor-comms" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted" id="stat-donor-comms">Donor Communications</h2>
               <p class="display-6 mb-1" aria-labelledby="stat-donor-comms">{{ donor_communications_count }}</p>
@@ -48,7 +48,7 @@
           </div>
         </div>
         <div class="col-md-6 col-xl-3">
-          <div class="card border-0 shadow-sm h-100">
+          <div class="card border-0 shadow-sm h-100" role="group" aria-labelledby="stat-my-tasks" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted" id="stat-my-tasks">My Tasks</h2>
               <p class="display-6 mb-1" aria-labelledby="stat-my-tasks">{{ my_tasks_count }}</p>
@@ -57,7 +57,7 @@
           </div>
         </div>
         <div class="col-md-6 col-xl-3">
-          <div class="card border-0 shadow-sm h-100">
+          <div class="card border-0 shadow-sm h-100" role="group" aria-labelledby="stat-translation-reviews" tabindex="0">
             <div class="card-body">
               <h2 class="h6 text-muted" id="stat-translation-reviews">Translation Reviews</h2>
               <p class="display-6 mb-1" aria-labelledby="stat-translation-reviews">{{ pending_translation_reviews_count }}</p>
@@ -69,12 +69,15 @@
 
       <div class="row g-4">
         <div class="col-lg-8">
-          <div class="card border-0 shadow-sm">
+          <section class="card border-0 shadow-sm" role="region" aria-labelledby="recent-opps-heading">
             <div class="card-header bg-white">
               <h2 class="h5 mb-0" id="recent-opps-heading">Recent Opportunities</h2>
             </div>
             <div class="card-body p-0">
-              <div class="table-responsive">
+              <p id="recent-opps-description" class="visually-hidden">
+                Use Alt+Shift+O to focus this table. Tab and Shift+Tab move between links, regions, and shortcut help in page order.
+              </p>
+              <div class="table-responsive" id="recent-opps-region" role="region" aria-labelledby="recent-opps-heading" aria-describedby="recent-opps-description" tabindex="0">
                 <table class="table table-hover align-middle mb-0 rtl-safe" aria-labelledby="recent-opps-heading">
                   <thead class="table-light">
                     <tr>
@@ -105,16 +108,16 @@
                 </table>
               </div>
             </div>
-          </div>
+          </section>
         </div>
 
         <div class="col-lg-4">
-          <div class="card border-0 shadow-sm">
+          <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="recent-apps-heading">
             <div class="card-header bg-white">
               <h2 class="h5 mb-0" id="recent-apps-heading">Recent Applications</h2>
             </div>
             <div class="card-body">
-              <ul class="list-group list-group-flush rtl-safe" aria-labelledby="recent-apps-heading">
+              <ul class="list-group list-group-flush rtl-safe" id="recent-apps-region" aria-labelledby="recent-apps-heading" tabindex="0">
                 {% for application in recent_applications %}
                 <li class="list-group-item px-0">
                   <div class="fw-semibold">{{ application.title }}</div>
@@ -130,7 +133,72 @@
                 {% endfor %}
               </ul>
             </div>
-          </div>
+          </section>
+
+          <section id="keyboard-shortcuts" class="card border-0 shadow-sm" role="region" aria-labelledby="keyboard-shortcuts-heading" tabindex="-1">
+            <div class="card-header bg-white">
+              <h2 class="h5 mb-0" id="keyboard-shortcuts-heading">Keyboard shortcuts</h2>
+            </div>
+            <div class="card-body">
+              <p id="keyboard-shortcuts-note" class="text-muted small mb-3">
+                Keyboard navigation follows the page order. Use Enter or Space to activate dashboard action buttons on linked pages.
+              </p>
+              <ul class="list-group list-group-flush small" aria-describedby="keyboard-shortcuts-note">
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>D</kbd> — Open the dashboard</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>S</kbd> — Open settings</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>M</kbd> — Focus the main content</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>O</kbd> — Focus recent opportunities</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>A</kbd> — Focus recent applications</li>
+                <li class="list-group-item px-0"><kbd>Alt</kbd> + <kbd>Shift</kbd> + <kbd>K</kbd> — Focus this shortcut help</li>
+              </ul>
+            </div>
+          </section>
         </div>
       </div>
+{% endblock %}
+
+{% block scripts %}
+    <script>
+      function focusAndScroll(element) {
+        if (!element) {
+          return;
+        }
+        element.focus();
+        element.scrollIntoView({ block: "start", behavior: "smooth" });
+      }
+
+      document.addEventListener("keydown", (event) => {
+        if (!(event.altKey && event.shiftKey) || event.ctrlKey || event.metaKey) {
+          return;
+        }
+
+        const activeElement = document.activeElement;
+        const isTyping = activeElement && (
+          activeElement.tagName === "INPUT"
+          || activeElement.tagName === "TEXTAREA"
+          || activeElement.tagName === "SELECT"
+          || activeElement.isContentEditable
+        );
+        if (isTyping && !["KeyK", "KeyM"].includes(event.code)) {
+          return;
+        }
+
+        const shortcutActions = {
+          KeyD: () => window.location.assign("{{ url_for('dashboard') }}"),
+          KeyS: () => window.location.assign("{{ url_for('settings_page') }}"),
+          KeyM: () => focusAndScroll(document.getElementById("main-content")),
+          KeyO: () => focusAndScroll(document.getElementById("recent-opps-region")),
+          KeyA: () => focusAndScroll(document.getElementById("recent-apps-region")),
+          KeyK: () => focusAndScroll(document.getElementById("keyboard-shortcuts")),
+        };
+
+        const action = shortcutActions[event.code];
+        if (!action) {
+          return;
+        }
+
+        event.preventDefault();
+        action();
+      });
+    </script>
 {% endblock %}

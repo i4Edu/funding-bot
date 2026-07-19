@@ -8,6 +8,7 @@ The Nonprofit Funding Bot helps staff discover funding opportunities, prevent du
 
 For planned milestones and release scope, see [roadmap.md](roadmap.md).
 For connector implementation and keyword-mapping guidance, see [docs/CONNECTORS.md](docs/CONNECTORS.md).
+For vulnerability reporting, disclosure timelines, incident response, and the penetration-testing checklist, see [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Overview
 
@@ -222,16 +223,14 @@ python -m flask --app web.app run
 ### Accessibility checks
 
 The dashboard templates now share a keyboard-visible skip link through
-`web/templates/base.html`. To run automated accessibility checks locally:
+`web/templates/base.html`. To run automated accessibility checks locally against the
+template fixture app:
 
 ```bash
 pip install -r web/requirements.txt
 npm install
 npx playwright install chromium
-ADMIN_PASSWORD=admin-secret \
-STAFF_PASSWORD=staff-secret \
-AUDITOR_PASSWORD=auditor-secret \
-python -m flask --app web.app run --host 127.0.0.1 --port 5001
+python -m flask --app tests.accessibility.app run --host 127.0.0.1 --port 5001
 ```
 
 Then, in a second terminal:
@@ -241,8 +240,8 @@ npm run test:a11y
 ```
 
 The accessibility runner uses `@axe-core/playwright` to scan `/dashboard`,
-`/dashboard/tasks`, and `/settings`, and exits non-zero when any axe violation is
-found. The same command runs in GitHub Actions CI.
+`/dashboard/tasks`, and `/settings` rendered by the fixture app, and exits non-zero
+when any axe violation is found. The same command runs in GitHub Actions CI.
 
 ### Dashboard screenshot
 
@@ -264,7 +263,8 @@ The dashboard uses HTTP Basic Auth. Use one of these usernames as the role name:
 | --- | --- | --- | --- |
 | `/` | `GET` | Public | Redirect to `/dashboard`. |
 | `/dashboard` | `GET` | `staff`, `admin`, `auditor` | HTML operations dashboard (WCAG 2.1 accessible). |
-| `/dashboard/tasks` | `GET` | `staff`, `admin`, `auditor` | HTML task dashboard showing tasks assigned to the authenticated role, plus task counts by status. |
+| `/dashboard/tasks` | `GET` | `staff`, `admin`, `auditor` | HTML task dashboard with assignee, status, due-date filters and assignee/status/due-date sorting. |
+| `/tasks` | `GET` | `staff`, `admin`, `auditor` | List tasks as JSON with assignee, status, due-date filtering and assignee/status/due-date sorting. |
 | `/opportunities` | `GET` | `staff`, `admin`, `auditor` | List opportunities as JSON. |
 | `/opportunities/<signature>` | `GET` | `staff`, `admin`, `auditor` | Show one opportunity, linked application, and submission attempts. |
 | `/opportunities/<signature>/submit` | `POST` | `admin` | Record a submission result for an opportunity. |
@@ -319,6 +319,25 @@ The `/metrics` endpoint exposes the following gauges and counters in the Prometh
 | `funding_bot_queue_workers` | gauge | Online Celery workers detected |
 
 Add a scrape target pointing to `http://<host>:5000/metrics` in your Prometheus configuration or Grafana Agent config, and authenticate with an `admin` or `auditor` dashboard role.
+
+### Task filter API
+
+`GET /tasks` and `GET /dashboard/tasks` accept the same query parameters:
+
+| Parameter | Example | Description |
+| --- | --- | --- |
+| `assignee` | `staff` | Filter to an exact assignee. Staff users are restricted to their own role. |
+| `status` | `in-progress` | Filter by task status. Accepted values: `todo`, `in-progress`, `done`, `blocked`. |
+| `due_date_before` | `2026-07-31` | Include only tasks due on or before the given UTC date. |
+| `due_date_after` | `2026-07-01` | Include only tasks due on or after the given UTC date. |
+| `sort` | `due_date` | Sort results by `assignee`, `status`, or `due_date`. Prefix with `-` for descending order (for example `-due_date` or `-assignee`). Default: `updated_at`. |
+
+Example:
+
+```bash
+curl -u admin:$ADMIN_PASSWORD \
+  "http://localhost:5000/tasks?assignee=staff&status=todo&due_date_after=2026-07-01&due_date_before=2026-07-31&sort=due_date"
+```
 
 ## Outreach template translations
 
@@ -476,11 +495,10 @@ Celery is the preferred replacement for cron for new asynchronous work in this r
 | --- | --- | --- |
 | `CELERY_BROKER_URL` | `redis://redis:6379/0` | Primary broker URL. Use the RabbitMQ example below to switch brokers. |
 | `CELERY_RESULT_BACKEND` | `redis://redis:6379/1` | Result backend for task metadata and task return values. |
-| `ENABLE_TASK_QUEUE` | `0` | Enable Celery-backed async task execution. |
+| `ENABLE_TASK_QUEUE` | `0` in code / `1` in `.env.example` | Enable Celery-backed async task execution. |
 | `ENABLE_LEGACY_CRON` | `1` | Keep legacy cron scheduling active during queue migration. |
 | `CELERY_QUEUE_NAME` | `funding-bot` | Default queue name for funding bot workers. |
-| `ENABLE_TASK_QUEUE` | `0` in code / `1` in `.env.example` | Enables queue-backed execution paths. |
-| `ENABLE_LEGACY_CRON` | `1` | Keeps the legacy CLI/cron path available during migration. |
+| `CELERY_HEALTH_TIMEOUT_SECONDS` | `2.0` in `.env.example` | Timeout for `/health/queue` broker and worker checks. |
 | `CELERY_TASK_ALWAYS_EAGER` | `0` | Execute queued work inline for tests and local debugging. |
 
 RabbitMQ broker example:
@@ -492,7 +510,7 @@ export CELERY_BROKER_URL=amqp://<user>:<password>@rabbitmq:5672//
 ### Running the worker
 
 ```bash
-celery --app task_queue.celery_app worker --loglevel=info --queues funding-bot
+celery -A celery_app:celery_app worker --loglevel=info --queues funding-bot
 ```
 
 ### Docker Compose brokers
@@ -500,13 +518,13 @@ celery --app task_queue.celery_app worker --loglevel=info --queues funding-bot
 `docker-compose.yml` now includes:
 
 - `redis` as the default Celery broker and result backend
-- `worker` running `task_queue.celery_app`
-- `flower` for queue monitoring on port `5555`
+- `rabbitmq` as an alternate broker option
+- `worker` running `celery_app:celery_app`
 
 Start the stack with:
 
 ```bash
-docker compose --profile queue up --build
+docker compose up --build
 ```
 
 ### Legacy cron fallback
@@ -521,7 +539,7 @@ Cron can remain as a migration fallback while queue-backed workers are introduce
 0 9 * * * cd /path/to/funding-bot && python -m funding_bot send-daily-summary
 ```
 
-For Kubernetes deployments, mirror either the legacy CLI schedule with a `CronJob` or the new worker model with a Celery-compatible broker deployment. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for full worker, Flower, scaling, and migration guidance.
+For Kubernetes deployments, mirror either the legacy CLI schedule with a `CronJob` or the new worker model with a Celery-compatible broker deployment.
 
 ## Partner Onboarding
 

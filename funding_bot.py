@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import signal
+import ssl
 import smtplib
 import sqlite3
 import sys
@@ -28,7 +29,9 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Protocol
 from xml.sax.saxutils import escape
 
+import requests
 from jsonschema import ValidationError, validate
+from requests.adapters import HTTPAdapter
 
 try:
     from babel.dates import format_date as babel_format_date
@@ -121,6 +124,24 @@ def _extract_dict_keys(value: Any) -> list[str]:
     return sorted(str(field) for field in value)
 
 
+_DATA_CLASSIFICATION_LEVELS = ("public", "internal", "confidential", "secret")
+_DATA_CLASSIFICATION_RANK = {
+    classification: index
+    for index, classification in enumerate(_DATA_CLASSIFICATION_LEVELS)
+}
+_ENCRYPTED_VALUE_PREFIX = "enc-v1:"
+
+
+def _normalize_data_classification(value: str | None, *, default: str = "internal") -> str:
+    normalized = str(value or default).strip().lower()
+    if normalized not in _DATA_CLASSIFICATION_RANK:
+        raise ValueError(
+            f"Invalid data classification {value!r}. "
+            f"Expected one of {list(_DATA_CLASSIFICATION_LEVELS)}."
+        )
+    return normalized
+
+
 class _DocumentTranslationLookup:
     """Template translation lookup with English fallback."""
 
@@ -187,6 +208,46 @@ def _read_numeric_env(
             return int(default) if as_int else default
         return parsed
     return int(default) if as_int else default
+
+
+def _require_https_url(url: str, *, purpose: str = "Outbound request") -> str:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme.lower() != "https":
+        raise ConnectionSecurityError(f"{purpose} must use an https:// URL: {url!r}")
+    if not parsed.netloc:
+        raise ConnectionSecurityError(f"{purpose} must include a valid host: {url!r}")
+    return url
+
+
+def _build_tls_ssl_context() -> ssl.SSLContext:
+    context = ssl.create_default_context()
+    minimum_version = getattr(ssl.TLSVersion, "TLSv1_2", None)
+    if minimum_version is not None:
+        context.minimum_version = minimum_version
+    context.check_hostname = True
+    context.verify_mode = ssl.CERT_REQUIRED
+    return context
+
+
+class _TLSHttpAdapter(HTTPAdapter):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self._ssl_context = _build_tls_ssl_context()
+        super().__init__(*args, **kwargs)
+
+    def init_poolmanager(self, *args: Any, **kwargs: Any) -> None:
+        kwargs["ssl_context"] = self._ssl_context
+        return super().init_poolmanager(*args, **kwargs)
+
+    def proxy_manager_for(self, *args: Any, **kwargs: Any) -> Any:
+        kwargs["ssl_context"] = self._ssl_context
+        return super().proxy_manager_for(*args, **kwargs)
+
+
+def _build_tls_http_session() -> requests.Session:
+    session = requests.Session()
+    adapter = _TLSHttpAdapter()
+    session.mount("https://", adapter)
+    return session
 
 
 class _TTLCache:
@@ -388,6 +449,10 @@ class FundingBotError(Exception):
 
 class RateLimitExceededError(FundingBotError):
     """Raised when a connector exhausts its allotted upstream quota."""
+
+
+class ConnectionSecurityError(FundingBotError):
+    """Raised when an outbound connector request violates TLS requirements."""
 
 
 class DuplicateSubmissionError(FundingBotError):
@@ -1003,6 +1068,7 @@ class _BasePortalConnector:
             return []
 
     def fetch_result(self, keywords: Iterable[str]) -> dict[str, Any]:
+        self._last_rate_limit_retry_after = None
         keyword_list = self._expand_keywords(keywords)
         cache_key = self._cache_key(keyword_list)
         if self._cache is not None:
@@ -1019,6 +1085,19 @@ class _BasePortalConnector:
             return self._build_degraded_result(keyword_list, reason="circuit_open")
 
         use_remote = self.http_client is not None or self.transport == "http"
+        if use_remote:
+            allowed, retry_after = self._rate_limiter.consume()
+            if not allowed:
+                self._metrics["rate_limited_requests"] += 1
+                self._last_rate_limit_retry_after = retry_after
+                self._last_error = (
+                    f"{self.source_name} rate limit exceeded; retry in {retry_after:.2f} seconds."
+                )
+                return self._build_degraded_result(
+                    keyword_list,
+                    reason="rate_limit_exceeded",
+                    error=self._last_error,
+                )
         if use_remote:
             try:
                 result = self._fetch_remote_result(keyword_list)
@@ -1111,6 +1190,7 @@ class _BasePortalConnector:
                 "degraded_reason": reason,
                 "circuit_state": self._refresh_circuit_state(),
                 "last_error": error or self._last_error,
+                "retry_after_seconds": self._last_rate_limit_retry_after,
             },
         }
 
@@ -1226,16 +1306,60 @@ class _BasePortalConnector:
     def _fetch_remote_result(self, keywords: list[str]) -> dict[str, Any]:
         client = self.http_client or _default_http_json_client
 
-        def operation() -> Any:
-            payload = {"keywords": keywords, "health_check": self._circuit_state == "half-open"}
-            try:
-                return client(self.base_url, payload, self.credentials)
-            except TypeError:
-                return client(self.base_url, payload)
+        opportunities: list[dict[str, Any]] = []
+        declared_version: Any = None
+        response_keys: set[str] = set()
+        pages_fetched = 0
+        page = 1
 
-        response = self._call_with_retry(
-            operation
-        )
+        while True:
+            def operation(page_number: int = page) -> Any:
+                payload = {
+                    "keywords": keywords,
+                    "page": page_number,
+                    "page_size": self.page_size,
+                    "health_check": self._circuit_state == "half-open",
+                }
+                try:
+                    return client(self.base_url, payload, self.credentials)
+                except TypeError:
+                    return client(self.base_url, payload)
+
+            response = self._call_with_retry(operation)
+            page_payload, page_declared_version, page_response_keys, next_page = self._parse_remote_page(
+                response,
+                current_page=page,
+            )
+            opportunities.extend(page_payload)
+            pages_fetched += 1
+            if page_declared_version is not None:
+                declared_version = page_declared_version
+            response_keys.update(page_response_keys)
+            if next_page is None:
+                break
+            page = next_page
+
+        detected_version = self.detect_schema_version(opportunities, declared_version)
+        return {
+            "schema_version": self.result_schema_version,
+            "opportunities": self.migrate_result_payload(opportunities, detected_version),
+            "metadata": {
+                "connector_name": self.source_name,
+                "source_status": "remote",
+                "detected_schema_version": detected_version,
+                "upstream_schema_version": declared_version,
+                "response_keys": sorted(response_keys),
+                "pages_fetched": pages_fetched,
+                "page_size": self.page_size,
+            },
+        }
+
+    def _parse_remote_page(
+        self,
+        response: Any,
+        *,
+        current_page: int,
+    ) -> tuple[list[dict[str, Any]], Any, list[str], int | None]:
         if isinstance(response, dict):
             payload = response.get("opportunities")
             if payload is None:
@@ -1243,23 +1367,25 @@ class _BasePortalConnector:
             if payload is None:
                 payload = response.get("items", [])
             declared_version = response.get("schema_version", response.get("result_schema_version"))
-            response_keys = sorted(str(key) for key in response)
-        else:
-            payload = response
-            declared_version = None
-            response_keys = []
-        detected_version = self.detect_schema_version(payload, declared_version)
-        return {
-            "schema_version": self.result_schema_version,
-            "opportunities": self.migrate_result_payload(payload, detected_version),
-            "metadata": {
-                "connector_name": self.source_name,
-                "source_status": "remote",
-                "detected_schema_version": detected_version,
-                "upstream_schema_version": declared_version,
-                "response_keys": response_keys,
-            },
-        }
+            response_keys = [str(key) for key in response]
+            next_page = response.get("next_page")
+            if next_page is None:
+                total_pages = response.get("total_pages")
+                if total_pages is not None:
+                    try:
+                        total_pages_int = int(total_pages)
+                    except (TypeError, ValueError):
+                        total_pages_int = current_page
+                    next_page = current_page + 1 if current_page < total_pages_int else None
+                elif "has_more" in response:
+                    next_page = current_page + 1 if response.get("has_more") else None
+                elif payload and len(payload) >= self.page_size:
+                    next_page = current_page + 1
+            return [dict(item) for item in (payload or [])], declared_version, response_keys, next_page
+
+        payload = [dict(item) for item in (response or [])]
+        next_page = current_page + 1 if payload and len(payload) >= self.page_size else None
+        return payload, None, [], next_page
 
     def detect_schema_version(self, payload: Any, declared_version: Any = None) -> int:
         if declared_version is not None:
@@ -1340,6 +1466,11 @@ class _BasePortalConnector:
             "state": self._refresh_circuit_state(),
             "last_error": self._last_error,
             "opened_at": self._opened_at,
+            "rate_limit": {
+                **self.rate_limit_config,
+                "available_tokens": self._rate_limiter.available_tokens,
+                "retry_after_seconds": self._last_rate_limit_retry_after,
+            },
         }
 
     def _call_with_retry(self, operation: Callable[[], Any]) -> Any:
@@ -1496,6 +1627,9 @@ class NGODirectoryConnector(_BasePortalConnector):
         ]
 
 
+_DEFAULT_CONNECTORS: list[PortalConnector] | None = None
+
+
 def default_connectors() -> list[PortalConnector]:
     """Return the built-in portal connectors used by ``run_discovery``.
 
@@ -1503,7 +1637,14 @@ def default_connectors() -> list[PortalConnector]:
     which keeps discovery safe to run out-of-the-box while still exercising
     the full search pipeline end-to-end.
     """
-    return [GrantsPortalConnector(), CSRNetworkConnector(), NGODirectoryConnector()]
+    global _DEFAULT_CONNECTORS
+    if _DEFAULT_CONNECTORS is None:
+        _DEFAULT_CONNECTORS = [
+            GrantsPortalConnector(),
+            CSRNetworkConnector(),
+            NGODirectoryConnector(),
+        ]
+    return list(_DEFAULT_CONNECTORS)
 
 
 CONNECTOR_CONFIG_ENV_VAR = "FUNDING_BOT_CONNECTORS"
@@ -1864,6 +2005,48 @@ class FundingBot:
     DEFAULT_PRIVACY_POLICY_FORMATS = ("html", "pdf")
     OUTREACH_TEMPLATE_CATALOG = OUTREACH_TEMPLATE_CATALOG_DIR
     DATA_RETENTION_POLICY_KEY = "data_retention_policy"
+    DATA_CLASSIFICATIONS = _DATA_CLASSIFICATION_LEVELS
+    MODEL_DEFAULT_CLASSIFICATIONS = {
+        "organization_profile": "internal",
+        "credential_refs": "internal",
+        "opportunities": "public",
+        "applications": "internal",
+        "submission_attempts": "internal",
+        "donors": "confidential",
+        "communications": "confidential",
+        "documents": "internal",
+        "audit_logs": "confidential",
+        "outreach_templates": "internal",
+        "outreach_events": "internal",
+        "task_runs": "internal",
+        "tasks": "internal",
+        "translation_reviews": "internal",
+    }
+    SETTING_DEFAULT_CLASSIFICATIONS = {
+        "profile": "confidential",
+        "search_settings": "internal",
+    }
+    DONOR_FIELD_CLASSIFICATIONS = {
+        "email": "confidential",
+        "name": "internal",
+        "opted_out": "confidential",
+        "preferences": "secret",
+        "last_contact_at": "confidential",
+        "segment": "internal",
+        "locale": "internal",
+    }
+    ORGANIZATION_PROFILE_FIELD_CLASSIFICATIONS = {
+        "name": "public",
+        "mission": "public",
+        "website": "public",
+        "registration_number": "confidential",
+        "tax_id": "secret",
+        "bank_account": "secret",
+        "bank_details": "secret",
+        "contact_email": "confidential",
+        "phone": "confidential",
+        "address": "confidential",
+    }
     DATA_RETENTION_DEFAULTS = {
         "audit_logs_days": 365,
         "communications_days": 365,
@@ -1911,6 +2094,8 @@ class FundingBot:
         self.connection.execute("PRAGMA busy_timeout = 5000")
         self.connection.row_factory = sqlite3.Row
         self._create_schema()
+        self._apply_migrations()
+        self._ensure_tasks_schema()
         self.connector_configs = self._load_connector_configs(connector_configs)
         self._validate_connector_configs()
 
@@ -2625,6 +2810,7 @@ class FundingBot:
         task["is_overdue"] = bool(
             task["due_date"] and task["status"] != "done" and task["due_date"] < today
         )
+        task["unread_comment_count"] = int(task.get("unread_comment_count", 0) or 0)
         return task
 
     @staticmethod
@@ -2640,6 +2826,132 @@ class FundingBot:
             raise ValueError(
                 f"Invalid task due_date {due_date!r}. Expected ISO date format YYYY-MM-DD."
             ) from exc
+
+    @staticmethod
+    def _assignment_notification_rate_limit_seconds() -> int:
+        raw_value = os.environ.get("TASK_ASSIGNMENT_NOTIFICATION_RATE_LIMIT_SECONDS", "3600")
+        try:
+            return max(0, int(raw_value))
+        except ValueError:
+            return 3600
+
+    def _get_task_row(self, task_id: int) -> sqlite3.Row:
+        row = self.connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        if row is None:
+            raise TaskNotFoundError(f"Task {task_id!r} does not exist.")
+        return row
+
+    def _get_task_comment_row(self, task_id: int, comment_id: int) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM task_comments WHERE id = ? AND task_id = ?",
+            (comment_id, task_id),
+        ).fetchone()
+        if row is None:
+            raise TaskCommentNotFoundError(
+                f"Task comment {comment_id!r} does not exist for task {task_id!r}."
+            )
+        return row
+
+    @staticmethod
+    def _serialize_task_comment(row: sqlite3.Row) -> dict[str, Any]:
+        return dict(row)
+
+    def _build_task_assignment_message(self, task: dict[str, Any]) -> tuple[str, str]:
+        profile = self.load_organization_profile()
+        organization_name = profile.get("name", "Funding Bot")
+        assignee_name = task.get("assignee_name") or task.get("assigned_to") or "teammate"
+        subject = f"[{organization_name}] Task assigned: {task['title']}"
+        description = str(task.get("description") or "").strip() or "No description provided."
+        due_date = task.get("due_date") or "No due date set."
+        body = "\n".join(
+            [
+                f"Hello {assignee_name},",
+                "",
+                "A task has been assigned to you.",
+                "",
+                f"Task: {task['title']}",
+                f"Assigned role: {task['assigned_to']}",
+                f"Status: {task['status']}",
+                f"Due date: {due_date}",
+                f"Description: {description}",
+            ]
+        )
+        return subject, body
+
+    def _notify_task_assignee(
+        self,
+        task_id: int,
+        *,
+        sender: Any | None = None,
+        happened_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        task = self._serialize_task(self._get_task_row(task_id))
+        recipient_email = str(task.get("assignee_email") or "").strip()
+        if not recipient_email:
+            return {"status": "skipped", "reason": "no_assignee_email"}
+        if sender is None:
+            self._log_action(
+                "task_assignment_notification_skipped",
+                task_id=task_id,
+                recipient_email=recipient_email,
+                reason="no_sender",
+            )
+            return {
+                "status": "skipped",
+                "reason": "no_sender",
+                "recipient_email": recipient_email,
+            }
+
+        notification_time = self._as_utc(happened_at)
+        latest = self.connection.execute(
+            """
+            SELECT happened_at
+            FROM task_notifications
+            WHERE task_id = ? AND recipient_email = ? AND notification_type = 'task_assignment'
+            ORDER BY happened_at DESC
+            LIMIT 1
+            """,
+            (task_id, recipient_email),
+        ).fetchone()
+        rate_limit_seconds = self._assignment_notification_rate_limit_seconds()
+        if latest is not None and rate_limit_seconds > 0:
+            last_sent_at = self._as_utc(datetime.fromisoformat(latest["happened_at"]))
+            if notification_time - last_sent_at < timedelta(seconds=rate_limit_seconds):
+                self._log_action(
+                    "task_assignment_notification_rate_limited",
+                    task_id=task_id,
+                    recipient_email=recipient_email,
+                    last_sent_at=latest["happened_at"],
+                )
+                return {
+                    "status": "rate_limited",
+                    "recipient_email": recipient_email,
+                    "last_sent_at": latest["happened_at"],
+                }
+
+        subject, body = self._build_task_assignment_message(task)
+        sender(recipient_email, subject, body)
+        happened_iso = self._to_iso(notification_time)
+        with self.connection:
+            self.connection.execute(
+                """
+                INSERT INTO task_notifications (task_id, recipient_email, notification_type, happened_at)
+                VALUES (?, ?, 'task_assignment', ?)
+                """,
+                (task_id, recipient_email, happened_iso),
+            )
+            self._log_action(
+                "task_assignment_notification_sent",
+                commit=False,
+                task_id=task_id,
+                recipient_email=recipient_email,
+                happened_at=happened_iso,
+            )
+        return {
+            "status": "sent",
+            "recipient_email": recipient_email,
+            "sent_at": happened_iso,
+        }
 
     @classmethod
     def _validate_task_transition(cls, current_status: str, new_status: str) -> None:
@@ -2812,6 +3124,204 @@ class FundingBot:
             "keywords": settings.get("keywords", []),
             "trusted_sources": settings.get("trusted_sources", []),
         }
+
+    @classmethod
+    def _normalize_data_residency(cls, value: str | None) -> str:
+        normalized = (value or cls.DEFAULT_DATA_RESIDENCY).strip().upper()
+        if normalized not in cls.SUPPORTED_DATA_RESIDENCIES:
+            raise FundingBotError(
+                "Invalid DATA_RESIDENCY value "
+                f"{value!r}. Expected one of {list(cls.SUPPORTED_DATA_RESIDENCIES)}."
+            )
+        return normalized
+
+    @classmethod
+    def validate_data_storage_location(
+        cls,
+        *,
+        data_residency: str | None = None,
+        storage_region: str | None = None,
+    ) -> dict[str, Any]:
+        configured_residency = cls._normalize_data_residency(
+            data_residency or os.environ.get("DATA_RESIDENCY")
+        )
+        actual_storage_region = cls._normalize_data_residency(
+            storage_region or os.environ.get("DATA_STORAGE_REGION") or configured_residency
+        )
+        if actual_storage_region != configured_residency:
+            raise FundingBotError(
+                "Data residency enforcement failed: configured DATA_RESIDENCY="
+                f"{configured_residency} but runtime storage region is {actual_storage_region}."
+            )
+        return {
+            "data_residency": configured_residency,
+            "storage_region": actual_storage_region,
+            "compliant": True,
+        }
+
+    def get_data_residency_status(self) -> dict[str, Any]:
+        self._data_residency_status = self.validate_data_storage_location(
+            data_residency=self._data_residency_status["data_residency"],
+            storage_region=os.environ.get("DATA_STORAGE_REGION")
+            or self._data_residency_status["storage_region"],
+        )
+        return dict(self._data_residency_status)
+
+    @classmethod
+    def _normalize_privacy_policy_formats(cls, formats: Iterable[str] | None) -> list[str]:
+        requested = list(formats or cls.DEFAULT_PRIVACY_POLICY_FORMATS)
+        normalized: list[str] = []
+        for fmt in requested:
+            current = str(fmt).strip().lower()
+            if current not in cls.SUPPORTED_PRIVACY_POLICY_FORMATS:
+                raise ValueError(
+                    f"Unsupported privacy policy format {fmt!r}. "
+                    f"Expected one of {sorted(cls.SUPPORTED_PRIVACY_POLICY_FORMATS)}."
+                )
+            if current not in normalized:
+                normalized.append(current)
+        return normalized
+
+    @classmethod
+    def _normalize_privacy_policy_jurisdictions(
+        cls,
+        jurisdictions: Iterable[str] | str | None,
+        *,
+        profile: dict[str, Any] | None = None,
+    ) -> list[str]:
+        candidate_values: Iterable[str] | str | None = jurisdictions
+        if candidate_values is None and isinstance(profile, dict):
+            candidate_values = profile.get("privacy_jurisdictions") or profile.get("jurisdictions")
+        if candidate_values is None:
+            candidate_values = [cls.DEFAULT_DATA_RESIDENCY]
+        if isinstance(candidate_values, str):
+            candidate_values = [item.strip() for item in candidate_values.split(",") if item.strip()]
+
+        normalized: list[str] = []
+        for jurisdiction in candidate_values:
+            current = cls._normalize_data_residency(str(jurisdiction))
+            if current not in normalized:
+                normalized.append(current)
+        return normalized
+
+    def _next_privacy_policy_revision(self, jurisdiction: str) -> tuple[int, str]:
+        row = self.connection.execute(
+            """
+            SELECT COALESCE(MAX(revision), 0) AS latest_revision
+            FROM privacy_policy_versions
+            WHERE jurisdiction = ?
+            """,
+            (jurisdiction,),
+        ).fetchone()
+        revision = int(row["latest_revision"]) + 1
+        return revision, f"{jurisdiction.lower()}-v{revision}"
+
+    def list_privacy_policy_versions(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            """
+            SELECT jurisdiction, revision, version, data_residency, effective_date,
+                   html_path, pdf_path, generated_at
+            FROM privacy_policy_versions
+            ORDER BY generated_at DESC, id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def generate_privacy_policies(
+        self,
+        *,
+        output_dir: str | os.PathLike[str],
+        jurisdictions: Iterable[str] | str | None = None,
+        formats: Iterable[str] | None = None,
+        effective_date: date | datetime | str | None = None,
+    ) -> list[dict[str, Any]]:
+        from web.privacy_policy import generate_privacy_policy_content
+
+        profile = self.load_organization_profile()
+        residency_status = self.get_data_residency_status()
+        normalized_jurisdictions = self._normalize_privacy_policy_jurisdictions(
+            jurisdictions,
+            profile=profile,
+        )
+        normalized_formats = self._normalize_privacy_policy_formats(formats)
+        target_dir = Path(output_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        if isinstance(effective_date, datetime):
+            effective_date_iso = effective_date.date().isoformat()
+        elif isinstance(effective_date, date):
+            effective_date_iso = effective_date.isoformat()
+        elif effective_date:
+            effective_date_iso = str(effective_date)
+        else:
+            effective_date_iso = self._utcnow().date().isoformat()
+
+        generated_at = self._to_iso()
+        generated: list[dict[str, Any]] = []
+        for jurisdiction in normalized_jurisdictions:
+            revision, version = self._next_privacy_policy_revision(jurisdiction)
+            policy = generate_privacy_policy_content(
+                organization_profile=profile,
+                jurisdiction=jurisdiction,
+                data_residency=residency_status["data_residency"],
+                version=version,
+                effective_date=effective_date_iso,
+            )
+            base_name = f"privacy_policy_{jurisdiction.lower()}_{version}"
+            html_path: str | None = None
+            pdf_path: str | None = None
+            if "html" in normalized_formats:
+                html_file = target_dir / f"{base_name}.html"
+                html_file.write_text(policy["html"], encoding="utf-8")
+                html_path = str(html_file)
+            if "pdf" in normalized_formats:
+                pdf_file = target_dir / f"{base_name}.pdf"
+                self._write_pdf(pdf_file, policy["text"])
+                pdf_path = str(pdf_file)
+
+            self.connection.execute(
+                """
+                INSERT INTO privacy_policy_versions (
+                    jurisdiction, revision, version, data_residency, effective_date,
+                    html_path, pdf_path, profile_json, generated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    jurisdiction,
+                    revision,
+                    version,
+                    residency_status["data_residency"],
+                    effective_date_iso,
+                    html_path,
+                    pdf_path,
+                    json.dumps(profile, sort_keys=True),
+                    generated_at,
+                ),
+            )
+            generated.append(
+                {
+                    "jurisdiction": jurisdiction,
+                    "revision": revision,
+                    "version": version,
+                    "data_residency": residency_status["data_residency"],
+                    "effective_date": effective_date_iso,
+                    "html_path": html_path,
+                    "pdf_path": pdf_path,
+                }
+            )
+
+        self.connection.commit()
+        self._log_action(
+            "privacy_policies_generated",
+            jurisdictions=normalized_jurisdictions,
+            formats=normalized_formats,
+            versions=[item["version"] for item in generated],
+            data_residency=residency_status["data_residency"],
+        )
+        return generated
 
     @classmethod
     def _parse_retention_days(cls, field_name: str, value: Any) -> int:
@@ -3655,10 +4165,16 @@ class FundingBot:
         *,
         title: str,
         assigned_to: str,
+        assignee_email: str | None = None,
+        assignee_name: str | None = None,
         description: str = "",
         status: str = "todo",
         created_at: datetime | None = None,
         due_date: datetime | str | None = None,
+        external_id: str | None = None,
+        source: str = "manual",
+        sender: Any | None = None,
+        commit: bool = True,
     ) -> dict[str, Any]:
         normalized_title = str(title).strip()
         normalized_assignee = str(assigned_to).strip().lower()
@@ -3668,83 +4184,103 @@ class FundingBot:
             raise ValueError("Task assignee is required.")
 
         normalized_status = self._normalize_task_status(status)
+        normalized_external_id = str(external_id).strip() if external_id is not None else None
+        if normalized_external_id == "":
+            normalized_external_id = None
+        normalized_due_date = self._normalize_task_due_date(
+            None if due_date is None else str(due_date)
+        )
+        normalized_source = str(source or "manual").strip() or "manual"
+        normalized_assignee_email = (
+            _validate_email(assignee_email) if assignee_email and str(assignee_email).strip() else None
+        )
+        normalized_assignee_name = (
+            str(assignee_name).strip() if assignee_name and str(assignee_name).strip() else None
+        )
         timestamp = self._to_iso(created_at)
-        normalized_due_date = self._normalize_due_date(due_date)
         cursor = self.connection.execute(
             """
             INSERT INTO tasks (
-                title, description, assigned_to, status, due_date, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                external_id, title, description, assigned_to, assignee_email, assignee_name,
+                status, due_date, source, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
+                normalized_external_id,
                 normalized_title,
                 str(description or "").strip(),
                 normalized_assignee,
+                normalized_assignee_email,
+                normalized_assignee_name,
                 normalized_status,
                 normalized_due_date,
+                normalized_source,
                 timestamp,
                 timestamp,
             ),
         )
-        self.connection.commit()
+        if commit:
+            self.connection.commit()
         task = self.get_task(cursor.lastrowid)
         self._log_action(
             "task_created",
+            commit=commit,
             task_id=task["id"],
             title=task["title"],
             assigned_to=task["assigned_to"],
             status=task["status"],
             due_date=task["due_date"],
+            external_id=task["external_id"],
+            source=task["source"],
+            assignee_email=task.get("assignee_email"),
         )
-        return task
-
-    def get_task(self, task_id: int) -> dict[str, Any]:
-        row = self.connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-        if row is None:
-            raise FundingBotError(f"Task {task_id!r} does not exist.")
-        return self._serialize_task(row)
-
-    def assign_task(
-        self,
-        task_id: int,
-        *,
-        assigned_to: str,
-        changed_by: str,
-    ) -> dict[str, Any]:
-        task = self.get_task(task_id)
-        normalized_assignee = str(assigned_to).strip().lower()
-        normalized_changed_by = str(changed_by).strip().lower()
-        if not normalized_assignee:
-            raise ValueError("Task assignee is required.")
-        if task["assigned_to"] == normalized_assignee:
-            return task
-
-        updated_at = self._to_iso()
-        with self.connection:
-            updated = self.connection.execute(
-                "UPDATE tasks SET assigned_to = ?, updated_at = ? WHERE id = ?",
-                (normalized_assignee, updated_at, task_id),
-            )
-            if updated.rowcount == 0:
-                raise TaskAssignmentError(f"Task {task_id!r} does not exist.")
         self._log_action(
             "task_assignment_changed",
-            task_id=task_id,
+            commit=commit,
+            task_id=task["id"],
             title=task["title"],
-            previous_assigned_to=task["assigned_to"],
-            assigned_to=normalized_assignee,
-            changed_by=normalized_changed_by,
+            previous_assignee=None,
+            assigned_to=task["assigned_to"],
+            external_id=task["external_id"],
+            assignee_email=task.get("assignee_email"),
         )
-        return self.get_task(task_id)
+        if task.get("assignee_email"):
+            task["assignment_notification"] = self._notify_task_assignee(
+                task["id"],
+                sender=sender,
+                happened_at=created_at,
+            )
+        return task
+
+    def get_task(self, task_id: int, *, viewer_email: str | None = None) -> dict[str, Any]:
+        task = self._serialize_task(self._get_task_row(task_id))
+        if viewer_email:
+            task["unread_comment_count"] = self.get_unread_task_comment_count(task_id, viewer_email)
+        return task
+
+    def get_task_by_external_id(self, external_id: str) -> dict[str, Any]:
+        normalized = str(external_id).strip()
+        if not normalized:
+            raise ValueError("Task external_id is required.")
+        row = self.connection.execute(
+            "SELECT * FROM tasks WHERE external_id = ?",
+            (normalized,),
+        ).fetchone()
+        if row is None:
+            raise FundingBotError(f"Task with external_id {external_id!r} does not exist.")
+        return self._serialize_task(row)
 
     def list_tasks(
         self,
         *,
         assigned_to: str | None = None,
+        assignee_email: str | None = None,
         status: str | None = None,
         due_date_before: datetime | str | None = None,
         due_date_after: datetime | str | None = None,
         sort: str | None = None,
+        source: str | None = None,
+        viewer_email: str | None = None,
     ) -> list[dict[str, Any]]:
         query = "SELECT * FROM tasks"
         params: list[Any] = []
@@ -3752,54 +4288,40 @@ class FundingBot:
         if assigned_to:
             clauses.append("assigned_to = ?")
             params.append(str(assigned_to).strip().lower())
+        if assignee_email:
+            clauses.append("assignee_email = ?")
+            params.append(_validate_email(assignee_email))
         if status:
             clauses.append("status = ?")
             params.append(self._normalize_task_status(status))
-        normalized_due_date_before = self._normalize_due_date(due_date_before)
+        normalized_due_date_before = (
+            self._normalize_task_due_date(str(due_date_before)) if due_date_before else None
+        )
         if normalized_due_date_before:
             clauses.append("due_date IS NOT NULL AND due_date <= ?")
             params.append(normalized_due_date_before)
-        normalized_due_date_after = self._normalize_due_date(due_date_after)
+        normalized_due_date_after = (
+            self._normalize_task_due_date(str(due_date_after)) if due_date_after else None
+        )
         if normalized_due_date_after:
             clauses.append("due_date IS NOT NULL AND due_date >= ?")
             params.append(normalized_due_date_after)
+        if source:
+            clauses.append("source = ?")
+            params.append(str(source).strip())
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
         query += " ORDER BY " + self._task_sort_clause(sort)
         rows = self.connection.execute(query, params).fetchall()
-        return [self._serialize_task(row) for row in rows]
-
-    def reassign_task(
-        self,
-        task_id: int,
-        *,
-        assigned_to: str,
-        changed_by: str,
-    ) -> dict[str, Any]:
-        task = self.get_task(task_id)
-        normalized_assignee = str(assigned_to).strip().lower()
-        if not normalized_assignee:
-            raise ValueError("Task assignee is required.")
-        if task["assigned_to"] == normalized_assignee:
-            return task
-
-        updated_at = self._to_iso()
-        with self.connection:
-            updated = self.connection.execute(
-                "UPDATE tasks SET assigned_to = ?, updated_at = ? WHERE id = ?",
-                (normalized_assignee, updated_at, task_id),
-            )
-            if updated.rowcount == 0:
-                raise FundingBotError(f"Task {task_id!r} does not exist.")
-        self._log_action(
-            "task_reassigned",
-            task_id=task_id,
-            title=task["title"],
-            previous_assigned_to=task["assigned_to"],
-            assigned_to=normalized_assignee,
-            changed_by=str(changed_by).strip().lower(),
-        )
-        return self.get_task(task_id)
+        normalized_viewer_email = _validate_email(viewer_email) if viewer_email else None
+        tasks = [self._serialize_task(row) for row in rows]
+        if normalized_viewer_email:
+            for task in tasks:
+                task["unread_comment_count"] = self.get_unread_task_comment_count(
+                    int(task["id"]),
+                    normalized_viewer_email,
+                )
+        return tasks
 
     @staticmethod
     def _task_sort_clause(sort: str | None) -> str:
@@ -3867,274 +4389,416 @@ class FundingBot:
             status=normalized_status,
             changed_by=str(changed_by).strip().lower(),
             notification=notification,
+            external_id=task.get("external_id"),
         )
         updated_task = self.get_task(task_id)
         updated_task["notification"] = notification
         return updated_task
 
-    @staticmethod
-    def _serialize_task_run(row: sqlite3.Row) -> dict[str, Any]:
-        record = dict(row)
-        record["payload"] = json.loads(record.pop("payload_json") or "{}")
-        result_json = record.pop("result_json")
-        record["result"] = json.loads(result_json) if result_json else None
-        callback_payload_json = record.pop("callback_payload_json")
-        record["callback_payload"] = (
-            json.loads(callback_payload_json) if callback_payload_json else None
-        )
-        record["shutdown_requested"] = bool(record.get("shutdown_requested"))
-        return record
-
-    @staticmethod
-    def generate_idempotency_key(task_name: str, payload: dict[str, Any] | None = None) -> str:
-        canonical_payload = json.dumps(payload or {}, sort_keys=True, separators=(",", ":"))
-        raw_key = f"{str(task_name).strip().lower()}|{canonical_payload}"
-        return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
-
-    def get_task_run(self, idempotency_key: str) -> dict[str, Any]:
-        row = self.connection.execute(
-            "SELECT * FROM task_runs WHERE idempotency_key = ?",
-            (idempotency_key,),
-        ).fetchone()
-        if row is None:
-            raise FundingBotError(f"Task run with idempotency key {idempotency_key!r} does not exist.")
-        return self._serialize_task_run(row)
-
-    def _claim_task_run(
+    def update_task_assignment(
         self,
+        task_id: int,
         *,
-        task_name: str,
-        payload: dict[str, Any] | None,
-        idempotency_key: str | None,
-        worker_id: str | None,
-    ) -> tuple[str, bool, dict[str, Any]]:
-        normalized_task_name = str(task_name).strip()
-        if not normalized_task_name:
-            raise ValueError("Task name is required.")
-        claimed_key = idempotency_key or self.generate_idempotency_key(normalized_task_name, payload)
-        timestamp = self._to_iso()
-        payload_json = json.dumps(payload or {}, sort_keys=True)
-        try:
-            with self.connection:
-                self.connection.execute(
-                    """
-                    INSERT INTO task_runs (
-                        task_id,
-                        idempotency_key,
-                        task_name,
-                        status,
-                        progress,
-                        message,
-                        payload_json,
-                        worker_id,
-                        duplicate_requests,
-                        shutdown_requested,
-                        created_at,
-                        updated_at
-                    ) VALUES (?, ?, ?, 'running', 0, 'Task started.', ?, ?, 0, 0, ?, ?)
-                    """,
-                    (
-                        claimed_key,
-                        claimed_key,
-                        normalized_task_name,
-                        payload_json,
-                        worker_id,
-                        timestamp,
-                        timestamp,
-                    ),
-                )
-        except sqlite3.IntegrityError:
-            with self.connection:
-                self.connection.execute(
-                    """
-                    UPDATE task_runs
-                    SET duplicate_requests = COALESCE(duplicate_requests, 0) + 1,
-                        updated_at = ?
-                    WHERE idempotency_key = ?
-                    """,
-                    (timestamp, claimed_key),
-                )
-            task_run = self.get_task_run(claimed_key)
-            self._log_action(
-                "queue_task_duplicate_prevented",
-                idempotency_key=claimed_key,
-                task_name=normalized_task_name,
-                status=task_run["status"],
-            )
-            return claimed_key, False, task_run
-        task_run = self.get_task_run(claimed_key)
-        self._log_action(
-            "queue_task_started",
-            idempotency_key=claimed_key,
-            task_name=normalized_task_name,
-            worker_id=worker_id,
-        )
-        return claimed_key, True, task_run
-
-    def _finalize_task_run(
-        self,
-        *,
-        idempotency_key: str,
-        status: str,
-        progress: int,
-        message: str,
-        result: Any = None,
-        error_message: str | None = None,
+        assigned_to: str,
+        assignee_email: str | None = None,
+        assignee_name: str | None = None,
+        sender: Any | None = None,
+        changed_by: str | None = None,
+        changed_at: datetime | None = None,
     ) -> dict[str, Any]:
-        timestamp = self._to_iso()
-        result_json = json.dumps(result, sort_keys=True, default=str) if result is not None else None
+        task = self.get_task(task_id)
+        normalized_assigned_to = str(assigned_to).strip().lower()
+        if not normalized_assigned_to:
+            raise ValueError("Task assignee is required.")
+        normalized_assignee_email = (
+            _validate_email(assignee_email) if assignee_email and str(assignee_email).strip() else None
+        )
+        normalized_assignee_name = (
+            str(assignee_name).strip() if assignee_name and str(assignee_name).strip() else None
+        )
+        updated_at = self._to_iso(changed_at)
         with self.connection:
             self.connection.execute(
                 """
-                UPDATE task_runs
-                SET status = ?,
-                    progress = ?,
-                    message = ?,
-                    result_json = ?,
-                    error_message = ?,
-                    updated_at = ?,
-                    completed_at = ?
-                WHERE idempotency_key = ?
+                UPDATE tasks
+                SET assigned_to = ?, assignee_email = ?, assignee_name = ?, updated_at = ?
+                WHERE id = ?
                 """,
                 (
-                    status,
-                    progress,
-                    message,
-                    result_json,
-                    error_message,
-                    timestamp,
-                    timestamp,
-                    idempotency_key,
+                    normalized_assigned_to,
+                    normalized_assignee_email,
+                    normalized_assignee_name,
+                    updated_at,
+                    task_id,
                 ),
             )
-        return self.get_task_run(idempotency_key)
+            self._log_action(
+                "task_assignment_changed",
+                commit=False,
+                task_id=task_id,
+                title=task["title"],
+                previous_assignee=task["assigned_to"],
+                assigned_to=normalized_assigned_to,
+                previous_assignee_email=task.get("assignee_email"),
+                assignee_email=normalized_assignee_email,
+                changed_by=str(changed_by or "").strip().lower() or None,
+                external_id=task.get("external_id"),
+            )
+        updated_task = self.get_task(task_id)
+        updated_task["assignment_notification"] = self._notify_task_assignee(
+            task_id,
+            sender=sender,
+            happened_at=changed_at,
+        )
+        return updated_task
 
-    def request_task_run_shutdown(self, idempotency_key: str, *, signal_name: str | None = None) -> dict[str, Any]:
-        timestamp = self._to_iso()
-        message = "Shutdown requested for in-flight task."
-        if signal_name:
-            message = f"{message} Signal: {signal_name}."
+    def create_task_comment(
+        self,
+        task_id: int,
+        *,
+        author: str,
+        content: str,
+        created_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        self._get_task_row(task_id)
+        normalized_author = str(author).strip()
+        normalized_content = str(content).strip()
+        if not normalized_author:
+            raise ValueError("Comment author is required.")
+        if not normalized_content:
+            raise ValueError("Comment content is required.")
+        timestamp = self._to_iso(created_at)
+        cursor = self.connection.execute(
+            """
+            INSERT INTO task_comments (task_id, author, content, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (task_id, normalized_author, normalized_content, timestamp, timestamp),
+        )
+        self.connection.commit()
+        comment = self._serialize_task_comment(self._get_task_comment_row(task_id, cursor.lastrowid))
+        self._log_action(
+            "task_comment_created",
+            task_id=task_id,
+            comment_id=comment["id"],
+            author=comment["author"],
+        )
+        return comment
+
+    def list_task_comments(
+        self,
+        task_id: int,
+        *,
+        viewer_email: str | None = None,
+    ) -> dict[str, Any]:
+        task = self.get_task(task_id, viewer_email=viewer_email)
+        rows = self.connection.execute(
+            """
+            SELECT * FROM task_comments
+            WHERE task_id = ?
+            ORDER BY created_at ASC, id ASC
+            """,
+            (task_id,),
+        ).fetchall()
+        return {
+            "task": task,
+            "comments": [self._serialize_task_comment(row) for row in rows],
+            "unread_count": task["unread_comment_count"],
+        }
+
+    def update_task_comment(
+        self,
+        task_id: int,
+        comment_id: int,
+        *,
+        content: str,
+        updated_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        comment = self._serialize_task_comment(self._get_task_comment_row(task_id, comment_id))
+        normalized_content = str(content).strip()
+        if not normalized_content:
+            raise ValueError("Comment content is required.")
+        updated_iso = self._to_iso(updated_at)
+        with self.connection:
+            self.connection.execute(
+                "UPDATE task_comments SET content = ?, updated_at = ? WHERE id = ? AND task_id = ?",
+                (normalized_content, updated_iso, comment_id, task_id),
+            )
+            self._log_action(
+                "task_comment_updated",
+                commit=False,
+                task_id=task_id,
+                comment_id=comment_id,
+                author=comment["author"],
+            )
+        return self._serialize_task_comment(self._get_task_comment_row(task_id, comment_id))
+
+    def delete_task_comment(self, task_id: int, comment_id: int) -> None:
+        comment = self._serialize_task_comment(self._get_task_comment_row(task_id, comment_id))
+        with self.connection:
+            self.connection.execute(
+                "DELETE FROM task_comments WHERE id = ? AND task_id = ?",
+                (comment_id, task_id),
+            )
+            self._log_action(
+                "task_comment_deleted",
+                commit=False,
+                task_id=task_id,
+                comment_id=comment_id,
+                author=comment["author"],
+            )
+
+    def mark_task_comments_read(
+        self,
+        task_id: int,
+        *,
+        reader_email: str,
+        read_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        self._get_task_row(task_id)
+        normalized_email = _validate_email(reader_email)
+        read_iso = self._to_iso(read_at)
         with self.connection:
             self.connection.execute(
                 """
-                UPDATE task_runs
-                SET shutdown_requested = 1,
-                    message = ?,
-                    updated_at = ?
-                WHERE idempotency_key = ?
+                INSERT INTO task_comment_reads (task_id, reader_email, last_read_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(task_id, reader_email) DO UPDATE SET last_read_at = excluded.last_read_at
                 """,
-                (message, timestamp, idempotency_key),
+                (task_id, normalized_email, read_iso),
             )
-        task_run = self.get_task_run(idempotency_key)
-        self._log_action(
-            "queue_task_shutdown_requested",
-            idempotency_key=idempotency_key,
-            task_name=task_run["task_name"],
-            signal=signal_name,
-        )
-        return task_run
-
-    def get_queue_metrics(self) -> dict[str, int]:
-        row = self.connection.execute(
-            """
-            SELECT
-                SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running,
-                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
-                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
-                SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
-                COALESCE(SUM(duplicate_requests), 0) AS duplicate_preventions
-            FROM task_runs
-            """
-        ).fetchone()
+            self._log_action(
+                "task_comments_marked_read",
+                commit=False,
+                task_id=task_id,
+                reader_email=normalized_email,
+                last_read_at=read_iso,
+            )
         return {
-            "running": int(row["running"] or 0),
-            "completed": int(row["completed"] or 0),
-            "failed": int(row["failed"] or 0),
-            "cancelled": int(row["cancelled"] or 0),
-            "duplicate_preventions": int(row["duplicate_preventions"] or 0),
+            "task_id": task_id,
+            "reader_email": normalized_email,
+            "last_read_at": read_iso,
+            "unread_count": self.get_unread_task_comment_count(task_id, normalized_email),
         }
 
-    def execute_queue_task(
+    def get_unread_task_comment_count(self, task_id: int, reader_email: str) -> int:
+        normalized_email = _validate_email(reader_email)
+        row = self.connection.execute(
+            """
+            SELECT COUNT(*) AS unread_count
+            FROM task_comments comments
+            LEFT JOIN task_comment_reads reads
+                ON reads.task_id = comments.task_id AND reads.reader_email = ?
+            WHERE comments.task_id = ?
+                AND lower(comments.author) != lower(?)
+                AND (
+                    reads.last_read_at IS NULL
+                    OR comments.updated_at > reads.last_read_at
+                )
+            """,
+            (normalized_email, task_id, normalized_email),
+        ).fetchone()
+        return int(row["unread_count"]) if row else 0
+
+    def upsert_task(
         self,
-        task_name: str,
-        payload: dict[str, Any] | None,
-        task_callable: Callable[[QueueTaskContext, dict[str, Any]], Any],
+        payload: dict[str, Any],
         *,
-        idempotency_key: str | None = None,
-        worker_id: str | None = None,
-        install_signal_handlers: bool = True,
+        default_source: str = "external_sync",
+        commit: bool = True,
     ) -> dict[str, Any]:
-        claimed_key, claimed, task_run = self._claim_task_run(
-            task_name=task_name,
-            payload=payload,
-            idempotency_key=idempotency_key,
-            worker_id=worker_id,
-        )
-        if not claimed:
-            task_run["duplicate"] = True
-            return task_run
+        external_id_raw = payload.get("external_id")
+        external_id = str(external_id_raw).strip() if external_id_raw is not None else None
+        if external_id == "":
+            external_id = None
 
-        controller = GracefulShutdownController(
-            lambda signum: self.request_task_run_shutdown(
-                claimed_key,
-                signal_name=signal.Signals(signum).name,
-            )
-        )
-        if install_signal_handlers:
-            controller.install()
-        context = QueueTaskContext(bot=self, idempotency_key=claimed_key, controller=controller)
-        try:
-            context.checkpoint("Shutdown requested before queue task execution started.")
-            result = task_callable(context, dict(payload or {}))
-            context.checkpoint("Shutdown requested after queue task checkpoint.")
-        except GracefulShutdownRequested as exc:
-            task_run = self._finalize_task_run(
-                idempotency_key=claimed_key,
-                status="cancelled",
-                progress=0,
-                message=str(exc),
-                error_message=str(exc),
-            )
-            self._log_action(
-                "queue_task_cancelled",
-                idempotency_key=claimed_key,
-                task_name=task_run["task_name"],
-            )
-            task_run["duplicate"] = False
-            return task_run
-        except Exception as exc:
-            task_run = self._finalize_task_run(
-                idempotency_key=claimed_key,
-                status="failed",
-                progress=0,
-                message="Task failed.",
-                error_message=str(exc),
-            )
-            self._log_action(
-                "queue_task_failed",
-                idempotency_key=claimed_key,
-                task_name=task_run["task_name"],
-                error_message=str(exc),
-            )
-            raise
-        finally:
-            if install_signal_handlers:
-                controller.restore()
+        existing = None
+        task_id = payload.get("id")
+        if task_id is not None:
+            existing = self.connection.execute(
+                "SELECT * FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+        if existing is None and external_id is not None:
+            existing = self.connection.execute(
+                "SELECT * FROM tasks WHERE external_id = ?",
+                (external_id,),
+            ).fetchone()
 
-        task_run = self._finalize_task_run(
-            idempotency_key=claimed_key,
-            status="completed",
-            progress=100,
-            message="Task completed.",
-            result=result,
+        if existing is None:
+            if payload.get("title") is None:
+                raise ValueError("Field 'title' is required for new tasks.")
+            if payload.get("assigned_to") is None:
+                raise ValueError("Field 'assigned_to' is required for new tasks.")
+            return self.create_task(
+                title=str(payload.get("title", "")),
+                assigned_to=str(payload.get("assigned_to", "")),
+                description=str(payload.get("description", "")),
+                status=str(payload.get("status", "todo")),
+                created_at=None,
+                due_date=payload.get("due_date"),
+                external_id=external_id,
+                source=str(payload.get("source") or default_source),
+                commit=commit,
+            )
+
+        updated_title = str(payload.get("title", existing["title"])).strip()
+        updated_assigned_to = str(payload.get("assigned_to", existing["assigned_to"])).strip().lower()
+        updated_description = str(payload.get("description", existing["description"])).strip()
+        updated_status = self._normalize_task_status(str(payload.get("status", existing["status"])))
+        updated_due_date = (
+            self._normalize_task_due_date(str(payload.get("due_date")))
+            if "due_date" in payload and payload.get("due_date") is not None
+            else (None if "due_date" in payload else existing["due_date"])
         )
-        self._log_action(
-            "queue_task_completed",
-            idempotency_key=claimed_key,
-            task_name=task_run["task_name"],
+        updated_source = str(payload.get("source", existing["source"] or default_source)).strip() or default_source
+        updated_external_id = external_id if external_id is not None else existing["external_id"]
+
+        if not updated_title:
+            raise ValueError("Task title is required.")
+        if not updated_assigned_to:
+            raise ValueError("Task assignee is required.")
+
+        changed_fields = [
+            field
+            for field, old_value, new_value in (
+                ("external_id", existing["external_id"], updated_external_id),
+                ("title", existing["title"], updated_title),
+                ("description", existing["description"], updated_description),
+                ("assigned_to", existing["assigned_to"], updated_assigned_to),
+                ("status", existing["status"], updated_status),
+                ("due_date", existing["due_date"], updated_due_date),
+                ("source", existing["source"], updated_source),
+            )
+            if old_value != new_value
+        ]
+        self.connection.execute(
+            """
+            UPDATE tasks
+            SET external_id = ?, title = ?, description = ?, assigned_to = ?, status = ?,
+                due_date = ?, source = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                updated_external_id,
+                updated_title,
+                updated_description,
+                updated_assigned_to,
+                updated_status,
+                updated_due_date,
+                updated_source,
+                self._to_iso(),
+                existing["id"],
+            ),
         )
-        task_run["duplicate"] = False
-        return task_run
+        if commit:
+            self.connection.commit()
+        refreshed = self.get_task(int(existing["id"]))
+        if changed_fields:
+            self._log_action(
+                "task_updated",
+                commit=commit,
+                task_id=refreshed["id"],
+                title=refreshed["title"],
+                assigned_to=refreshed["assigned_to"],
+                external_id=refreshed["external_id"],
+                changed_fields=changed_fields,
+                status=refreshed["status"],
+                due_date=refreshed["due_date"],
+                source=refreshed["source"],
+            )
+        elif commit:
+            self.connection.commit()
+        if existing["assigned_to"] != refreshed["assigned_to"]:
+            self._log_action(
+                "task_assignment_changed",
+                commit=commit,
+                task_id=refreshed["id"],
+                title=refreshed["title"],
+                previous_assignee=existing["assigned_to"],
+                assigned_to=refreshed["assigned_to"],
+                external_id=refreshed["external_id"],
+            )
+        return refreshed
+
+    def sync_tasks(
+        self,
+        tasks: Iterable[dict[str, Any]],
+        *,
+        default_source: str = "external_sync",
+    ) -> list[dict[str, Any]]:
+        synced: list[dict[str, Any]] = []
+        with self.connection:
+            for task in tasks:
+                synced.append(self.upsert_task(task, default_source=default_source, commit=False))
+            self._log_action(
+                "tasks_synced",
+                commit=False,
+                count=len(synced),
+                source=default_source,
+            )
+        return synced
+
+    def import_tasks_from_csv(
+        self,
+        csv_text: str,
+        *,
+        default_source: str = "csv_import",
+    ) -> list[dict[str, Any]]:
+        if not str(csv_text).strip():
+            raise ValueError("CSV import body is empty.")
+
+        reader = csv.DictReader(io.StringIO(csv_text))
+        allowed_headers = {
+            "external_id",
+            "title",
+            "description",
+            "assigned_to",
+            "status",
+            "due_date",
+            "source",
+        }
+        if reader.fieldnames is None:
+            raise ValueError(
+                "CSV header row is required. Expected columns: "
+                "external_id,title,description,assigned_to,status,due_date,source."
+            )
+        unknown_headers = sorted(set(reader.fieldnames) - allowed_headers)
+        if unknown_headers:
+            raise ValueError(f"Unsupported CSV columns: {unknown_headers}.")
+
+        imported: list[dict[str, Any]] = []
+        with self.connection:
+            for row_number, row in enumerate(reader, start=2):
+                if row is None or not any((value or "").strip() for value in row.values()):
+                    continue
+                try:
+                    imported.append(
+                        self.upsert_task(
+                            {
+                                "external_id": row.get("external_id"),
+                                "title": row.get("title"),
+                                "description": row.get("description", ""),
+                                "assigned_to": row.get("assigned_to"),
+                                "status": row.get("status") or "todo",
+                                "due_date": row.get("due_date"),
+                                "source": row.get("source") or default_source,
+                            },
+                            default_source=default_source,
+                            commit=False,
+                        )
+                    )
+                except (FundingBotError, ValueError) as exc:
+                    raise ValueError(f"CSV row {row_number}: {exc}") from exc
+            if not imported:
+                raise ValueError("CSV import did not contain any task rows.")
+            self._log_action(
+                "tasks_imported",
+                commit=False,
+                count=len(imported),
+                source=default_source,
+            )
+        return imported
 
     def _get_opportunity(self, signature: str) -> sqlite3.Row:
         row = self.connection.execute(
@@ -5192,6 +5856,221 @@ class FundingBot:
             )
         return summary
 
+    def build_gdpr_compliance_report(
+        self,
+        *,
+        cadence: str = "weekly",
+        as_of: datetime | None = None,
+    ) -> dict[str, Any]:
+        normalized_cadence = cadence.strip().lower()
+        if normalized_cadence not in {"weekly", "monthly"}:
+            raise ValueError("cadence must be either 'weekly' or 'monthly'.")
+
+        report_end = self._as_utc(as_of)
+        retention_span = timedelta(days=7 if normalized_cadence == "weekly" else 30)
+        period_start_dt = report_end - retention_span
+        period_start = self._to_iso(period_start_dt)
+        period_end = self._to_iso(report_end)
+
+        def _retention_days(env_name: str, default: int) -> int:
+            raw_value = os.environ.get(env_name)
+            if raw_value is None:
+                return default
+            try:
+                return max(1, int(raw_value))
+            except ValueError:
+                return default
+
+        donor_retention_days = _retention_days("GDPR_DONOR_RETENTION_DAYS", 365)
+        communication_retention_days = _retention_days("GDPR_COMMUNICATION_RETENTION_DAYS", 730)
+        application_retention_days = _retention_days("GDPR_APPLICATION_RETENTION_DAYS", 1095)
+        donor_cutoff = self._to_iso(report_end - timedelta(days=donor_retention_days))
+        communication_cutoff = self._to_iso(report_end - timedelta(days=communication_retention_days))
+        application_cutoff = self._to_iso(report_end - timedelta(days=application_retention_days))
+
+        consent_grants_in_period = self.connection.execute(
+            """
+            SELECT COUNT(*) FROM consent_records
+            WHERE status = 'granted' AND recorded_at >= ? AND recorded_at <= ?
+            """,
+            (period_start, period_end),
+        ).fetchone()[0]
+        consent_withdrawals_in_period = self.connection.execute(
+            """
+            SELECT COUNT(*) FROM consent_records
+            WHERE status = 'withdrawn' AND recorded_at >= ? AND recorded_at <= ?
+            """,
+            (period_start, period_end),
+        ).fetchone()[0]
+        communicated_donors = {
+            row["donor_email"]
+            for row in self.connection.execute(
+                "SELECT DISTINCT donor_email FROM communications WHERE donor_email NOT LIKE '[deleted]-%'"
+            ).fetchall()
+        }
+        consented_donors = {
+            row["donor_email"]
+            for row in self.connection.execute(
+                """
+                SELECT DISTINCT donor_email FROM consent_records
+                WHERE status = 'granted' AND channel = 'email'
+                """
+            ).fetchall()
+        }
+        missing_consent_donors = sorted(communicated_donors - consented_donors)
+        opted_out_without_record = self.connection.execute(
+            """
+            SELECT COUNT(*) FROM donors d
+            WHERE d.opted_out = 1
+              AND d.email NOT LIKE '[deleted]-%'
+              AND NOT EXISTS (
+                  SELECT 1 FROM consent_records cr
+                  WHERE cr.donor_email = d.email AND cr.status = 'withdrawn'
+              )
+            """
+        ).fetchone()[0]
+        latest_consent_status_by_donor: dict[str, str] = {}
+        for row in self.connection.execute(
+            """
+            SELECT donor_email, status
+            FROM consent_records
+            WHERE channel = 'email'
+            ORDER BY recorded_at DESC, id DESC
+            """
+        ).fetchall():
+            latest_consent_status_by_donor.setdefault(row["donor_email"], row["status"])
+        active_consents = sum(
+            1 for status in latest_consent_status_by_donor.values() if status == "granted"
+        )
+
+        stale_donors = [
+            dict(row)
+            for row in self.connection.execute(
+                """
+                SELECT email, name, last_contact_at FROM donors
+                WHERE email NOT LIKE '[deleted]-%'
+                  AND last_contact_at IS NOT NULL
+                  AND last_contact_at < ?
+                ORDER BY last_contact_at ASC
+                LIMIT 10
+                """,
+                (donor_cutoff,),
+            ).fetchall()
+        ]
+        communications_past_retention = self.connection.execute(
+            """
+            SELECT COUNT(*) FROM communications
+            WHERE donor_email NOT LIKE '[deleted]-%' AND sent_at < ?
+            """,
+            (communication_cutoff,),
+        ).fetchone()[0]
+        applications_past_retention = self.connection.execute(
+            "SELECT COUNT(*) FROM applications WHERE submitted_at < ?",
+            (application_cutoff,),
+        ).fetchone()[0]
+        exports_in_period = self.connection.execute(
+            """
+            SELECT COUNT(*) FROM audit_logs
+            WHERE action = 'gdpr_exported' AND happened_at >= ? AND happened_at <= ?
+            """,
+            (period_start, period_end),
+        ).fetchone()[0]
+        deletions_in_period = self.connection.execute(
+            """
+            SELECT COUNT(*) FROM audit_logs
+            WHERE action = 'gdpr_deleted' AND happened_at >= ? AND happened_at <= ?
+            """,
+            (period_start, period_end),
+        ).fetchone()[0]
+        last_export_at = self.connection.execute(
+            "SELECT MAX(happened_at) FROM audit_logs WHERE action = 'gdpr_exported'"
+        ).fetchone()[0]
+        last_deletion_at = self.connection.execute(
+            "SELECT MAX(happened_at) FROM audit_logs WHERE action = 'gdpr_deleted'"
+        ).fetchone()[0]
+
+        checks = [
+            {
+                "name": "consent_coverage",
+                "status": "ok" if not missing_consent_donors else "action_required",
+                "details": {
+                    "donors_missing_consent_count": len(missing_consent_donors),
+                    "sample_donors": missing_consent_donors[:5],
+                },
+            },
+            {
+                "name": "retention_review",
+                "status": (
+                    "ok"
+                    if not stale_donors
+                    and communications_past_retention == 0
+                    and applications_past_retention == 0
+                    else "action_required"
+                ),
+                "details": {
+                    "stale_donors_count": len(stale_donors),
+                    "communications_past_retention_count": communications_past_retention,
+                    "applications_past_retention_count": applications_past_retention,
+                },
+            },
+            {
+                "name": "opt_out_records",
+                "status": "ok" if opted_out_without_record == 0 else "action_required",
+                "details": {
+                    "opted_out_without_record_count": opted_out_without_record,
+                },
+            },
+            {
+                "name": "data_subject_request_auditability",
+                "status": "ok",
+                "details": {
+                    "exports_in_period": exports_in_period,
+                    "deletions_in_period": deletions_in_period,
+                    "last_export_at": last_export_at,
+                    "last_deletion_at": last_deletion_at,
+                },
+            },
+        ]
+        report = {
+            "report_type": "gdpr_compliance_self_check",
+            "cadence": normalized_cadence,
+            "period_start": period_start,
+            "period_end": period_end,
+            "generated_at": self._to_iso(),
+            "consent_summary": {
+                "grants_in_period": int(consent_grants_in_period),
+                "withdrawals_in_period": int(consent_withdrawals_in_period),
+                "active_email_consents": int(active_consents),
+                "communicated_donors_without_consent": len(missing_consent_donors),
+                "opted_out_donors_total": self.connection.execute(
+                    "SELECT COUNT(*) FROM donors WHERE opted_out = 1"
+                ).fetchone()[0],
+            },
+            "data_retention": {
+                "donor_retention_days": donor_retention_days,
+                "communication_retention_days": communication_retention_days,
+                "application_retention_days": application_retention_days,
+                "stale_donors_count": len(stale_donors),
+                "stale_donor_samples": stale_donors[:5],
+                "communications_past_retention_count": int(communications_past_retention),
+                "applications_past_retention_count": int(applications_past_retention),
+            },
+            "data_subject_requests": {
+                "exports_in_period": int(exports_in_period),
+                "deletions_in_period": int(deletions_in_period),
+                "last_export_at": last_export_at,
+                "last_deletion_at": last_deletion_at,
+            },
+            "checks": checks,
+        }
+        self._log_action(
+            "gdpr_self_check_report_generated",
+            cadence=normalized_cadence,
+            period_start=period_start,
+            period_end=period_end,
+        )
+        return report
+
     def build_monthly_audit_report(
         self,
         *,
@@ -5461,6 +6340,22 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
         help="Write the report as JSON to FILE instead of printing it.",
     )
 
+    gdpr_parser = subparsers.add_parser(
+        "gdpr-self-check-report",
+        help="Generate a GDPR compliance self-check report.",
+    )
+    gdpr_parser.add_argument(
+        "--cadence",
+        choices=("weekly", "monthly"),
+        default="weekly",
+        help="Report cadence window to summarize (default: weekly).",
+    )
+    gdpr_parser.add_argument(
+        "--output",
+        metavar="FILE",
+        help="Write the report as JSON to FILE instead of printing it.",
+    )
+
     discover_parser = subparsers.add_parser(
         "discover",
         help="Search configured donation sources and store new opportunities.",
@@ -5648,6 +6543,16 @@ def main(argv: list[str] | None = None) -> None:
                 output_path.parent.mkdir(parents=True, exist_ok=True)
                 output_path.write_text(report_json, encoding="utf-8")
                 print(f"Monthly audit report written to {args.output}.")
+            else:
+                print(report_json)
+        elif args.command == "gdpr-self-check-report":
+            report = bot.build_gdpr_compliance_report(cadence=args.cadence)
+            report_json = json.dumps(report, indent=2)
+            if args.output:
+                output_path = Path(args.output)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(report_json, encoding="utf-8")
+                print(f"GDPR self-check report written to {args.output}.")
             else:
                 print(report_json)
         elif args.command == "discover":

@@ -3,16 +3,18 @@ import AxeBuilder from "@axe-core/playwright";
 import { chromium } from "playwright";
 
 const baseUrl = process.env.ACCESSIBILITY_BASE_URL || "http://127.0.0.1:5001";
-const authToken = Buffer.from(
-  `${process.env.ACCESSIBILITY_USERNAME || "admin"}:${process.env.ACCESSIBILITY_PASSWORD || "admin-secret"}`,
-).toString("base64");
 const routes = ["/dashboard", "/dashboard/tasks", "/settings"];
+const headers = {};
+
+if (process.env.ACCESSIBILITY_USERNAME && process.env.ACCESSIBILITY_PASSWORD) {
+  headers.Authorization = `Basic ${Buffer.from(
+    `${process.env.ACCESSIBILITY_USERNAME}:${process.env.ACCESSIBILITY_PASSWORD}`,
+  ).toString("base64")}`;
+}
 
 const browser = await chromium.launch({ headless: true });
 const context = await browser.newContext({
-  extraHTTPHeaders: {
-    Authorization: `Basic ${authToken}`,
-  },
+  extraHTTPHeaders: headers,
 });
 
 let hasViolations = false;
