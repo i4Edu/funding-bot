@@ -2,6 +2,7 @@ import io
 import itertools
 import json
 import os
+import signal
 import tempfile
 import unittest
 import unittest.mock
@@ -14,6 +15,8 @@ from funding_bot import (
     DuplicateSubmissionError,
     FundingBot,
     FundingBotError,
+    GracefulShutdownController,
+    GracefulShutdownRequested,
     OptOutError,
     OutreachThrottledError,
     SMTPEmailSender,
@@ -620,11 +623,88 @@ class SendDailySummaryTests(unittest.TestCase):
         self.assertEqual(["donor@example.org"], calls)
 
 
+class QueueExecutionTests(unittest.TestCase):
+    def setUp(self):
+        self.bot = FundingBot(trusted_sources={"Grants Portal"})
+
+    def tearDown(self):
+        self.bot.close()
+
+    def test_generate_idempotency_key_is_stable_and_prevents_duplicate_execution(self):
+        calls = []
+        payload = {"value": 7, "nested": {"enabled": True}}
+        key = self.bot.generate_idempotency_key("demo-task", payload)
+
+        def task(context, task_payload):
+            calls.append(task_payload["value"])
+            self.assertEqual(key, context.idempotency_key)
+            return {"echo": task_payload["value"]}
+
+        first = self.bot.execute_queue_task(
+            "demo-task",
+            payload,
+            task,
+            idempotency_key=key,
+            install_signal_handlers=False,
+        )
+        second = self.bot.execute_queue_task(
+            "demo-task",
+            payload,
+            task,
+            idempotency_key=key,
+            install_signal_handlers=False,
+        )
+
+        self.assertEqual([7], calls)
+        self.assertEqual("completed", first["status"])
+        self.assertFalse(first["duplicate"])
+        self.assertTrue(second["duplicate"])
+        self.assertEqual({"echo": 7}, second["result"])
+
+        stored = self.bot.get_task_run(key)
+        self.assertEqual(key, stored["idempotency_key"])
+        self.assertEqual(1, stored["duplicate_requests"])
+        self.assertEqual("completed", stored["status"])
+        self.assertEqual(1, self.bot.get_queue_metrics()["duplicate_preventions"])
+
+    def test_execute_queue_task_marks_shutdown_requested_and_cancels_cleanly(self):
+        def task(context, task_payload):
+            context.bot.request_task_run_shutdown(context.idempotency_key, signal_name="SIGTERM")
+            context.checkpoint("Stopping queued work before the next unit.")
+            return {"unexpected": task_payload}
+
+        result = self.bot.execute_queue_task(
+            "shutdown-task",
+            {"step": 1},
+            task,
+            install_signal_handlers=False,
+        )
+
+        self.assertEqual("cancelled", result["status"])
+        self.assertTrue(result["shutdown_requested"])
+        self.assertIn("Stopping queued work", result["message"])
+
+    def test_graceful_shutdown_controller_records_signals(self):
+        seen = []
+        controller = GracefulShutdownController(on_shutdown=seen.append)
+
+        controller._handle_signal(signal.SIGTERM, None)
+
+        self.assertTrue(controller.shutdown_requested())
+        self.assertEqual([signal.SIGTERM], seen)
+        with self.assertRaises(GracefulShutdownRequested):
+            controller.raise_if_shutdown_requested()
+
+
 from funding_bot import (
     CSRNetworkConnector,
+    CrowdfundingConnector,
     FileVault,
+    GlobalGivingConnector,
     GrantsPortalConnector,
+    KickstarterForGoodConnector,
     NGODirectoryConnector,
+    TokenBucketRateLimiter,
     create_connector,
     main,
 )
@@ -656,6 +736,144 @@ class PortalConnectorTests(unittest.TestCase):
 
         self.assertEqual([], grants.fetch_opportunities(["health"]))
 
+    def test_remote_connectors_paginate_until_all_results_are_collected(self):
+        calls = []
+
+        def fake_http_client(_url, params, _credentials=None):
+            calls.append(dict(params))
+            page = params["page"]
+            rows = {
+                1: [
+                    {
+                        "source": "Grants Portal",
+                        "donor_name": "Fund A",
+                        "title": "Education Page 1A",
+                        "portal_url": "https://example.org/1",
+                        "summary": "Education funding",
+                        "category": "Education",
+                        "tags": ["education"],
+                    },
+                    {
+                        "source": "Grants Portal",
+                        "donor_name": "Fund B",
+                        "title": "Education Page 1B",
+                        "portal_url": "https://example.org/2",
+                        "summary": "Education funding",
+                        "category": "Education",
+                        "tags": ["education"],
+                    },
+                ],
+                2: [
+                    {
+                        "source": "Grants Portal",
+                        "donor_name": "Fund C",
+                        "title": "Education Page 2A",
+                        "portal_url": "https://example.org/3",
+                        "summary": "Education funding",
+                        "category": "Education",
+                        "tags": ["education"],
+                    }
+                ],
+            }
+            return {
+                "opportunities": rows[page],
+                "next_page": page + 1 if page < 2 else None,
+                "schema_version": 2,
+            }
+
+        connector = GrantsPortalConnector(http_client=fake_http_client, page_size=2)
+        opportunities = connector.fetch_opportunities(["education"])
+
+        self.assertEqual(3, len(opportunities))
+        self.assertEqual([1, 2], [call["page"] for call in calls])
+        self.assertTrue(all(call["page_size"] == 2 for call in calls))
+
+    def test_connector_cache_tracks_hits_misses_and_supports_invalidation(self):
+        calls = []
+
+        def fake_http_client(_url, params, _credentials=None):
+            calls.append(dict(params))
+            keyword = params["keywords"][0]
+            return {
+                "opportunities": [
+                    {
+                        "source": "Grants Portal",
+                        "donor_name": "Cache Fund",
+                        "title": f"{keyword.title()} Opportunity",
+                        "portal_url": f"https://example.org/{keyword}",
+                        "summary": f"{keyword} funding",
+                        "category": "Education",
+                        "tags": [keyword],
+                    }
+                ],
+                "schema_version": 2,
+            }
+
+        connector = GrantsPortalConnector(http_client=fake_http_client, page_size=5)
+        connector.fetch_opportunities(["education"])
+        connector.fetch_opportunities(["education"])
+        connector.fetch_opportunities(["youth"])
+
+        metrics = connector.cache_metrics()
+        self.assertEqual(1, metrics["hits"])
+        self.assertEqual(2, metrics["misses"])
+        self.assertEqual("grants-portal", metrics["connector_id"])
+        self.assertEqual(
+            "grants-portal",
+            json.loads(connector.build_cache_key(["education"]))["connector_id"],
+        )
+        self.assertEqual(2, len(calls))
+
+        connector.invalidate_cache(["education"])
+        connector.fetch_opportunities(["education"])
+        self.assertEqual(3, len(calls))
+
+    def test_connector_cache_expires_after_ttl(self):
+        calls = []
+
+        def fake_http_client(_url, params, _credentials=None):
+            calls.append(dict(params))
+            return {
+                "opportunities": [
+                    {
+                        "source": "Grants Portal",
+                        "donor_name": "TTL Fund",
+                        "title": "Education TTL Opportunity",
+                        "portal_url": "https://example.org/ttl",
+                        "summary": "Education funding",
+                        "category": "Education",
+                        "tags": ["education"],
+                    }
+                ],
+                "schema_version": 2,
+            }
+
+        connector = GrantsPortalConnector(http_client=fake_http_client, cache_ttl=1, page_size=2)
+        with unittest.mock.patch("funding_bot.time.monotonic", side_effect=[0.0, 0.5, 1.5, 1.6]):
+            connector.fetch_opportunities(["education"])
+            connector.fetch_opportunities(["education"])
+            connector.fetch_opportunities(["education"])
+
+        self.assertEqual(2, len(calls))
+        self.assertEqual({"hits": 1, "misses": 2}, {
+            "hits": connector.cache_metrics()["hits"],
+            "misses": connector.cache_metrics()["misses"],
+        })
+
+    def test_connector_uses_per_connector_page_size_environment_override(self):
+        calls = []
+
+        def fake_http_client(_url, params, _credentials=None):
+            calls.append(dict(params))
+            return {"opportunities": [], "schema_version": 2}
+
+        with unittest.mock.patch.dict(os.environ, {"GRANTS_PORTAL_PAGE_SIZE": "7"}, clear=False):
+            connector = GrantsPortalConnector(http_client=fake_http_client)
+            connector.fetch_opportunities(["education"])
+
+        self.assertEqual(7, connector.page_size)
+        self.assertEqual(7, calls[0]["page_size"])
+
     def test_connector_keyword_mappings_expand_synonyms_and_categories(self):
         self.assertEqual(
             "Education Innovation Grant",
@@ -680,6 +898,119 @@ class PortalConnectorTests(unittest.TestCase):
             ["csr", "corporate social responsibility", "corporate giving"],
             validation["keyword_mappings"]["csr"]["keywords"],
         )
+
+    def test_crowdfunding_connectors_support_demo_results_for_globalgiving_and_kickstarter(self):
+        globalgiving = GlobalGivingConnector()
+        kickstarter = KickstarterForGoodConnector()
+
+        globalgiving_rows = globalgiving.fetch_opportunities(["stem"])
+        kickstarter_rows = kickstarter.fetch_opportunities(["assistive tech"])
+
+        self.assertEqual(1, len(globalgiving_rows))
+        self.assertEqual("GlobalGiving", globalgiving_rows[0]["source"])
+        self.assertEqual("Community STEM Lab Campaign", globalgiving_rows[0]["title"])
+
+        self.assertEqual(1, len(kickstarter_rows))
+        self.assertEqual("Kickstarter for Good", kickstarter_rows[0]["source"])
+        self.assertEqual("Assistive Tech Makerspace Project", kickstarter_rows[0]["title"])
+
+    def test_crowdfunding_connector_parses_globalgiving_payload(self):
+        connector = CrowdfundingConnector(
+            platform="globalgiving",
+            transport="http",
+            http_client=lambda url, payload: {
+                "projects": {
+                    "project": [
+                        {
+                            "title": "Girls in STEM",
+                            "projectLink": "https://www.globalgiving.org/projects/girls-in-stem/",
+                            "summary": "Fund computer science classes.",
+                            "themeName": "Education",
+                            "country": "Bangladesh",
+                            "organization": {"name": "i4Edu Partners"},
+                        }
+                    ]
+                }
+            },
+        )
+
+        rows = connector.fetch_opportunities(["stem"])
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("GlobalGiving", rows[0]["source"])
+        self.assertEqual("i4Edu Partners", rows[0]["donor_name"])
+        self.assertEqual("Girls in STEM", rows[0]["title"])
+
+    def test_token_bucket_rate_limiter_refills_over_time(self):
+        clock = FakeClock()
+        limiter = TokenBucketRateLimiter(2, 0.5, time_func=clock.monotonic)
+
+        self.assertEqual((True, 0.0), limiter.consume())
+        self.assertEqual((True, 0.0), limiter.consume())
+        allowed, retry_after = limiter.consume()
+        self.assertFalse(allowed)
+        self.assertAlmostEqual(2.0, retry_after)
+
+        clock.current = 2.0
+        self.assertEqual((True, 0.0), limiter.consume())
+
+    def test_connector_rate_limit_gracefully_degrades_and_recovers(self):
+        clock = FakeClock()
+        calls = []
+
+        def http_client(url, payload):
+            calls.append(payload)
+            return {
+                "projects": {
+                    "project": [
+                        {
+                            "title": f"Campaign {len(calls)}",
+                            "projectLink": f"https://example.org/{len(calls)}",
+                            "summary": "Crowdfunding summary",
+                            "themeName": "Education",
+                            "organization": {"name": "Community Fund"},
+                        }
+                    ]
+                }
+            }
+
+        connector = CrowdfundingConnector(
+            platform="globalgiving",
+            transport="http",
+            http_client=http_client,
+            cache_ttl=1,
+            time_func=clock.monotonic,
+            rate_limit_config={"capacity": 1, "refill_rate": 0.5},
+        )
+
+        first = connector.fetch_result(["education"])
+        second = connector.fetch_result(["equity"])
+
+        self.assertEqual(1, len(first["opportunities"]))
+        self.assertEqual([], second["opportunities"])
+        self.assertEqual("rate_limit_exceeded", second["metadata"]["degraded_reason"])
+        self.assertGreater(second["metadata"]["retry_after_seconds"], 0)
+        self.assertEqual(1, connector.get_failure_metrics()["rate_limited_requests"])
+
+        clock.current = 2.0
+        third = connector.fetch_result(["equity"])
+
+        self.assertEqual(1, len(third["opportunities"]))
+        self.assertEqual(2, len(calls))
+
+    def test_connector_rate_limit_configuration_can_come_from_env(self):
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "GLOBALGIVING_RATE_LIMIT_CAPACITY": "2",
+                "GLOBALGIVING_RATE_LIMIT_REFILL_RATE": "0.25",
+            },
+            clear=False,
+        ):
+            connector = GlobalGivingConnector()
+
+        self.assertEqual(2.0, connector.rate_limit_config["capacity"])
+        self.assertEqual(0.25, connector.rate_limit_config["refill_rate"])
 
     def test_connector_retries_transient_errors_with_exponential_backoff(self):
         clock = FakeClock()

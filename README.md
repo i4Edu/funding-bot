@@ -8,6 +8,7 @@ The Nonprofit Funding Bot helps staff discover funding opportunities, prevent du
 
 For planned milestones and release scope, see [roadmap.md](roadmap.md).
 For connector implementation and keyword-mapping guidance, see [docs/CONNECTORS.md](docs/CONNECTORS.md).
+For collaboration workflow, permissions, and task API examples, see [docs/COLLABORATION.md](docs/COLLABORATION.md).
 For vulnerability reporting, disclosure timelines, incident response, and the penetration-testing checklist, see [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Overview
@@ -18,8 +19,11 @@ The project is designed for nonprofit operations teams that need a lightweight w
 - storing organizational profile data and credential references
 - tracking applications in SQLite with duplicate protection
 - logging outreach with opt-out safeguards and throttling
+- storing donor communication consent and opt-out history
 - generating PDF and DOCX-ready documents from templates
 - emailing a daily summary report to staff
+- coordinating shared task assignment, re-assignment, and status tracking
+- generating weekly/monthly GDPR self-check reports for retention and data-subject activity
 - expanding into dashboards, compliance tooling, and production deployment over time
 
 ## Architecture
@@ -40,7 +44,7 @@ The project is designed for nonprofit operations teams that need a lightweight w
 | `v0.2.0` | ✅ Done | Portal connectors, donor segmentation, GDPR-oriented compliance workflows, and engagement metrics. |
 | `v0.3.0` | ✅ Done | Admin CLI extensions, credential vault integration, AI proposal drafting, and richer outreach analytics. |
 | `v0.4.0` | ✅ Done | Web dashboard, role-based access, collaboration workflows, and monthly audit reports. |
-| `v0.5.0` | ✅ Done | Docker and Kubernetes operations, retry/backoff resilience, and multi-language outreach templates. |
+| `v0.5.0` | ✅ Done | Docker and Kubernetes operations, retry/backoff resilience, multi-language outreach templates, and translation review tooling. |
 | `v1.0.0` | ✅ Done | Mature donor CRM behavior, full portal ecosystem, advanced compliance, and production release readiness. |
 
 ### Version details
@@ -58,6 +62,7 @@ The project is designed for nonprofit operations teams that need a lightweight w
 - donor segmentation (`corporate`, `institutional`, `individual`)
 - donor locale preferences for outreach templates (`en`, `bn`)
 - GDPR-oriented auditability and encrypted credential handling
+- consent records for donor communication history and opt-outs
 - personalized outreach templates with engagement metrics
 
 #### v0.3.0 — Automation + intelligence
@@ -80,11 +85,14 @@ The project is designed for nonprofit operations teams that need a lightweight w
 - Kubernetes rollout for multi-instance operations
 - retry/backoff handling for browser and portal failures
 - multi-language outreach templates, including English and Bengali
+- translation review workflow with pending / approved / rejected status tracking
+- RTL-aware locale metadata and preview checks for future Arabic / Urdu support
 
 #### v1.0.0 — Production release
 - mature CRM-like donor and application history
 - hardened compliance and accessibility processes
 - automated daily, weekly, and monthly reporting
+- periodic GDPR self-check reports covering consent, retention, exports, and deletions
 - onboarding-friendly staff documentation and production operations
 
 ## Installation
@@ -149,6 +157,9 @@ python -m funding_bot send-daily-summary --dry-run
 # Send the daily summary via SMTP
 python -m funding_bot send-daily-summary --recipient lupael@i4e.com.bd
 
+# Generate a weekly GDPR self-check report
+python -m funding_bot gdpr-self-check-report --cadence weekly
+
 # List discovered opportunities (optionally filter by status)
 python -m funding_bot list-opportunities
 python -m funding_bot list-opportunities --status pending --limit 20
@@ -188,6 +199,7 @@ Command reference:
 | `audit-log` | `v0.3.0` | `--limit N`, `--action ACTION` | Review recent audit events for compliance and operational troubleshooting. | Available |
 | `list-donors` | `v0.3.0` | `--segment {corporate,institutional,individual,unknown}` | List donor records and segment membership. | Available |
 | `monthly-audit-report` | `v1.0.0` | `--year YEAR`, `--month MONTH`, `--output FILE` | Generate a monthly GDPR/ISO compliance audit report as JSON. | Available |
+| `gdpr-self-check-report` | `v1.0.0` | `--cadence {weekly,monthly}`, `--output FILE` | Generate a GDPR self-check report covering consent coverage, retention, exports, and deletions. | Available |
 | `discover` | `v0.3.0` | `--keywords KEYWORDS`, `--trusted-sources SOURCES` | Query every configured portal connector and persist new opportunities (proves donation search). | Available |
 | `test-connector` | `v1.0.0` | `--connector NAME`, `--keywords KEYWORDS`, `--limit N` | Validate one connector in isolation and print sample results plus connector-specific keyword mappings. | Available |
 | `send-outreach` | `v0.3.0` | `--email EMAIL`, `--name NAME`, `--subject TEMPLATE`, `--body TEMPLATE`, `--dry-run` | Compose and send (or preview) a personalized donor outreach email (proves donor communication). | Available |
@@ -208,6 +220,31 @@ command (or before calling `SMTPEmailSender.from_env()` programmatically):
 | `SMTP_PASSWORD` | *(empty)*     | Login password                             |
 | `SMTP_USE_TLS`  | `1`           | Set to `0` to disable STARTTLS             |
 | `SMTP_FROM`     | username      | Envelope `From` address                    |
+
+## Connector pagination and caching
+
+Portal connectors now fetch remote results page-by-page and cache successful
+results for a configurable polling window.
+
+- cache keys include the connector ID, normalized keywords, and page size
+- repeated discovery calls within the TTL reuse cached connector results
+- cache invalidation is available programmatically with `connector.invalidate_cache()`
+  or `connector.invalidate_cache(["keyword"])` for a single query
+- connector cache metrics expose hits, misses, cache size, page size, and TTL
+  through `connector.cache_metrics()` and the `/metrics` endpoint
+
+Environment variables:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `PORTAL_PAGE_SIZE` | `100` | Global default page size for paginated connector requests. |
+| `PORTAL_CACHE_TTL` | `300` | Global connector cache TTL in seconds. |
+| `GRANTS_PORTAL_PAGE_SIZE` | inherits `PORTAL_PAGE_SIZE` | Page size override for the Grants Portal connector. |
+| `GRANTS_PORTAL_CACHE_TTL` | inherits `PORTAL_CACHE_TTL` | Cache TTL override for the Grants Portal connector. |
+| `CSR_NETWORK_PAGE_SIZE` | inherits `PORTAL_PAGE_SIZE` | Page size override for the CSR Network connector. |
+| `CSR_NETWORK_CACHE_TTL` | inherits `PORTAL_CACHE_TTL` | Cache TTL override for the CSR Network connector. |
+| `NGO_DIRECTORY_PAGE_SIZE` | inherits `PORTAL_PAGE_SIZE` | Page size override for the NGO Directory connector. |
+| `NGO_DIRECTORY_CACHE_TTL` | inherits `PORTAL_CACHE_TTL` | Cache TTL override for the NGO Directory connector. |
 
 ## Web Dashboard
 
@@ -278,6 +315,10 @@ The dashboard uses HTTP Basic Auth. Use one of these usernames as the role name:
 | `/settings/credentials` | `POST` | `admin` | Register a credential alias (never exposes secret values). |
 | `/settings/discover` | `POST` | `admin` | Run discovery immediately in cron mode, or enqueue it as a Celery task when `ENABLE_TASK_QUEUE=1`. |
 | `/settings/test-outreach` | `POST` | `admin` | Compose (dry-run) or send a donor outreach email — proves the bot can communicate with donors. |
+| `/translations` | `GET` | `staff`, `admin`, `auditor` | HTML translation review dashboard with locale preview and RTL rendering checks. |
+| `/translations/locales` | `GET` | `staff`, `admin`, `auditor` | List supported locale metadata, including direction and RTL flags. |
+| `/translations/reviews` | `GET` / `POST` | `staff`, `admin`, `auditor` for `GET`; `staff`, `admin` for `POST` | List review items or queue new locale content for approval. |
+| `/translations/reviews/<id>/decision` | `POST` | `staff`, `admin` | Approve or reject a queued translation review item. |
 | `/tasks/<id>/status` | `POST` | `staff`, `admin`, `auditor` | Transition a task through `todo`, `in-progress`, `blocked`, and `done` with state-machine validation. |
 | `/feedback` | `POST` | `staff`, `admin` | Submit partner feature-request or bug-report feedback. |
 | `/metrics` | `GET` | `admin`, `auditor` | Prometheus-compatible text metrics for Grafana scraping, including task totals and status counts. |
@@ -296,6 +337,24 @@ The dashboard pages keep a predictable tab order based on the visible layout and
 - Screen reader QA should confirm landmarks, headings, live-region status messages, and the keyboard shortcut help card on both `/dashboard` and `/settings`.
 
 Automated accessibility coverage lives in `tests/test_web_app.py` and checks ARIA labels, live regions, keyboard bindings, and shortcut documentation.
+
+### Translation review workflow
+
+Use the `/translations` dashboard to stage and approve locale copy before it is used in outreach templates or future localized UI work.
+
+1. Sign in as `staff` or `admin`.
+2. Submit a locale change with the locale code, translation key, source text, translated text, and optional notes.
+3. Each submission is stored with a `pending` review state.
+4. A staff reviewer can approve (`approved`) or reject (`rejected`) the queued item from the same dashboard.
+5. Review actions capture reviewer role, timestamp, and notes for auditability.
+
+### RTL preview checks
+
+Arabic (`ar`) and Urdu (`ur`) locale definitions are marked as right-to-left. The dashboard templates now use `dir`, logical text alignment, and shared RTL-safe CSS utilities so reviewers can preview future RTL rendering with a URL such as:
+
+```bash
+curl -u staff:$STAFF_PASSWORD "http://localhost:5000/translations?locale=ar"
+```
 
 ### Prometheus metrics
 
@@ -520,11 +579,12 @@ celery -A celery_app:celery_app worker --loglevel=info --queues funding-bot
 - `redis` as the default Celery broker and result backend
 - `rabbitmq` as an alternate broker option
 - `worker` running `celery_app:celery_app`
+- `flower` for queue monitoring on port `5555`
 
 Start the stack with:
 
 ```bash
-docker compose up --build
+docker compose --profile queue up --build
 ```
 
 ### Legacy cron fallback

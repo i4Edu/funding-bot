@@ -78,8 +78,8 @@ Use a dedicated deployment with the same container image as the web app:
 ```yaml
 command:
   - celery
-  - --app
-  - task_queue.celery_app
+  - -A
+  - celery_app:celery_app
   - worker
   - --loglevel=info
   - --queues
@@ -112,7 +112,7 @@ Use `/health/queue` for worker-specific alerts and `/health` for general readine
 Run Flower with:
 
 ```bash
-celery --app task_queue.celery_app flower --port=5555
+celery -A celery_app:celery_app flower --port=5555
 ```
 
 Flower should be protected behind authentication or a private network boundary. Recommended uses:

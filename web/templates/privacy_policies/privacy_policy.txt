@@ -1,0 +1,39 @@
+{{ name }} Privacy Policy
+Version: {{ version }}
+Effective date: {{ effective_date }}
+Jurisdiction: {{ details.title }}
+Configured data residency: {{ data_residency }}
+
+{{ name }} (registration {{ registration_number }}) is committed to protecting personal data while {{ mission }}.
+
+Who we are
+Our website is {{ website }}.
+Our mailing address is {{ address }}.
+Privacy questions may be sent to {{ privacy_email }}.
+
+How we use information
+We collect and use information to manage donor relationships, process operational activity, support grant applications, and maintain internal compliance records.
+
+Categories of information
+{% for category in data_categories %}- {{ category }}
+{% endfor %}
+
+Hosting and residency
+Self-hosted deployments for this organization are configured for {{ data_residency }} data residency.
+{{ details.transfer_clause }}
+
+Jurisdiction-specific rights
+{% for regulation in details.regulations %}- {{ regulation }}
+{% endfor %}
+{% for right in details.rights %}- {{ right }}
+{% endfor %}
+
+Service providers
+{% for processor in subprocessors %}- {{ processor }}
+{% endfor %}
+
+Retention
+{{ retention_summary }}
+
+Contact us
+You may contact {{ name }} at {{ contact_email }} for privacy requests or policy questions.

@@ -13,7 +13,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
 
-from flask import Flask, Response, g, jsonify, redirect, render_template, request, url_for
+from flask import Flask, Response, g, jsonify, redirect, render_template, request, session, url_for
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -26,6 +26,8 @@ from funding_bot import (  # noqa: E402
     FundingBotError,
     OpportunityNotFoundError,
     SMTPEmailSender,
+    TaskCommentNotFoundError,
+    TaskNotFoundError,
     TaskTransitionError,
     _validate_email,
     default_connectors,
@@ -52,9 +54,57 @@ ROLE_PASSWORD_ENV_VARS = {
     "staff": "STAFF_PASSWORD",
     "auditor": "AUDITOR_PASSWORD",
 }
+DEFAULT_SESSION_TIMEOUT_MINUTES = 30
+SESSION_ROLE_KEY = "authenticated_role"
+SESSION_AUTHENTICATED_AT_KEY = "authenticated_at"
+SESSION_LAST_SEEN_AT_KEY = "last_seen_at"
 
 # Track server start time for the uptime metric.
 _APP_START_TIME = time.time()
+
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def _read_session_timeout_minutes() -> int:
+    raw_value = os.environ.get("DASHBOARD_SESSION_TIMEOUT_MINUTES", str(DEFAULT_SESSION_TIMEOUT_MINUTES))
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return DEFAULT_SESSION_TIMEOUT_MINUTES
+    return max(1, parsed)
+
+
+def _configure_session_security(flask_app: Flask) -> None:
+    flask_app.config["SECRET_KEY"] = os.environ.get(
+        "FLASK_SECRET_KEY",
+        os.environ.get("SECRET_KEY", "development-only-change-me"),
+    )
+    flask_app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(
+        minutes=_read_session_timeout_minutes()
+    )
+    flask_app.config["SESSION_COOKIE_HTTPONLY"] = True
+    flask_app.config["SESSION_COOKIE_SECURE"] = _env_flag(
+        "SESSION_COOKIE_SECURE",
+        default=True,
+    )
+    flask_app.config["SESSION_COOKIE_SAMESITE"] = os.environ.get(
+        "SESSION_COOKIE_SAMESITE",
+        "Lax",
+    )
+    flask_app.config["SESSION_REFRESH_EACH_REQUEST"] = True
+
+
+_configure_session_security(app)
 
 
 def _bot() -> FundingBot:
@@ -81,7 +131,58 @@ def _auth_challenge(message: str = "Authentication required") -> Response:
     )
 
 
+def _session_timeout() -> timedelta:
+    configured = app.config.get("PERMANENT_SESSION_LIFETIME", timedelta(minutes=DEFAULT_SESSION_TIMEOUT_MINUTES))
+    return configured if isinstance(configured, timedelta) else timedelta(minutes=DEFAULT_SESSION_TIMEOUT_MINUTES)
+
+
+def _parse_session_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _clear_authenticated_session() -> None:
+    session.pop(SESSION_ROLE_KEY, None)
+    session.pop(SESSION_AUTHENTICATED_AT_KEY, None)
+    session.pop(SESSION_LAST_SEEN_AT_KEY, None)
+
+
+def _establish_authenticated_session(role: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    session.permanent = True
+    session[SESSION_ROLE_KEY] = role
+    session.setdefault(SESSION_AUTHENTICATED_AT_KEY, now)
+    session[SESSION_LAST_SEEN_AT_KEY] = now
+
+
+def _get_session_role() -> str | None:
+    role = session.get(SESSION_ROLE_KEY)
+    if not isinstance(role, str) or role not in ROLE_PASSWORD_ENV_VARS:
+        _clear_authenticated_session()
+        return None
+    last_seen = _parse_session_timestamp(session.get(SESSION_LAST_SEEN_AT_KEY))
+    if last_seen is None:
+        _clear_authenticated_session()
+        return None
+    if datetime.now(timezone.utc) - last_seen > _session_timeout():
+        _clear_authenticated_session()
+        return None
+    _establish_authenticated_session(role)
+    return role
+
+
 def _get_authenticated_role() -> str:
+    session_role = _get_session_role()
+    if session_role is not None:
+        return session_role
+
     header = request.headers.get("Authorization", "")
     if not header.startswith("Basic "):
         raise PermissionError("Authentication required")
@@ -104,6 +205,7 @@ def _get_authenticated_role() -> str:
     if not expected_password or not hmac.compare_digest(password, expected_password):
         raise PermissionError("Invalid authentication credentials")
 
+    _establish_authenticated_session(role)
     return role
 
 
@@ -152,6 +254,16 @@ def _coerce_bool(value: Any, field_name: str) -> bool:
     raise ValueError(f"Field '{field_name}' must be a boolean.")
 
 
+def _coerce_list(value: Any, field_name: str) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    raise ValueError(f"Field '{field_name}' must be a list or comma-separated string.")
+
+
 def _serialize_opportunity(row: Any) -> dict[str, Any]:
     data = dict(row)
     data["raw_data"] = _parse_json_column(data.pop("raw_data_json", "{}"))
@@ -185,6 +297,14 @@ def _serialize_task(row: Any) -> dict[str, Any]:
     return dict(row)
 
 
+def _serialize_task_comment(row: Any) -> dict[str, Any]:
+    return dict(row)
+
+
+def _task_assignment_sender() -> Any | None:
+    return SMTPEmailSender.from_env() if SMTPEmailSender.is_configured() else None
+
+
 def _read_task_import_csv() -> str:
     upload = request.files.get("file")
     if upload is not None:
@@ -206,7 +326,7 @@ def _group_tasks_by_status(tasks: list[dict[str, Any]]) -> dict[str, list[dict[s
 
 
 def _can_move_task(role: str | None, task: dict[str, Any]) -> bool:
-    return role == "admin" or (role == "staff" and task.get("assigned_to") == role)
+    return role == "admin" or task.get("assigned_to") == role
 
 
 def _serialize_translation_review(review: Any) -> dict[str, Any]:
@@ -581,6 +701,16 @@ def handle_opportunity_not_found(exc: OpportunityNotFoundError) -> Response:
     return _json_error(str(exc), 404)
 
 
+@app.errorhandler(TaskNotFoundError)
+def handle_task_not_found(exc: TaskNotFoundError) -> Response:
+    return _json_error(str(exc), 404)
+
+
+@app.errorhandler(TaskCommentNotFoundError)
+def handle_task_comment_not_found(exc: TaskCommentNotFoundError) -> Response:
+    return _json_error(str(exc), 404)
+
+
 @app.errorhandler(FundingBotError)
 def handle_funding_bot_error(exc: FundingBotError) -> Response:
     return _json_error(str(exc), 400)
@@ -651,7 +781,7 @@ def list_tasks_route() -> Response:
 def create_task_route() -> Response:
     payload = _get_request_json()
     title = str(payload.get("title", "")).strip()
-    assigned_to = str(payload.get("assigned_to", "")).strip()
+    assigned_to = str(payload.get("assigned_to", "")).strip().lower()
     description = str(payload.get("description", "")).strip()
     status = str(payload.get("status", "todo")).strip() or "todo"
     due_date = payload.get("due_date")
@@ -660,6 +790,10 @@ def create_task_route() -> Response:
         raise ValueError("Field 'title' is required.")
     if not assigned_to:
         raise ValueError("Field 'assigned_to' is required.")
+    if assigned_to not in ROLE_PASSWORD_ENV_VARS:
+        raise ValueError(
+            f"Field 'assigned_to' must be one of {sorted(ROLE_PASSWORD_ENV_VARS)}."
+        )
     if due_date is not None and not isinstance(due_date, str):
         raise ValueError("Field 'due_date' must be a string or null.")
 
@@ -687,11 +821,15 @@ def get_task_route(task_id: int) -> Response:
 @require_role("admin")
 def assign_task_route(task_id: int) -> Response:
     payload = _get_request_json()
-    assigned_to = str(payload.get("assigned_to", "")).strip()
+    assigned_to = str(payload.get("assigned_to", "")).strip().lower()
     if not assigned_to:
         raise ValueError("Field 'assigned_to' is required.")
+    if assigned_to not in ROLE_PASSWORD_ENV_VARS:
+        raise ValueError(
+            f"Field 'assigned_to' must be one of {sorted(ROLE_PASSWORD_ENV_VARS)}."
+        )
 
-    task = _bot().assign_task(
+    task = _bot().reassign_task(
         task_id,
         assigned_to=assigned_to,
         changed_by=getattr(g, "current_role", None) or "unknown",
@@ -1190,6 +1328,32 @@ def metrics() -> Response:
     for row in task_assignments:
         lines.append(
             f'funding_bot_tasks_assigned_total{{assigned_to="{row["assigned_to"]}"}} {row["total"]}'
+        )
+    lines.extend(
+        [
+            "# HELP funding_bot_connector_cache_hits_total Connector cache hits",
+            "# TYPE funding_bot_connector_cache_hits_total counter",
+            "# HELP funding_bot_connector_cache_misses_total Connector cache misses",
+            "# TYPE funding_bot_connector_cache_misses_total counter",
+            "# HELP funding_bot_connector_cache_entries Connector cache entries",
+            "# TYPE funding_bot_connector_cache_entries gauge",
+            "# HELP funding_bot_connector_cache_ttl_seconds Connector cache TTL in seconds",
+            "# TYPE funding_bot_connector_cache_ttl_seconds gauge",
+            "# HELP funding_bot_connector_page_size Connector page size",
+            "# TYPE funding_bot_connector_page_size gauge",
+        ]
+    )
+    for connector in default_connectors():
+        cache_metrics = connector.cache_metrics()
+        labels = f'connector_id="{cache_metrics["connector_id"]}"'
+        lines.extend(
+            [
+                f'funding_bot_connector_cache_hits_total{{{labels}}} {int(cache_metrics.get("hits", 0))}',
+                f'funding_bot_connector_cache_misses_total{{{labels}}} {int(cache_metrics.get("misses", 0))}',
+                f'funding_bot_connector_cache_entries{{{labels}}} {int(cache_metrics.get("size", 0))}',
+                f'funding_bot_connector_cache_ttl_seconds{{{labels}}} {float(cache_metrics.get("ttl_seconds", 0.0))}',
+                f'funding_bot_connector_page_size{{{labels}}} {int(cache_metrics.get("page_size", 0))}',
+            ]
         )
     return Response("\n".join(lines) + "\n", mimetype="text/plain; version=0.0.4")
 

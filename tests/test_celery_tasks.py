@@ -61,8 +61,28 @@ class CeleryTaskExecutionTests(unittest.TestCase):
                 self.closed = False
                 self.calls = []
 
+            def execute_queue_task(
+                self,
+                task_name,
+                payload,
+                callback,
+                *,
+                idempotency_key=None,
+                worker_id=None,
+                install_signal_handlers=True,
+            ):
+                self.calls.append((task_name, payload, idempotency_key, worker_id, install_signal_handlers))
+                result = callback(SimpleNamespace(bot=self, idempotency_key=idempotency_key, checkpoint=lambda *_: None), payload)
+                return {
+                    "idempotency_key": idempotency_key,
+                    "status": "completed",
+                    "duplicate": False,
+                    "duplicate_requests": 0,
+                    "shutdown_requested": False,
+                    "result": result,
+                }
+
             def run_discovery(self, *, keywords=None, trusted_sources=None):
-                self.calls.append((keywords, trusted_sources))
                 return [{"title": "Education Innovation Grant"}]
 
             def close(self):
@@ -75,11 +95,16 @@ class CeleryTaskExecutionTests(unittest.TestCase):
                 keywords=["education"],
                 trusted_sources=["Grants Portal"],
                 db_path=".test_queue.db",
+                idempotency_key="discover-key",
             )
 
         self.assertEqual(1, payload["count"])
         self.assertEqual("queue", payload["mode"])
-        self.assertEqual([(["education"], ["Grants Portal"])], fake_bot.calls)
+        self.assertEqual(
+            [("discover_opportunities", {"keywords": ["education"], "trusted_sources": ["Grants Portal"]}, "discover-key", None, True)],
+            fake_bot.calls,
+        )
+        self.assertEqual("discover-key", payload["idempotency_key"])
         self.assertTrue(fake_bot.closed)
 
     def test_send_outreach_task_respects_dry_run(self):
@@ -87,6 +112,26 @@ class CeleryTaskExecutionTests(unittest.TestCase):
             def __init__(self):
                 self.closed = False
                 self.sender = None
+
+            def execute_queue_task(
+                self,
+                task_name,
+                payload,
+                callback,
+                *,
+                idempotency_key=None,
+                worker_id=None,
+                install_signal_handlers=True,
+            ):
+                result = callback(SimpleNamespace(bot=self, idempotency_key=idempotency_key, checkpoint=lambda *_: None), payload)
+                return {
+                    "idempotency_key": idempotency_key,
+                    "status": "completed",
+                    "duplicate": False,
+                    "duplicate_requests": 0,
+                    "shutdown_requested": False,
+                    "result": result,
+                }
 
             def send_outreach(self, **kwargs):
                 self.sender = kwargs["sender"]
@@ -105,10 +150,12 @@ class CeleryTaskExecutionTests(unittest.TestCase):
                 body_template="Body",
                 dry_run=True,
                 db_path=".test_queue.db",
+                idempotency_key="outreach-key",
             )
 
         self.assertTrue(payload["dry_run"])
         self.assertEqual("queue", payload["mode"])
+        self.assertEqual("outreach-key", payload["idempotency_key"])
         self.assertIsNone(fake_bot.sender)
         self.assertTrue(fake_bot.closed)
 
@@ -117,6 +164,26 @@ class CeleryTaskExecutionTests(unittest.TestCase):
             def __init__(self):
                 self.closed = False
                 self.sender = None
+
+            def execute_queue_task(
+                self,
+                task_name,
+                payload,
+                callback,
+                *,
+                idempotency_key=None,
+                worker_id=None,
+                install_signal_handlers=True,
+            ):
+                result = callback(SimpleNamespace(bot=self, idempotency_key=idempotency_key, checkpoint=lambda *_: None), payload)
+                return {
+                    "idempotency_key": idempotency_key,
+                    "status": "completed",
+                    "duplicate": False,
+                    "duplicate_requests": 0,
+                    "shutdown_requested": False,
+                    "result": result,
+                }
 
             def send_daily_summary(self, *, recipient, sender):
                 self.sender = sender
@@ -135,10 +202,12 @@ class CeleryTaskExecutionTests(unittest.TestCase):
                 recipient="ops@example.org",
                 dry_run=False,
                 db_path=".test_queue.db",
+                idempotency_key="summary-key",
             )
 
         self.assertEqual("ops@example.org", payload["recipient"])
         self.assertFalse(payload["dry_run"])
+        self.assertEqual("summary-key", payload["idempotency_key"])
         self.assertIs(sender, fake_bot.sender)
         self.assertTrue(fake_bot.closed)
 
@@ -167,6 +236,7 @@ class DispatchDiscoveryTests(unittest.TestCase):
         self.assertEqual(202, status_code)
         self.assertEqual("job-123", payload["task_id"])
         self.assertEqual("hybrid", payload["mode"])
+        self.assertIn("idempotency_key", payload)
         self.assertTrue(payload["legacy_cron_enabled"])
         delayed.assert_called_once()
 

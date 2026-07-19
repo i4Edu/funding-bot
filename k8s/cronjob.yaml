@@ -1,4 +1,4 @@
-# Daily job that sends the funding summary at 09:00 UTC.
+# Daily summary job at 09:00 UTC.
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -45,7 +45,116 @@ spec:
                 - name: bot-data
                   mountPath: /app/data
           volumes:
-            # Reuse the same claim so scheduled jobs operate on the shared SQLite data.
+            - name: bot-data
+              persistentVolumeClaim:
+                claimName: funding-bot-data
+---
+# Weekly GDPR self-check every Monday at 10:00 UTC.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: funding-bot-weekly-gdpr-self-check
+  namespace: funding-bot
+  labels:
+    app: funding-bot
+spec:
+  schedule: "0 10 * * 1"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: funding-bot
+            component: compliance
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: funding-bot
+              image: funding-bot:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - python
+                - -m
+                - funding_bot
+                - gdpr-self-check-report
+                - --cadence
+                - weekly
+                - --output
+                - /app/data/reports/gdpr-weekly-latest.json
+              envFrom:
+                - configMapRef:
+                    name: funding-bot-config
+                - secretRef:
+                    name: funding-bot-secrets
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+              volumeMounts:
+                - name: bot-data
+                  mountPath: /app/data
+          volumes:
+            - name: bot-data
+              persistentVolumeClaim:
+                claimName: funding-bot-data
+---
+# Monthly GDPR self-check on the first day of each month at 11:00 UTC.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: funding-bot-monthly-gdpr-self-check
+  namespace: funding-bot
+  labels:
+    app: funding-bot
+spec:
+  schedule: "0 11 1 * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: funding-bot
+            component: compliance
+        spec:
+          restartPolicy: OnFailure
+          containers:
+            - name: funding-bot
+              image: funding-bot:latest
+              imagePullPolicy: IfNotPresent
+              command:
+                - python
+                - -m
+                - funding_bot
+                - gdpr-self-check-report
+                - --cadence
+                - monthly
+                - --output
+                - /app/data/reports/gdpr-monthly-latest.json
+              envFrom:
+                - configMapRef:
+                    name: funding-bot-config
+                - secretRef:
+                    name: funding-bot-secrets
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  cpu: 100m
+                  memory: 128Mi
+              volumeMounts:
+                - name: bot-data
+                  mountPath: /app/data
+          volumes:
             - name: bot-data
               persistentVolumeClaim:
                 claimName: funding-bot-data

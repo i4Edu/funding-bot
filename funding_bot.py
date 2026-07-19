@@ -16,9 +16,6 @@ import sys
 import threading
 import time
 import urllib.parse
-import urllib.request
-import urllib.error
-import urllib.request
 import zipfile
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -875,15 +872,17 @@ class OAuth2ClientCredentialsVault:
         form_data: dict[str, Any],
         headers: dict[str, str],
     ) -> dict[str, Any]:
-        request = urllib.request.Request(
-            url,
-            data=urllib.parse.urlencode(form_data).encode("utf-8"),
-            headers=headers,
-            method="POST",
-        )
-        with urllib.request.urlopen(request, timeout=30) as response:
-            payload = response.read().decode("utf-8")
-        parsed = json.loads(payload)
+        secure_url = _require_https_url(url, purpose="OAuth token request")
+        with _build_tls_http_session() as session:
+            response = session.post(
+                secure_url,
+                data=form_data,
+                headers=headers,
+                timeout=30,
+                verify=True,
+            )
+            response.raise_for_status()
+            parsed = response.json()
         if not isinstance(parsed, dict):
             raise CredentialRefreshError("OAuth2 token endpoint returned a non-object JSON payload.")
         return parsed
@@ -962,7 +961,10 @@ class _BasePortalConnector:
         rate_limiter: TokenBucketRateLimiter | None = None,
     ) -> None:
         self.http_client = http_client
-        self.base_url = base_url or self.base_url
+        self.base_url = _require_https_url(
+            base_url or self.base_url,
+            purpose=f"{self.source_name or self.__class__.__name__} connector base URL",
+        )
         self.source_name = source_name or self.source_name
         self.credentials = dict(credentials or {})
         self.transport = transport
@@ -987,6 +989,7 @@ class _BasePortalConnector:
         self._opened_at: float | None = None
         self._last_error: str | None = None
         self._last_rate_limit_retry_after: float | None = None
+        _CONNECTOR_METRICS.ensure_connector(self.source_name, self.connector_slug)
         self._metrics: dict[str, Any] = {
             "requests": 0,
             "successful_requests": 0,
@@ -1387,6 +1390,73 @@ class _BasePortalConnector:
         next_page = current_page + 1 if payload and len(payload) >= self.page_size else None
         return payload, None, [], next_page
 
+    def _throttle_remote_request(self) -> None:
+        allowed, retry_after = self._rate_limiter.consume()
+        if allowed:
+            return
+        self._metrics["rate_limited_requests"] += 1
+        self._last_rate_limit_retry_after = retry_after
+        if retry_after == float("inf"):
+            raise RateLimitExceededError(
+                f"Connector {self.source_name!r} is rate-limited and cannot recover automatically."
+            )
+        self._sleep(retry_after)
+
+    def _invoke_http_get_client(
+        self,
+        url: str,
+        params: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        self._throttle_remote_request()
+        if self.http_client is not None:
+            attempts = (
+                lambda: self.http_client(url, params, self.credentials, headers=headers or {}),
+                lambda: self.http_client(url, params, headers=headers or {}),
+                lambda: self.http_client(url, params, self.credentials),
+                lambda: self.http_client(url, params),
+            )
+            for attempt in attempts:
+                try:
+                    return attempt()
+                except TypeError:
+                    continue
+            return self.http_client(url, params)
+
+        query_items: list[tuple[str, str]] = []
+        for key, value in params.items():
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple, set)):
+                query_items.extend((key, str(item)) for item in value if item is not None)
+            else:
+                query_items.append((key, str(value)))
+        query_string = urllib.parse.urlencode(query_items, doseq=True)
+        request = urllib.request.Request(
+            f"{url}?{query_string}" if query_string else url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": "funding-bot/1.0",
+                **(headers or {}),
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(request, timeout=15) as response:
+            payload = response.read().decode("utf-8")
+        return json.loads(payload or "{}")
+
+    def _fetch_remote_json(
+        self,
+        url: str,
+        params: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> Any:
+        return self._call_with_retry(
+            lambda: self._invoke_http_get_client(url, params, headers=headers)
+        )
+
     def detect_schema_version(self, payload: Any, declared_version: Any = None) -> int:
         if declared_version is not None:
             try:
@@ -1627,6 +1697,206 @@ class NGODirectoryConnector(_BasePortalConnector):
         ]
 
 
+class CrowdfundingConnector(_BasePortalConnector):
+    """Connector for crowdfunding platforms such as GlobalGiving and Kickstarter."""
+
+    connector_slug = "crowdfunding"
+    source_name = "Crowdfunding"
+    platform = "globalgiving"
+    default_page_size = 20
+    keyword_category_mappings = {
+        "crowdfunding": {
+            "keywords": ("public giving", "campaign", "community fundraising"),
+            "categories": ("Crowdfunding",),
+        },
+        "education": {
+            "keywords": ("learning", "school", "stem"),
+            "categories": ("Education",),
+        },
+    }
+    _PLATFORM_CONFIGS = {
+        "globalgiving": {
+            "connector_slug": "globalgiving",
+            "source_name": "GlobalGiving",
+            "base_url": "https://api.globalgiving.org/api/public/projectservice/all/projects/active",
+        },
+        "kickstarter": {
+            "connector_slug": "kickstarter-for-good",
+            "source_name": "Kickstarter for Good",
+            "base_url": "https://www.kickstarter.com/discover/advanced",
+        },
+    }
+
+    def __init__(
+        self,
+        http_client: Callable[..., Any] | None = None,
+        *,
+        platform: str | None = None,
+        **kwargs: Any,
+    ) -> None:
+        normalized_platform = (platform or self.platform).strip().lower()
+        if normalized_platform not in self._PLATFORM_CONFIGS:
+            raise ValueError(f"Unsupported crowdfunding platform: {normalized_platform!r}")
+        platform_config = self._PLATFORM_CONFIGS[normalized_platform]
+        self.platform = normalized_platform
+        self.connector_slug = str(platform_config["connector_slug"])
+        kwargs.setdefault("source_name", str(platform_config["source_name"]))
+        kwargs.setdefault("base_url", str(platform_config["base_url"]))
+        kwargs.setdefault("transport", "demo")
+        super().__init__(http_client=http_client, **kwargs)
+
+    def _fetch_remote_result(self, keywords: list[str]) -> dict[str, Any]:
+        if self.http_client is None:
+            return super()._fetch_remote_result(keywords)
+        payload = {
+            "keywords": keywords,
+            "page_size": self.page_size,
+            "platform": self.platform,
+            "health_check": self._circuit_state == "half-open",
+        }
+        response = self._call_with_retry(lambda: self.http_client(self.base_url, payload))
+        raw_rows, response_keys = self._extract_platform_rows(response)
+        normalized_rows = [row for row in (self._normalize_platform_row(item) for item in raw_rows) if row]
+        return {
+            "schema_version": self.result_schema_version,
+            "opportunities": normalized_rows,
+            "metadata": {
+                "connector_name": self.source_name,
+                "source_status": "remote",
+                "platform": self.platform,
+                "response_keys": response_keys,
+            },
+        }
+
+    def _extract_platform_rows(self, response: Any) -> tuple[list[dict[str, Any]], list[str]]:
+        if isinstance(response, list):
+            return [dict(item) for item in response if isinstance(item, dict)], []
+        if not isinstance(response, dict):
+            return [], []
+        if "opportunities" in response:
+            rows = response.get("opportunities", [])
+            return [dict(item) for item in rows if isinstance(item, dict)], sorted(str(key) for key in response)
+        if self.platform == "globalgiving":
+            projects = response.get("projects", {})
+            if isinstance(projects, dict):
+                rows = projects.get("project", projects.get("projects", []))
+                if isinstance(rows, list):
+                    return [dict(item) for item in rows if isinstance(item, dict)], sorted(
+                        str(key) for key in response
+                    )
+        if self.platform == "kickstarter":
+            rows = response.get("projects")
+            if rows is None and isinstance(response.get("data"), dict):
+                rows = response["data"].get("projects", [])
+            if isinstance(rows, list):
+                return [dict(item) for item in rows if isinstance(item, dict)], sorted(
+                    str(key) for key in response
+                )
+        return [], sorted(str(key) for key in response)
+
+    def _normalize_platform_row(self, row: dict[str, Any]) -> dict[str, Any] | None:
+        if self.platform == "globalgiving":
+            title = row.get("title") or row.get("name")
+            if not title:
+                return None
+            organization = row.get("organization")
+            donor_name = (
+                row.get("donor_name")
+                or row.get("owner_name")
+                or (organization.get("name") if isinstance(organization, dict) else None)
+                or "GlobalGiving Campaign"
+            )
+            category = row.get("themeName") or row.get("category") or "Crowdfunding"
+            portal_url = row.get("projectLink") or row.get("portal_url") or row.get("url") or self.base_url
+            summary = row.get("summary") or row.get("need") or row.get("activity") or ""
+            tags = [
+                str(value)
+                for value in (row.get("themeName"), row.get("country"), "crowdfunding")
+                if value
+            ]
+            return {
+                "source": self.source_name,
+                "donor_name": str(donor_name),
+                "title": str(title),
+                "portal_url": str(portal_url),
+                "summary": str(summary),
+                "category": str(category),
+                "tags": tags,
+            }
+
+        title = row.get("title") or row.get("name")
+        if not title:
+            return None
+        creator = row.get("creator")
+        category = row.get("category")
+        urls = row.get("urls")
+        web = urls.get("web") if isinstance(urls, dict) else None
+        donor_name = (
+            row.get("donor_name")
+            or (creator.get("name") if isinstance(creator, dict) else None)
+            or "Kickstarter Creator"
+        )
+        category_name = (
+            row.get("category_name")
+            or (category.get("name") if isinstance(category, dict) else None)
+            or "Crowdfunding"
+        )
+        portal_url = (
+            row.get("portal_url")
+            or row.get("url")
+            or (web.get("project") if isinstance(web, dict) else None)
+            or self.base_url
+        )
+        summary = row.get("summary") or row.get("blurb") or ""
+        tags = [str(value) for value in (category_name, "crowdfunding", "social impact") if value]
+        return {
+            "source": self.source_name,
+            "donor_name": str(donor_name),
+            "title": str(title),
+            "portal_url": str(portal_url),
+            "summary": str(summary),
+            "category": str(category_name),
+            "tags": tags,
+        }
+
+    def _demo_data(self) -> list[dict[str, Any]]:
+        if self.platform == "globalgiving":
+            return [
+                {
+                    "source": self.source_name,
+                    "donor_name": "GlobalGiving Community",
+                    "title": "Community STEM Lab Campaign",
+                    "portal_url": "https://www.globalgiving.org/projects/community-stem-lab/",
+                    "summary": "Crowdfunding campaign supporting rural STEM labs and teacher training.",
+                    "category": "Education",
+                    "tags": ["education", "crowdfunding", "community"],
+                }
+            ]
+        return [
+            {
+                "source": self.source_name,
+                "donor_name": "Kickstarter Social Impact",
+                "title": "Assistive Tech Makerspace Project",
+                "portal_url": "https://www.kickstarter.com/projects/social-impact/assistive-tech-makerspace",
+                "summary": "Creative campaign funding inclusive makerspace equipment for learners.",
+                "category": "Innovation",
+                "tags": ["innovation", "crowdfunding", "social impact"],
+            }
+        ]
+
+
+class GlobalGivingConnector(CrowdfundingConnector):
+    connector_slug = "globalgiving"
+    source_name = "GlobalGiving"
+    platform = "globalgiving"
+
+
+class KickstarterForGoodConnector(CrowdfundingConnector):
+    connector_slug = "kickstarter-for-good"
+    source_name = "Kickstarter for Good"
+    platform = "kickstarter"
+
+
 _DEFAULT_CONNECTORS: list[PortalConnector] | None = None
 
 
@@ -1643,6 +1913,8 @@ def default_connectors() -> list[PortalConnector]:
             GrantsPortalConnector(),
             CSRNetworkConnector(),
             NGODirectoryConnector(),
+            GlobalGivingConnector(),
+            KickstarterForGoodConnector(),
         ]
     return list(_DEFAULT_CONNECTORS)
 
@@ -1663,6 +1935,14 @@ CONNECTOR_CONFIG_SCHEMA = {
                     "credential_alias": {"type": "string", "minLength": 1},
                     "credentials": {"type": "object"},
                     "cache_ttl": {"type": "number", "exclusiveMinimum": 0},
+                    "rate_limit": {
+                        "type": "object",
+                        "properties": {
+                            "capacity": {"type": "number", "exclusiveMinimum": 0},
+                            "refill_rate": {"type": "number", "minimum": 0},
+                        },
+                        "additionalProperties": False,
+                    },
                     "settings": {"type": "object"},
                 },
                 "required": ["type"],
@@ -1680,19 +1960,22 @@ def _default_http_json_client(
     payload: dict[str, Any],
     credentials: dict[str, Any] | None = None,
 ) -> Any:
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
+    secure_url = _require_https_url(url, purpose="Connector request")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
     for key, value in (credentials or {}).items():
-        request.add_header(f"X-Connector-{key.replace('_', '-').title()}", str(value))
-
+        headers[f"X-Connector-{key.replace('_', '-').title()}"] = str(value)
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            return json.loads(response.read().decode("utf-8") or "{}")
-    except urllib.error.URLError as exc:
+        with _build_tls_http_session() as session:
+            response = session.post(
+                secure_url,
+                json=payload,
+                headers=headers,
+                timeout=10,
+                verify=True,
+            )
+            response.raise_for_status()
+            return response.json()
+    except (requests.RequestException, ValueError) as exc:
         raise FundingBotError(f"Connector request to {url!r} failed: {exc}") from exc
 
 
@@ -1748,6 +2031,15 @@ class ConnectorRegistry:
                 f"Unknown connector type {config['type']!r}. Registered connector types: {known}."
             )
 
+        if config.get("base_url"):
+            try:
+                _require_https_url(
+                    str(config["base_url"]),
+                    purpose=f"{config['type']} connector base URL",
+                )
+            except ConnectionSecurityError as exc:
+                raise ConnectorConfigError(str(exc)) from exc
+
         if plugin.credential_schema is None:
             return
 
@@ -1792,6 +2084,7 @@ class ConnectorRegistry:
                     credentials=credentials,
                     transport=config.get("transport", "demo"),
                     cache_ttl=config.get("cache_ttl"),
+                    rate_limit_config=config.get("rate_limit"),
                     **settings,
                 )
             )
@@ -1802,6 +2095,11 @@ DEFAULT_CONNECTOR_REGISTRY = ConnectorRegistry()
 DEFAULT_CONNECTOR_REGISTRY.register(GrantsPortalConnector.connector_slug, GrantsPortalConnector)
 DEFAULT_CONNECTOR_REGISTRY.register(CSRNetworkConnector.connector_slug, CSRNetworkConnector)
 DEFAULT_CONNECTOR_REGISTRY.register(NGODirectoryConnector.connector_slug, NGODirectoryConnector)
+DEFAULT_CONNECTOR_REGISTRY.register(GlobalGivingConnector.connector_slug, GlobalGivingConnector)
+DEFAULT_CONNECTOR_REGISTRY.register(
+    KickstarterForGoodConnector.connector_slug,
+    KickstarterForGoodConnector,
+)
 
 
 def connector_registry() -> dict[str, type[_BasePortalConnector]]:
@@ -1810,6 +2108,8 @@ def connector_registry() -> dict[str, type[_BasePortalConnector]]:
         GrantsPortalConnector.connector_slug: GrantsPortalConnector,
         CSRNetworkConnector.connector_slug: CSRNetworkConnector,
         NGODirectoryConnector.connector_slug: NGODirectoryConnector,
+        GlobalGivingConnector.connector_slug: GlobalGivingConnector,
+        KickstarterForGoodConnector.connector_slug: KickstarterForGoodConnector,
     }
 
 
@@ -2115,6 +2415,11 @@ class FundingBot:
                 env_var_name TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                name TEXT PRIMARY KEY,
+                applied_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS opportunities (
                 signature TEXT PRIMARY KEY,
                 source TEXT NOT NULL,
@@ -2290,9 +2595,9 @@ class FundingBot:
                 external_id TEXT UNIQUE,
                 title TEXT NOT NULL,
                 description TEXT NOT NULL DEFAULT '',
-                assigned_to TEXT NOT NULL,
+                assignee TEXT NOT NULL,
                 status TEXT NOT NULL,
-                due_date TEXT,
+                due_date TEXT NOT NULL,
                 source TEXT NOT NULL DEFAULT 'manual',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -2377,8 +2682,8 @@ class FundingBot:
                 ON task_history(status);
             CREATE INDEX IF NOT EXISTS idx_dead_letter_queue_task_name
                 ON dead_letter_queue(task_name, failed_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_tasks_assigned_to
-                ON tasks(assigned_to);
+            CREATE INDEX IF NOT EXISTS idx_tasks_assignee
+                ON tasks(assignee);
             CREATE INDEX IF NOT EXISTS idx_tasks_status
                 ON tasks(status);
             CREATE INDEX IF NOT EXISTS idx_tasks_external_id
@@ -2415,6 +2720,122 @@ class FundingBot:
         self._ensure_column("task_runs", "dead_lettered", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("task_runs", "last_attempt_at", "TEXT")
         self._ensure_column("task_runs", "next_retry_at", "TEXT")
+        self._ensure_column(
+            "task_runs",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'internal'",
+        )
+        self._ensure_column(
+            "organization_profile",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'internal'",
+        )
+        self._ensure_column(
+            "organization_profile",
+            "field_classifications_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
+        self._ensure_column(
+            "credential_refs",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'internal'",
+        )
+        self._ensure_column(
+            "opportunities",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'public'",
+        )
+        self._ensure_column(
+            "applications",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'internal'",
+        )
+        self._ensure_column(
+            "submission_attempts",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'internal'",
+        )
+        self._ensure_column(
+            "donors",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'confidential'",
+        )
+        self._ensure_column(
+            "donors",
+            "field_classifications_json",
+            "TEXT NOT NULL DEFAULT '{}'",
+        )
+        self._ensure_column(
+            "consent_records",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'confidential'",
+        )
+        self._ensure_column(
+            "communications",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'confidential'",
+        )
+        self._ensure_column(
+            "documents",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'internal'",
+        )
+        self._ensure_column(
+            "privacy_policy_versions",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'internal'",
+        )
+        self._ensure_column(
+            "audit_logs",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'confidential'",
+        )
+        self._ensure_column(
+            "outreach_templates",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'internal'",
+        )
+        self._ensure_column(
+            "outreach_events",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'internal'",
+        )
+        self._ensure_column(
+            "connector_result_cache",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'internal'",
+        )
+        self._ensure_column(
+            "task_history",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'internal'",
+        )
+        self._ensure_column(
+            "dead_letter_queue",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'internal'",
+        )
+        self._ensure_column("tasks", "data_classification", "TEXT NOT NULL DEFAULT 'internal'")
+        self._ensure_column(
+            "task_comments",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'internal'",
+        )
+        self._ensure_column(
+            "task_comment_reads",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'internal'",
+        )
+        self._ensure_column(
+            "task_notifications",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'internal'",
+        )
+        self._ensure_column(
+            "translation_reviews",
+            "data_classification",
+            "TEXT NOT NULL DEFAULT 'internal'",
+        )
         # Index on donors.segment must be created after the column is guaranteed to exist.
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_donors_segment ON donors(segment)"
@@ -2426,9 +2847,36 @@ class FundingBot:
 
     # Allowlist of table/column identifiers that _ensure_column is permitted to touch.
     # All calls are internal and use literals; the allowlist is an extra safety guard.
-    _ALLOWED_ALTER_TABLES = frozenset({"donors", "tasks", "task_runs"})
+    _ALLOWED_ALTER_TABLES = frozenset(
+        {
+            "organization_profile",
+            "credential_refs",
+            "opportunities",
+            "applications",
+            "submission_attempts",
+            "donors",
+            "consent_records",
+            "communications",
+            "documents",
+            "privacy_policy_versions",
+            "audit_logs",
+            "outreach_templates",
+            "outreach_events",
+            "connector_result_cache",
+            "task_runs",
+            "task_history",
+            "dead_letter_queue",
+            "tasks",
+            "task_comments",
+            "task_comment_reads",
+            "task_notifications",
+            "translation_reviews",
+        }
+    )
     _ALLOWED_ALTER_COLUMNS = frozenset(
         {
+            "data_classification",
+            "field_classifications_json",
             "segment",
             "locale",
             "external_id",
@@ -2971,6 +3419,34 @@ class FundingBot:
         if commit:
             self.connection.commit()
 
+    @staticmethod
+    def _serialize_task_run(row: sqlite3.Row) -> dict[str, Any]:
+        task_run = dict(row)
+        task_run["payload"] = json.loads(task_run.pop("payload_json") or "{}")
+        result_json = task_run.pop("result_json")
+        task_run["result"] = json.loads(result_json) if result_json else None
+        callback_payload_json = task_run.pop("callback_payload_json")
+        task_run["callback_payload"] = (
+            json.loads(callback_payload_json) if callback_payload_json else None
+        )
+        task_run["shutdown_requested"] = bool(task_run.get("shutdown_requested"))
+        task_run["dead_lettered"] = bool(task_run.get("dead_lettered"))
+        return task_run
+
+    @staticmethod
+    def _serialize_task_history_row(row: sqlite3.Row) -> dict[str, Any]:
+        history = dict(row)
+        history["details"] = json.loads(history.pop("details_json") or "{}")
+        result_json = history.pop("result_json")
+        history["result"] = json.loads(result_json) if result_json else None
+        return history
+
+    @staticmethod
+    def _serialize_dead_letter_row(row: sqlite3.Row) -> dict[str, Any]:
+        record = dict(row)
+        record["payload"] = json.loads(record.pop("payload_json") or "{}")
+        return record
+
     def record_task_run(
         self,
         task_id: str,
@@ -2984,11 +3460,22 @@ class FundingBot:
         error_message: str | None = None,
         callback_name: str | None = None,
         callback_payload: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        worker_id: str | None = None,
+        duplicate_requests: int = 0,
+        shutdown_requested: bool = False,
+        retry_limit: int | None = None,
+        attempts: int = 0,
+        backoff_seconds: float | None = None,
+        backoff_max_seconds: float | None = None,
+        dead_lettered: bool = False,
+        last_attempt_at: datetime | str | None = None,
+        next_retry_at: datetime | str | None = None,
         completed_at: datetime | None = None,
     ) -> dict[str, Any]:
         now = self._to_iso()
         existing = self.connection.execute(
-            "SELECT created_at, completed_at FROM task_runs WHERE task_id = ?",
+            "SELECT created_at, completed_at, duplicate_requests FROM task_runs WHERE task_id = ?",
             (task_id,),
         ).fetchone()
         created_at = existing["created_at"] if existing else now
@@ -2997,13 +3484,30 @@ class FundingBot:
             if completed_at is not None
             else (existing["completed_at"] if existing else None)
         )
+        normalized_retry_limit = (
+            self.DEFAULT_QUEUE_RETRY_LIMIT if retry_limit is None else max(0, int(retry_limit))
+        )
+        normalized_attempts = max(0, int(attempts))
+        normalized_backoff_seconds = (
+            self.DEFAULT_QUEUE_RETRY_BACKOFF_SECONDS
+            if backoff_seconds is None
+            else max(0.0, float(backoff_seconds))
+        )
+        normalized_backoff_max_seconds = (
+            self.DEFAULT_QUEUE_RETRY_BACKOFF_MAX_SECONDS
+            if backoff_max_seconds is None
+            else max(normalized_backoff_seconds, float(backoff_max_seconds))
+        )
         self.connection.execute(
             """
             INSERT INTO task_runs (
                 task_id, task_name, status, progress, message, payload_json,
                 result_json, error_message, callback_name, callback_payload_json,
+                idempotency_key, worker_id, duplicate_requests, shutdown_requested,
+                retry_limit, attempts, backoff_seconds, backoff_max_seconds,
+                dead_lettered, last_attempt_at, next_retry_at,
                 created_at, updated_at, completed_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(task_id) DO UPDATE SET
                 task_name = excluded.task_name,
                 status = excluded.status,
@@ -3014,6 +3518,17 @@ class FundingBot:
                 error_message = excluded.error_message,
                 callback_name = excluded.callback_name,
                 callback_payload_json = excluded.callback_payload_json,
+                idempotency_key = excluded.idempotency_key,
+                worker_id = excluded.worker_id,
+                duplicate_requests = excluded.duplicate_requests,
+                shutdown_requested = excluded.shutdown_requested,
+                retry_limit = excluded.retry_limit,
+                attempts = excluded.attempts,
+                backoff_seconds = excluded.backoff_seconds,
+                backoff_max_seconds = excluded.backoff_max_seconds,
+                dead_lettered = excluded.dead_lettered,
+                last_attempt_at = excluded.last_attempt_at,
+                next_retry_at = excluded.next_retry_at,
                 updated_at = excluded.updated_at,
                 completed_at = excluded.completed_at
             """,
@@ -3030,6 +3545,24 @@ class FundingBot:
                 json.dumps(callback_payload, sort_keys=True)
                 if callback_payload is not None
                 else None,
+                idempotency_key or task_id,
+                worker_id,
+                max(
+                    duplicate_requests,
+                    int(existing["duplicate_requests"] or 0) if existing else 0,
+                ),
+                int(shutdown_requested),
+                normalized_retry_limit,
+                normalized_attempts,
+                normalized_backoff_seconds,
+                normalized_backoff_max_seconds,
+                int(dead_lettered),
+                self._to_iso(last_attempt_at)
+                if isinstance(last_attempt_at, datetime)
+                else last_attempt_at,
+                self._to_iso(next_retry_at)
+                if isinstance(next_retry_at, datetime)
+                else next_retry_at,
                 created_at,
                 now,
                 finished_at,
@@ -3040,14 +3573,14 @@ class FundingBot:
             "SELECT * FROM task_runs WHERE task_id = ?",
             (task_id,),
         ).fetchone()
-        return dict(row) if row else {}
+        return self._serialize_task_run(row) if row else {}
 
     def get_task_run(self, task_id: str) -> dict[str, Any] | None:
         row = self.connection.execute(
             "SELECT * FROM task_runs WHERE task_id = ?",
             (task_id,),
         ).fetchone()
-        return dict(row) if row else None
+        return self._serialize_task_run(row) if row else None
 
     def list_task_runs(
         self,
@@ -3065,7 +3598,425 @@ class FundingBot:
             query += " LIMIT ?"
             params.append(limit)
         rows = self.connection.execute(query, params).fetchall()
-        return [dict(row) for row in rows]
+        return [self._serialize_task_run(row) for row in rows]
+
+    def _load_queue_retry_config(
+        self,
+        *,
+        retry_limit: int | None = None,
+        backoff_seconds: float | None = None,
+        backoff_max_seconds: float | None = None,
+    ) -> dict[str, float | int]:
+        configured_retry_limit = (
+            self.DEFAULT_QUEUE_RETRY_LIMIT if retry_limit is None else int(retry_limit)
+        )
+        configured_backoff_seconds = (
+            self.DEFAULT_QUEUE_RETRY_BACKOFF_SECONDS
+            if backoff_seconds is None
+            else float(backoff_seconds)
+        )
+        configured_backoff_max_seconds = (
+            self.DEFAULT_QUEUE_RETRY_BACKOFF_MAX_SECONDS
+            if backoff_max_seconds is None
+            else float(backoff_max_seconds)
+        )
+        if configured_retry_limit < 0:
+            raise ValueError("retry_limit must be zero or greater.")
+        if configured_backoff_seconds <= 0:
+            raise ValueError("backoff_seconds must be greater than zero.")
+        if configured_backoff_max_seconds < configured_backoff_seconds:
+            raise ValueError(
+                "backoff_max_seconds must be greater than or equal to backoff_seconds."
+            )
+        return {
+            "retry_limit": configured_retry_limit,
+            "backoff_seconds": configured_backoff_seconds,
+            "backoff_max_seconds": configured_backoff_max_seconds,
+        }
+
+    @staticmethod
+    def _calculate_retry_delay(
+        attempt_number: int,
+        *,
+        backoff_seconds: float,
+        backoff_max_seconds: float,
+    ) -> float:
+        return min(backoff_seconds * (2 ** max(0, attempt_number - 1)), backoff_max_seconds)
+
+    def _record_task_history(
+        self,
+        *,
+        task_id: str,
+        task_name: str,
+        attempt_number: int,
+        status: str,
+        happened_at: datetime | str | None = None,
+        backoff_seconds: float | None = None,
+        next_retry_at: datetime | str | None = None,
+        result: Any = None,
+        error_message: str | None = None,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        normalized_happened_at = self._to_iso(happened_at) if isinstance(happened_at, datetime) else (
+            happened_at or self._to_iso()
+        )
+        normalized_next_retry_at = (
+            self._to_iso(next_retry_at)
+            if isinstance(next_retry_at, datetime)
+            else next_retry_at
+        )
+        self.connection.execute(
+            """
+            INSERT INTO task_history (
+                task_id, task_name, attempt_number, status, happened_at,
+                backoff_seconds, next_retry_at, result_json, error_message, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                task_id,
+                task_name,
+                attempt_number,
+                status,
+                normalized_happened_at,
+                backoff_seconds,
+                normalized_next_retry_at,
+                json.dumps(result, sort_keys=True, default=str) if result is not None else None,
+                error_message,
+                json.dumps(details or {}, sort_keys=True, default=str),
+            ),
+        )
+
+    def list_task_history(self, task_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT * FROM task_history WHERE task_id = ? ORDER BY attempt_number, id",
+            (task_id,),
+        ).fetchall()
+        return [self._serialize_task_history_row(row) for row in rows]
+
+    def list_dead_letter_queue(
+        self,
+        *,
+        task_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM dead_letter_queue"
+        params: list[Any] = []
+        if task_name is not None:
+            query += " WHERE task_name = ?"
+            params.append(task_name)
+        query += " ORDER BY failed_at DESC, id DESC"
+        rows = self.connection.execute(query, params).fetchall()
+        return [self._serialize_dead_letter_row(row) for row in rows]
+
+    def get_queue_metrics(self) -> dict[str, int]:
+        run_counts = self.connection.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
+                SUM(CASE WHEN dead_lettered = 1 THEN 1 ELSE 0 END) AS dead_lettered,
+                COALESCE(SUM(duplicate_requests), 0) AS duplicate_preventions
+            FROM task_runs
+            """
+        ).fetchone()
+        history_counts = self.connection.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status = 'retry_scheduled' THEN 1 ELSE 0 END) AS retries_scheduled
+            FROM task_history
+            """
+        ).fetchone()
+        return {
+            "running": int(run_counts["running"] or 0),
+            "completed": int(run_counts["completed"] or 0),
+            "failed": int(run_counts["failed"] or 0),
+            "cancelled": int(run_counts["cancelled"] or 0),
+            "dead_lettered": int(run_counts["dead_lettered"] or 0),
+            "duplicate_preventions": int(run_counts["duplicate_preventions"] or 0),
+            "retries_scheduled": int(history_counts["retries_scheduled"] or 0),
+        }
+
+    def execute_queue_task(
+        self,
+        task_name: str,
+        payload: dict[str, Any] | None,
+        task_callable: Callable[[QueueTaskContext, dict[str, Any]], Any],
+        *,
+        idempotency_key: str | None = None,
+        worker_id: str | None = None,
+        retry_limit: int | None = None,
+        backoff_seconds: float | None = None,
+        backoff_max_seconds: float | None = None,
+        sleep_func: Callable[[float], None] | None = None,
+    ) -> dict[str, Any]:
+        normalized_task_name = str(task_name).strip()
+        if not normalized_task_name:
+            raise ValueError("Task name is required.")
+        normalized_payload = dict(payload or {})
+        normalized_idempotency_key = (
+            idempotency_key
+            or hashlib.sha256(
+                (
+                    f"{normalized_task_name}|"
+                    f"{json.dumps(normalized_payload, sort_keys=True, separators=(',', ':'))}|"
+                    f"{time.monotonic_ns()}"
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        config = self._load_queue_retry_config(
+            retry_limit=retry_limit,
+            backoff_seconds=backoff_seconds,
+            backoff_max_seconds=backoff_max_seconds,
+        )
+        controller = GracefulShutdownController()
+        context = QueueTaskContext(
+            bot=self,
+            idempotency_key=normalized_idempotency_key,
+            controller=controller,
+        )
+        sleeper = sleep_func or time.sleep
+
+        self.record_task_run(
+            normalized_idempotency_key,
+            normalized_task_name,
+            status="running",
+            progress=0,
+            message="Task started.",
+            payload=normalized_payload,
+            idempotency_key=normalized_idempotency_key,
+            worker_id=worker_id,
+            retry_limit=int(config["retry_limit"]),
+            attempts=0,
+            backoff_seconds=float(config["backoff_seconds"]),
+            backoff_max_seconds=float(config["backoff_max_seconds"]),
+            dead_lettered=False,
+            next_retry_at=None,
+        )
+        self._log_action(
+            "queue_task_started",
+            task_id=normalized_idempotency_key,
+            task_name=normalized_task_name,
+            retry_limit=int(config["retry_limit"]),
+            backoff_seconds=float(config["backoff_seconds"]),
+            backoff_max_seconds=float(config["backoff_max_seconds"]),
+            worker_id=worker_id,
+        )
+
+        for attempt_number in range(1, int(config["retry_limit"]) + 2):
+            happened_at = self._utcnow()
+            try:
+                context.checkpoint("Shutdown requested before queue task execution started.")
+                result = task_callable(context, dict(normalized_payload))
+                context.checkpoint("Shutdown requested after queue task execution.")
+            except GracefulShutdownRequested as exc:
+                self._record_task_history(
+                    task_id=normalized_idempotency_key,
+                    task_name=normalized_task_name,
+                    attempt_number=attempt_number,
+                    status="cancelled",
+                    happened_at=happened_at,
+                    error_message=str(exc),
+                    details={"payload": normalized_payload},
+                )
+                task_run = self.record_task_run(
+                    normalized_idempotency_key,
+                    normalized_task_name,
+                    status="cancelled",
+                    progress=0,
+                    message=str(exc),
+                    payload=normalized_payload,
+                    error_message=str(exc),
+                    idempotency_key=normalized_idempotency_key,
+                    worker_id=worker_id,
+                    retry_limit=int(config["retry_limit"]),
+                    attempts=attempt_number,
+                    backoff_seconds=float(config["backoff_seconds"]),
+                    backoff_max_seconds=float(config["backoff_max_seconds"]),
+                    dead_lettered=False,
+                    last_attempt_at=happened_at,
+                    completed_at=happened_at,
+                )
+                self.connection.commit()
+                self._log_action(
+                    "queue_task_cancelled",
+                    task_id=normalized_idempotency_key,
+                    task_name=normalized_task_name,
+                    attempts=attempt_number,
+                )
+                return task_run
+            except Exception as exc:
+                error_message = str(exc)
+                should_retry = attempt_number <= int(config["retry_limit"])
+                retry_delay = None
+                next_retry_at = None
+                status = "failed"
+                message = "Task failed."
+                if should_retry:
+                    retry_delay = self._calculate_retry_delay(
+                        attempt_number,
+                        backoff_seconds=float(config["backoff_seconds"]),
+                        backoff_max_seconds=float(config["backoff_max_seconds"]),
+                    )
+                    next_retry_at = happened_at + timedelta(seconds=retry_delay)
+                    status = "retry_scheduled"
+                    message = (
+                        f"Task failed on attempt {attempt_number}; "
+                        f"retrying in {retry_delay:.2f} seconds."
+                    )
+                self._record_task_history(
+                    task_id=normalized_idempotency_key,
+                    task_name=normalized_task_name,
+                    attempt_number=attempt_number,
+                    status=status,
+                    happened_at=happened_at,
+                    backoff_seconds=retry_delay,
+                    next_retry_at=next_retry_at,
+                    error_message=error_message,
+                    details={"payload": normalized_payload},
+                )
+                task_run = self.record_task_run(
+                    normalized_idempotency_key,
+                    normalized_task_name,
+                    status="running" if should_retry else "failed",
+                    progress=0,
+                    message=message,
+                    payload=normalized_payload,
+                    error_message=error_message,
+                    idempotency_key=normalized_idempotency_key,
+                    worker_id=worker_id,
+                    retry_limit=int(config["retry_limit"]),
+                    attempts=attempt_number,
+                    backoff_seconds=float(config["backoff_seconds"]),
+                    backoff_max_seconds=float(config["backoff_max_seconds"]),
+                    dead_lettered=not should_retry,
+                    last_attempt_at=happened_at,
+                    next_retry_at=next_retry_at,
+                    completed_at=None if should_retry else happened_at,
+                )
+                if should_retry:
+                    self.connection.commit()
+                    self._log_action(
+                        "queue_task_retry_scheduled",
+                        task_id=normalized_idempotency_key,
+                        task_name=normalized_task_name,
+                        attempts=attempt_number,
+                        retry_limit=int(config["retry_limit"]),
+                        backoff_seconds=retry_delay,
+                        next_retry_at=self._to_iso(next_retry_at),
+                        error_message=error_message,
+                    )
+                    sleeper(retry_delay)
+                    continue
+
+                self.connection.execute(
+                    """
+                    INSERT INTO dead_letter_queue (
+                        task_id, task_name, payload_json, error_message, attempts, failed_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(task_id) DO UPDATE SET
+                        task_name = excluded.task_name,
+                        payload_json = excluded.payload_json,
+                        error_message = excluded.error_message,
+                        attempts = excluded.attempts,
+                        failed_at = excluded.failed_at
+                    """,
+                    (
+                        normalized_idempotency_key,
+                        normalized_task_name,
+                        json.dumps(normalized_payload, sort_keys=True),
+                        error_message,
+                        attempt_number,
+                        self._to_iso(happened_at),
+                    ),
+                )
+                self.connection.commit()
+                self._log_action(
+                    "queue_task_failed",
+                    task_id=normalized_idempotency_key,
+                    task_name=normalized_task_name,
+                    attempts=attempt_number,
+                    error_message=error_message,
+                    dead_lettered=True,
+                )
+                return task_run
+
+            self._record_task_history(
+                task_id=normalized_idempotency_key,
+                task_name=normalized_task_name,
+                attempt_number=attempt_number,
+                status="completed",
+                happened_at=happened_at,
+                result=result,
+                details={"payload": normalized_payload},
+            )
+            task_run = self.record_task_run(
+                normalized_idempotency_key,
+                normalized_task_name,
+                status="completed",
+                progress=100,
+                message="Task completed.",
+                payload=normalized_payload,
+                result=result if isinstance(result, dict) else {"value": result},
+                idempotency_key=normalized_idempotency_key,
+                worker_id=worker_id,
+                retry_limit=int(config["retry_limit"]),
+                attempts=attempt_number,
+                backoff_seconds=float(config["backoff_seconds"]),
+                backoff_max_seconds=float(config["backoff_max_seconds"]),
+                dead_lettered=False,
+                last_attempt_at=happened_at,
+                next_retry_at=None,
+                completed_at=happened_at,
+            )
+            self.connection.commit()
+            self._log_action(
+                "queue_task_completed",
+                task_id=normalized_idempotency_key,
+                task_name=normalized_task_name,
+                attempts=attempt_number,
+            )
+            return task_run
+
+        raise FundingBotError(
+            f"Queue task {normalized_task_name!r} did not record a terminal state."
+        )
+
+    def run_discovery_task(
+        self,
+        *,
+        connectors: Iterable[PortalConnector] | None = None,
+        keywords: Iterable[str] | None = None,
+        trusted_sources: Iterable[str] | None = None,
+        discovered_at: datetime | None = None,
+        retry_limit: int | None = None,
+        backoff_seconds: float | None = None,
+        backoff_max_seconds: float | None = None,
+        sleep_func: Callable[[float], None] | None = None,
+    ) -> dict[str, Any]:
+        connector_list = list(connectors) if connectors is not None else None
+        keyword_list = list(keywords) if keywords is not None else None
+        source_list = list(trusted_sources) if trusted_sources is not None else None
+        return self.execute_queue_task(
+            "discover_opportunities",
+            {
+                "keywords": keyword_list or [],
+                "trusted_sources": source_list or [],
+                "discovered_at": self._to_iso(discovered_at) if discovered_at else None,
+            },
+            lambda _context, _payload: {
+                "opportunities": self.run_discovery(
+                    connectors=connector_list,
+                    keywords=keyword_list,
+                    trusted_sources=source_list,
+                    discovered_at=discovered_at,
+                )
+            },
+            retry_limit=retry_limit,
+            backoff_seconds=backoff_seconds,
+            backoff_max_seconds=backoff_max_seconds,
+            sleep_func=sleep_func,
+        )
 
     @staticmethod
     def _signature_for(opportunity: dict[str, Any]) -> str:
@@ -6446,6 +7397,31 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
         help="Name of the environment variable holding the secret.",
     )
 
+    retention_policy_parser = subparsers.add_parser(
+        "set-data-retention-policy",
+        help="Persist retention windows for operational data cleanup.",
+    )
+    retention_policy_parser.add_argument("--audit-logs-days", type=int, metavar="DAYS")
+    retention_policy_parser.add_argument("--communications-days", type=int, metavar="DAYS")
+    retention_policy_parser.add_argument("--documents-days", type=int, metavar="DAYS")
+    retention_policy_parser.add_argument("--submission-attempts-days", type=int, metavar="DAYS")
+    retention_policy_parser.add_argument("--completed-tasks-days", type=int, metavar="DAYS")
+
+    retention_enforcement_parser = subparsers.add_parser(
+        "enforce-data-retention",
+        help="Delete records that exceed the configured retention windows.",
+    )
+    retention_enforcement_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Report what would be deleted without modifying data.",
+    )
+    retention_enforcement_parser.add_argument(
+        "--as-of",
+        metavar="ISO8601",
+        help="Evaluate retention as of the provided UTC timestamp.",
+    )
+
     subparsers.add_parser("show-settings", help="Print the organization profile, search settings, and credentials.")
 
     return parser
@@ -6474,6 +7450,7 @@ def _run_show_settings(bot: "FundingBot") -> None:
         {
             "organization_profile": bot.load_organization_profile(),
             "search_settings": bot.load_search_settings(),
+            "data_retention_policy": bot.load_data_retention_policy(),
         },
         indent=2,
     )
@@ -6545,6 +7522,22 @@ def main(argv: list[str] | None = None) -> None:
                 print(f"Monthly audit report written to {args.output}.")
             else:
                 print(report_json)
+        elif args.command == "set-data-retention-policy":
+            policy_updates = {
+                "audit_logs_days": args.audit_logs_days,
+                "communications_days": args.communications_days,
+                "documents_days": args.documents_days,
+                "submission_attempts_days": args.submission_attempts_days,
+                "completed_tasks_days": args.completed_tasks_days,
+            }
+            policy = bot.store_data_retention_policy(
+                {key: value for key, value in policy_updates.items() if value is not None}
+            )
+            print(json.dumps(policy, indent=2, sort_keys=True))
+        elif args.command == "enforce-data-retention":
+            as_of = datetime.fromisoformat(args.as_of) if args.as_of else None
+            report = bot.enforce_data_retention(now=as_of, dry_run=args.dry_run)
+            print(json.dumps(report, indent=2, sort_keys=True))
         elif args.command == "gdpr-self-check-report":
             report = bot.build_gdpr_compliance_report(cadence=args.cadence)
             report_json = json.dumps(report, indent=2)

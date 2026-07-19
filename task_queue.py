@@ -5,12 +5,11 @@ from dataclasses import dataclass
 from typing import Any, Callable
 from urllib.parse import urlparse
 
-from funding_bot import FundingBot, SMTPEmailSender
+from funding_bot import FundingBot, QueueTaskContext, SMTPEmailSender
 
 DEFAULT_QUEUE_NAME = "funding-bot"
 DEFAULT_BROKER_URL = "redis://redis:6379/0"
 DEFAULT_RESULT_BACKEND = "redis://redis:6379/1"
-DEFAULT_RABBITMQ_BROKER_URL = "amqp://" "guest:guest@rabbitmq:5672//"
 
 
 def _coerce_bool(value: Any, *, default: bool = False) -> bool:
@@ -173,18 +172,11 @@ def create_celery_app(config: QueueConfig | None = None) -> Any:
         backend=queue_config.result_backend,
     )
     celery_app.conf.update(
-        accept_content=["json"],
         broker_connection_retry_on_startup=True,
-        imports=("tasks.celery_tasks",),
-        result_extended=True,
-        result_serializer="json",
         task_always_eager=queue_config.task_always_eager,
         task_default_queue=queue_config.queue_name,
         task_ignore_result=False,
-        task_serializer="json",
-        enable_utc=True,
         task_track_started=True,
-        timezone="UTC",
     )
     return celery_app
 
@@ -200,25 +192,55 @@ def _with_bot(db_path: str | None, callback: Callable[[FundingBot], Any]) -> Any
         bot.close()
 
 
+def _queue_result_payload(task_run: dict[str, Any], *, mode: str = "queue", **extra: Any) -> dict[str, Any]:
+    payload = dict(task_run.get("result") or {})
+    payload.update(extra)
+    payload["mode"] = mode
+    payload["duplicate"] = bool(task_run.get("duplicate"))
+    payload["idempotency_key"] = task_run.get("idempotency_key")
+    payload["task_run"] = task_run
+    return payload
+
+
 @celery_app.task(
     bind=True,
     name="funding_bot.discover_opportunities",
     queue=load_queue_config().queue_name,
 )
 def discover_opportunities_task(
-    _: Any,
+    self: Any,
     *,
     keywords: list[str] | None = None,
     trusted_sources: list[str] | None = None,
     db_path: str | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     def _run(bot: FundingBot) -> dict[str, Any]:
-        found = bot.run_discovery(keywords=keywords, trusted_sources=trusted_sources)
-        return {
-            "mode": "queue",
-            "count": len(found),
-            "new_opportunities": found,
+        payload = {
+            "keywords": keywords or [],
+            "trusted_sources": trusted_sources or [],
         }
+
+        def _task(context: QueueTaskContext, task_payload: dict[str, Any]) -> dict[str, Any]:
+            context.checkpoint("Shutdown requested before discovery started.")
+            found = context.bot.run_discovery(
+                keywords=task_payload.get("keywords") or None,
+                trusted_sources=task_payload.get("trusted_sources") or None,
+            )
+            context.checkpoint("Shutdown requested after discovery completed.")
+            return {
+                "count": len(found),
+                "new_opportunities": found,
+            }
+
+        task_run = bot.execute_queue_task(
+            "discover_opportunities",
+            payload,
+            _task,
+            idempotency_key=idempotency_key,
+            worker_id=getattr(getattr(self, "request", None), "hostname", None),
+        )
+        return _queue_result_payload(task_run)
 
     return _with_bot(db_path, _run)
 
@@ -229,7 +251,7 @@ def discover_opportunities_task(
     queue=load_queue_config().queue_name,
 )
 def send_outreach_task(
-    _: Any,
+    self: Any,
     *,
     donor_email: str,
     donor_name: str,
@@ -237,19 +259,38 @@ def send_outreach_task(
     body_template: str,
     dry_run: bool = True,
     db_path: str | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     def _run(bot: FundingBot) -> dict[str, Any]:
-        sender = None if dry_run else SMTPEmailSender.from_env()
-        result = bot.send_outreach(
-            donor_email=donor_email,
-            donor_name=donor_name,
-            subject_template=subject_template,
-            body_template=body_template,
-            sender=sender,
+        payload = {
+            "donor_email": donor_email,
+            "donor_name": donor_name,
+            "subject_template": subject_template,
+            "body_template": body_template,
+            "dry_run": dry_run,
+        }
+
+        def _task(context: QueueTaskContext, task_payload: dict[str, Any]) -> dict[str, Any]:
+            context.checkpoint("Shutdown requested before donor outreach started.")
+            sender = None if task_payload.get("dry_run", True) else SMTPEmailSender.from_env()
+            result = context.bot.send_outreach(
+                donor_email=str(task_payload["donor_email"]),
+                donor_name=str(task_payload["donor_name"]),
+                subject_template=str(task_payload["subject_template"]),
+                body_template=str(task_payload["body_template"]),
+                sender=sender,
+            )
+            context.checkpoint("Shutdown requested after donor outreach completed.")
+            return result
+
+        task_run = bot.execute_queue_task(
+            "send_outreach",
+            payload,
+            _task,
+            idempotency_key=idempotency_key,
+            worker_id=getattr(getattr(self, "request", None), "hostname", None),
         )
-        result["dry_run"] = dry_run
-        result["mode"] = "queue"
-        return result
+        return _queue_result_payload(task_run, dry_run=dry_run)
 
     return _with_bot(db_path, _run)
 
@@ -260,18 +301,34 @@ def send_outreach_task(
     queue=load_queue_config().queue_name,
 )
 def send_daily_summary_task(
-    _: Any,
+    self: Any,
     *,
     recipient: str = "lupael@i4e.com.bd",
     dry_run: bool = False,
     db_path: str | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     def _run(bot: FundingBot) -> dict[str, Any]:
-        sender = None if dry_run else SMTPEmailSender.from_env()
-        result = bot.send_daily_summary(recipient=recipient, sender=sender)
-        result["dry_run"] = dry_run
-        result["mode"] = "queue"
-        return result
+        payload = {"recipient": recipient, "dry_run": dry_run}
+
+        def _task(context: QueueTaskContext, task_payload: dict[str, Any]) -> dict[str, Any]:
+            context.checkpoint("Shutdown requested before daily summary started.")
+            sender = None if task_payload.get("dry_run", False) else SMTPEmailSender.from_env()
+            result = context.bot.send_daily_summary(
+                recipient=str(task_payload["recipient"]),
+                sender=sender,
+            )
+            context.checkpoint("Shutdown requested after daily summary completed.")
+            return result
+
+        task_run = bot.execute_queue_task(
+            "send_daily_summary",
+            payload,
+            _task,
+            idempotency_key=idempotency_key,
+            worker_id=getattr(getattr(self, "request", None), "hostname", None),
+        )
+        return _queue_result_payload(task_run, recipient=recipient, dry_run=dry_run)
 
     return _with_bot(db_path, _run)
 
@@ -305,16 +362,23 @@ def dispatch_discovery(
     db_path: str | None = None,
 ) -> tuple[int, dict[str, Any]]:
     config = load_queue_config()
+    payload = {
+        "keywords": keywords or [],
+        "trusted_sources": trusted_sources or [],
+    }
+    idempotency_key = FundingBot.generate_idempotency_key("discover_opportunities", payload)
     if config.enable_task_queue:
         result = discover_opportunities_task.delay(
             keywords=keywords,
             trusted_sources=trusted_sources,
             db_path=db_path,
+            idempotency_key=idempotency_key,
         )
         return 202, {
             "mode": config.mode,
             "task_id": getattr(result, "id", None),
             "task_name": discover_opportunities_task.name,
+            "idempotency_key": idempotency_key,
             "legacy_cron_enabled": config.enable_legacy_cron,
         }
 
@@ -323,6 +387,7 @@ def dispatch_discovery(
         keywords=keywords,
         trusted_sources=trusted_sources,
         db_path=db_path,
+        idempotency_key=idempotency_key,
     )
     payload["mode"] = config.mode
     payload["legacy_cron_enabled"] = config.enable_legacy_cron

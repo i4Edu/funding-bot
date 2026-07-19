@@ -58,6 +58,43 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn(b"Settings", response.data)
         self.assertIn(b"Translations", response.data)
 
+    def test_dashboard_page_exposes_keyboard_shortcuts_and_focus_regions(self):
+        response = self.client.get("/dashboard", headers=self.auditor_headers)
+        self.assertEqual(200, response.status_code)
+        html = response.get_data(as_text=True)
+        self.assertIn('aria-label="Open settings page"', html)
+        self.assertIn('id="main-content" class="container py-4" tabindex="-1"', html)
+        self.assertIn('id="recent-opps-region"', html)
+        self.assertIn('Alt</kbd> + <kbd>Shift</kbd> + <kbd>O</kbd> — Focus recent opportunities', html)
+        self.assertIn('KeyO: () => focusAndScroll(document.getElementById("recent-opps-region"))', html)
+
+    def test_settings_page_includes_aria_labels_live_regions_and_shortcuts(self):
+        response = self.client.get("/settings", headers=self.admin_headers)
+        self.assertEqual(200, response.status_code)
+        html = response.get_data(as_text=True)
+        self.assertIn('aria-label="Save organization profile"', html)
+        self.assertIn('aria-label="Run donation discovery now"', html)
+        self.assertIn('aria-keyshortcuts="Alt+Shift+R"', html)
+        self.assertIn('role="status" aria-live="polite" aria-atomic="true" aria-label="Discovery results"', html)
+        self.assertIn('role="status" aria-live="polite" aria-atomic="true" aria-label="Outreach results"', html)
+        self.assertIn('Alt</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> — Focus donor outreach', html)
+
+    def test_task_dashboard_page_includes_shortcut_help(self):
+        response = self.client.get("/dashboard/tasks", headers=self.auditor_headers)
+        self.assertEqual(200, response.status_code)
+        html = response.get_data(as_text=True)
+        self.assertIn('aria-label="Open dashboard page"', html)
+        self.assertIn('id="assigned-task-list-region"', html)
+        self.assertIn('Alt</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> — Focus the assigned task list', html)
+
+    def test_settings_page_binds_keyboard_activation_for_action_buttons(self):
+        response = self.client.get("/settings", headers=self.admin_headers)
+        self.assertEqual(200, response.status_code)
+        html = response.get_data(as_text=True)
+        self.assertIn('document.querySelectorAll("[data-keyboard-click]").forEach(bindKeyboardActivation);', html)
+        self.assertIn('event.key === "Enter" || event.key === " "', html)
+        self.assertIn('KeyR: () => document.getElementById("run-discovery").click()', html)
+
     def test_update_organization_settings_requires_admin(self):
         response = self.client.post(
             "/settings/organization",

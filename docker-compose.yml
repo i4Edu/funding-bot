@@ -19,8 +19,8 @@ services:
     command:
       [
         "celery",
-        "--app",
-        "task_queue.celery_app",
+        "-A",
+        "celery_app:celery_app",
         "worker",
         "--loglevel=info",
         "--queues",
@@ -30,6 +30,7 @@ services:
       - .env
     depends_on:
       - redis
+      - rabbitmq
     volumes:
       - bot_data:/app/data
 
@@ -42,8 +43,8 @@ services:
     command:
       [
         "celery",
-        "--app",
-        "task_queue.celery_app",
+        "-A",
+        "celery_app:celery_app",
         "flower",
         "--port=5555",
       ]
@@ -51,6 +52,7 @@ services:
       - .env
     depends_on:
       - redis
+      - rabbitmq
       - worker
     ports:
       - "5555:5555"
@@ -89,6 +91,13 @@ services:
     profiles: ["queue"]
     ports:
       - "6379:6379"
+
+  rabbitmq:
+    image: rabbitmq:3-management
+    profiles: ["queue"]
+    ports:
+      - "5672:5672"
+      - "15672:15672"
 
 volumes:
   bot_data:
