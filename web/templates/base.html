@@ -1,5 +1,5 @@
 <!doctype html>
-<html lang="en">
+<html lang="{{ ui_locale.code if ui_locale is defined else 'en' }}" dir="{{ ui_locale.direction if ui_locale is defined else 'ltr' }}">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -31,12 +31,42 @@
         outline: 3px solid #0d6efd;
         outline-offset: 2px;
       }
+
+      .rtl-safe,
+      .rtl-safe th,
+      .rtl-safe td,
+      .rtl-safe input,
+      .rtl-safe textarea,
+      .rtl-safe select {
+        text-align: start;
+      }
+
+      .rtl-safe-list {
+        padding-inline-start: 1.25rem;
+      }
+
+      .rtl-safe-pre {
+        direction: inherit;
+        text-align: start;
+        unicode-bidi: plaintext;
+      }
+
+      .locale-chip {
+        font-size: 0.75rem;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      [dir="rtl"] .navbar .container-fluid,
+      [dir="rtl"] .rtl-row-reverse {
+        flex-direction: row-reverse;
+      }
     </style>
     {% block head %}{% endblock %}
   </head>
   <body class="{% block body_class %}bg-light{% endblock %}">
     <a class="skip-link" href="#main-content">Skip to main content</a>
-    <nav class="navbar navbar-expand-lg navbar-dark bg-success shadow-sm" role="navigation" aria-label="Primary navigation">
+    <nav class="navbar navbar-expand-lg navbar-dark bg-success shadow-sm rtl-safe" role="navigation" aria-label="Primary navigation">
       <div class="container-fluid">
         <span class="navbar-brand mb-0 h1">Nonprofit Funding Bot</span>
         {% block nav_links %}{% endblock %}

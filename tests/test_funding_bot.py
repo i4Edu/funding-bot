@@ -6,6 +6,8 @@ import unittest
 import unittest.mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from shutil import rmtree
+from zipfile import ZipFile
 
 from funding_bot import (
     DuplicateSubmissionError,
@@ -46,6 +48,9 @@ class FakeClock:
 class FundingBotTests(unittest.TestCase):
     def setUp(self):
         self.bot = FundingBot(trusted_sources={"Grants Portal", "CSR Network"})
+        self.output_dir = Path(".test_document_outputs")
+        if self.output_dir.exists():
+            rmtree(self.output_dir)
         self.bot.store_organization_profile(
             {
                 "name": "i4Edu",
@@ -56,6 +61,8 @@ class FundingBotTests(unittest.TestCase):
 
     def tearDown(self):
         self.bot.close()
+        if self.output_dir.exists():
+            rmtree(self.output_dir)
         os.environ.pop("PORTAL_CREDENTIALS", None)
 
     def _discover_sample_opportunity(self):
@@ -254,17 +261,16 @@ class FundingBotTests(unittest.TestCase):
             next_action="Awaiting confirmation",
         )
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            documents = self.bot.generate_document(
-                kind="cover_letter",
-                template=(
-                    "{name}\nMission: {mission}\nRegistration: {registration_number}\n"
-                    "Opportunity: UNICEF CSR Grant"
-                ),
-                output_dir=tmpdir,
-            )
-            self.assertTrue(Path(documents["pdf"]).exists())
-            self.assertTrue(Path(documents["docx"]).exists())
+        documents = self.bot.generate_document(
+            kind="cover_letter",
+            template=(
+                "{name}\nMission: {mission}\nRegistration: {registration_number}\n"
+                "Opportunity: UNICEF CSR Grant"
+            ),
+            output_dir=self.output_dir,
+        )
+        self.assertTrue(Path(documents["pdf"]).exists())
+        self.assertTrue(Path(documents["docx"]).exists())
 
         summary = self.bot.build_daily_summary(
             recipient="lupael@i4e.com.bd",
@@ -273,6 +279,54 @@ class FundingBotTests(unittest.TestCase):
         self.assertIn("Daily Nonprofit Funding Report – 2026-06-22", summary["subject"])
         self.assertIn("UNICEF CSR Grant", summary["body"])
         self.assertIn("Pending Applications: 1", summary["body"])
+
+    def test_generate_document_falls_back_to_english_translations(self):
+        documents = self.bot.generate_document(
+            kind="cover_letter",
+            template="{t[greeting]}\nBudget: {budget}\nDate: {report_date}",
+            output_dir=self.output_dir,
+            formats=("docx",),
+            locale="bn",
+            context={
+                "budget": 1250000,
+                "report_date": datetime(2026, 7, 19, 9, 30, tzinfo=timezone.utc),
+                "translations": {
+                    "en": {"greeting": "Dear Review Committee"},
+                    "bn": {},
+                },
+            },
+        )
+
+        with ZipFile(documents["docx"]) as archive:
+            document_xml = archive.read("word/document.xml").decode("utf-8")
+
+        self.assertIn("Dear Review Committee", document_xml)
+        self.assertIn("12,50,000", document_xml)
+        self.assertIn("19/07/2026 09:30", document_xml)
+
+    def test_generate_document_formats_english_locale_values(self):
+        documents = self.bot.generate_document(
+            kind="cover_letter",
+            template="{t[greeting]}\nBudget: {budget}\nDate: {report_date}",
+            output_dir=self.output_dir,
+            formats=("docx",),
+            locale="en",
+            context={
+                "budget": 1250000.5,
+                "report_date": datetime(2026, 7, 19, 9, 30, tzinfo=timezone.utc),
+                "translations": {
+                    "en": {"greeting": "Dear Review Committee"},
+                    "bn": {"greeting": "প্রিয় পর্যালোচনা কমিটি"},
+                },
+            },
+        )
+
+        with ZipFile(documents["docx"]) as archive:
+            document_xml = archive.read("word/document.xml").decode("utf-8")
+
+        self.assertIn("Dear Review Committee", document_xml)
+        self.assertIn("1,250,000.5", document_xml)
+        self.assertIn("07/19/2026 09:30", document_xml)
 
 
 class SMTPEmailSenderTests(unittest.TestCase):

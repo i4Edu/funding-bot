@@ -39,6 +39,12 @@ class SettingsPanelTests(unittest.TestCase):
         if self.db_path.exists():
             self.db_path.unlink()
         os.environ.pop("BOT_DB_PATH", None)
+        os.environ.pop("ENABLE_TASK_QUEUE", None)
+        os.environ.pop("ENABLE_LEGACY_CRON", None)
+        os.environ.pop("ENABLE_TASK_QUEUE", None)
+        os.environ.pop("CELERY_BROKER_URL", None)
+        os.environ.pop("CELERY_QUEUE_NAME", None)
+        os.environ.pop("CELERY_HEALTH_TIMEOUT_SECONDS", None)
 
     def test_settings_page_requires_authentication(self):
         response = self.client.get("/settings")
@@ -48,6 +54,24 @@ class SettingsPanelTests(unittest.TestCase):
         response = self.client.get("/settings", headers=self.auditor_headers)
         self.assertEqual(200, response.status_code)
         self.assertIn(b"Settings", response.data)
+        self.assertIn(b'class="skip-link"', response.data)
+        self.assertIn(b'href="#main-content"', response.data)
+        self.assertIn(b'id="main-content"', response.data)
+        self.assertIn(b".skip-link:focus", response.data)
+
+    def test_dashboard_page_renders_skip_link(self):
+        response = self.client.get("/dashboard", headers=self.auditor_headers)
+        self.assertEqual(200, response.status_code)
+        self.assertIn(b'class="skip-link"', response.data)
+        self.assertIn(b'href="#main-content"', response.data)
+        self.assertIn(b'id="main-content"', response.data)
+
+    def test_task_dashboard_page_renders_skip_link(self):
+        response = self.client.get("/dashboard/tasks", headers=self.auditor_headers)
+        self.assertEqual(200, response.status_code)
+        self.assertIn(b'class="skip-link"', response.data)
+        self.assertIn(b'href="#main-content"', response.data)
+        self.assertIn(b'id="main-content"', response.data)
 
     def test_update_organization_settings_requires_admin(self):
         response = self.client.post(
@@ -111,11 +135,48 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         payload = response.get_json()
         self.assertEqual(1, payload["count"])
+        self.assertEqual("cron", payload["mode"])
+        self.assertTrue(payload["legacy_cron_enabled"])
         self.assertEqual("Education Innovation Grant", payload["new_opportunities"][0]["title"])
 
     def test_run_discovery_requires_admin(self):
         response = self.client.post("/settings/discover", json={}, headers=self.auditor_headers)
         self.assertEqual(403, response.status_code)
+
+    def test_run_discovery_now_returns_task_metadata_in_queue_mode(self):
+        os.environ["ENABLE_TASK_QUEUE"] = "1"
+        os.environ["ENABLE_LEGACY_CRON"] = "1"
+
+        response = self.client.post(
+            "/settings/discover",
+            json={"keywords": ["education"]},
+            headers=self.admin_headers,
+        )
+
+        self.assertEqual(202, response.status_code)
+        payload = response.get_json()
+        self.assertEqual("hybrid", payload["mode"])
+        self.assertTrue(payload["legacy_cron_enabled"])
+        self.assertEqual("funding_bot.discover_opportunities", payload["task_name"])
+        self.assertTrue(payload["task_id"])
+
+    def test_health_endpoint_includes_queue_mode(self):
+        response = self.client.get("/health")
+
+        self.assertEqual(200, response.status_code)
+        payload = response.get_json()
+        self.assertEqual("ok", payload["status"])
+        self.assertEqual("cron", payload["queue"]["mode"])
+        self.assertFalse(payload["queue"]["queue_enabled"])
+
+    def test_queue_health_endpoint_reports_disabled_queue_mode(self):
+        response = self.client.get("/health/queue")
+
+        self.assertEqual(200, response.status_code)
+        payload = response.get_json()
+        self.assertEqual("disabled", payload["status"])
+        self.assertEqual("cron", payload["mode"])
+        self.assertEqual(0, payload["queue_depth"])
 
     def test_test_outreach_dry_run_composes_email_and_logs_it(self):
         response = self.client.post(
@@ -240,6 +301,7 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn("Timed out", response.get_json()["error"])
 
     def test_queue_health_snapshot_handles_timeout_errors(self):
+        os.environ["ENABLE_TASK_QUEUE"] = "1"
         os.environ["CELERY_BROKER_URL"] = "redis://broker.example:6379/0"
         try:
             with mock.patch.object(
@@ -257,6 +319,8 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn("Timed out while contacting the Celery broker", snapshot["error"])
 
     def test_metrics_include_queue_depth_metrics(self):
+        bot = FundingBot(db_path=str(self.db_path))
+        bot.close()
         queue_snapshot = {
             "status": "ok",
             "queue_name": "funding-bot",

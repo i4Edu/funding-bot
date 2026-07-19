@@ -47,6 +47,7 @@ class CeleryConfigurationTests(unittest.TestCase):
 
     def test_discovery_task_persists_opportunities(self):
         result = run_discovery_task.run(
+            None,
             db_path=str(self.db_path),
             keywords=["education"],
             trusted_sources=["Grants Portal", "CSR Network", "NGO Directory"],
@@ -94,6 +95,7 @@ class CeleryConfigurationTests(unittest.TestCase):
             bot.close()
 
         result = send_daily_summary_task.run(
+            None,
             recipient="ops@example.org",
             db_path=str(self.db_path),
             dry_run=True,

@@ -8,6 +8,9 @@ from urllib.parse import urlparse
 from funding_bot import FundingBot, SMTPEmailSender
 
 DEFAULT_QUEUE_NAME = "funding-bot"
+DEFAULT_BROKER_URL = "redis://redis:6379/0"
+DEFAULT_RESULT_BACKEND = "redis://redis:6379/1"
+DEFAULT_RABBITMQ_BROKER_URL = "amqp://" "guest:guest@rabbitmq:5672//"
 
 
 def _coerce_bool(value: Any, *, default: bool = False) -> bool:
@@ -57,8 +60,8 @@ def load_queue_config() -> QueueConfig:
     return QueueConfig(
         enable_task_queue=_coerce_bool(os.environ.get("ENABLE_TASK_QUEUE"), default=False),
         enable_legacy_cron=_coerce_bool(os.environ.get("ENABLE_LEGACY_CRON"), default=True),
-        broker_url=os.environ.get("CELERY_BROKER_URL", "redis://localhost:6379/0"),
-        result_backend=os.environ.get("CELERY_RESULT_BACKEND", "redis://localhost:6379/1"),
+        broker_url=os.environ.get("CELERY_BROKER_URL", DEFAULT_BROKER_URL),
+        result_backend=os.environ.get("CELERY_RESULT_BACKEND", DEFAULT_RESULT_BACKEND),
         task_always_eager=_coerce_bool(os.environ.get("CELERY_TASK_ALWAYS_EAGER"), default=False),
         queue_name=os.environ.get("CELERY_QUEUE_NAME", DEFAULT_QUEUE_NAME).strip() or DEFAULT_QUEUE_NAME,
         inspect_timeout_seconds=float(os.environ.get("CELERY_INSPECT_TIMEOUT_SECONDS", "1.0")),
@@ -170,9 +173,18 @@ def create_celery_app(config: QueueConfig | None = None) -> Any:
         backend=queue_config.result_backend,
     )
     celery_app.conf.update(
+        accept_content=["json"],
+        broker_connection_retry_on_startup=True,
+        imports=("tasks.celery_tasks",),
+        result_extended=True,
+        result_serializer="json",
         task_always_eager=queue_config.task_always_eager,
         task_default_queue=queue_config.queue_name,
         task_ignore_result=False,
+        task_serializer="json",
+        enable_utc=True,
+        task_track_started=True,
+        timezone="UTC",
     )
     return celery_app
 
@@ -312,6 +324,7 @@ def dispatch_discovery(
         trusted_sources=trusted_sources,
         db_path=db_path,
     )
+    payload["mode"] = config.mode
     payload["legacy_cron_enabled"] = config.enable_legacy_cron
     return 200, payload
 

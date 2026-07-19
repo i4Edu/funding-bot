@@ -55,6 +55,7 @@ The project is designed for nonprofit operations teams that need a lightweight w
 #### v0.2.0 — Multi-portal + engagement
 - government, CSR, and NGO portal connectors
 - donor segmentation (`corporate`, `institutional`, `individual`)
+- donor locale preferences for outreach templates (`en`, `bn`)
 - GDPR-oriented auditability and encrypted credential handling
 - personalized outreach templates with engagement metrics
 
@@ -87,11 +88,43 @@ The project is designed for nonprofit operations teams that need a lightweight w
 
 ## Installation
 
-The core bot uses the Python standard library, and the web/task-queue stack uses Flask, Celery, and the Redis client:
+The core bot uses the Python standard library plus Babel for locale-aware document formatting, and the web/task-queue stack uses Flask, Celery, and the Redis client:
 
 ```bash
 pip install -r web/requirements.txt
 ```
+
+## Document localization
+
+`FundingBot.generate_document(..., locale=...)` supports these document locales:
+
+| Locale | Purpose | Date format | Number format |
+| --- | --- | --- | --- |
+| `en` | English documents | `MM/DD/YYYY` | Western grouping, e.g. `1,250,000.5` |
+| `bn` | Bengali documents | `DD/MM/YYYY` | Bengali locale grouping, e.g. `12,50,000` |
+
+Formatting uses Babel. Template placeholders automatically localize `date`, `datetime`, `int`, `float`, and `Decimal` values from the merged profile/context.
+
+For translated copy inside templates, provide a `translations` mapping and reference it with `{t[key]}`:
+
+```python
+documents = bot.generate_document(
+    kind="cover_letter",
+    template="{t[greeting]}\nDate: {report_date}\nBudget: {budget}",
+    output_dir="generated-docs",
+    locale="bn",
+    context={
+        "report_date": datetime(2026, 7, 19, 9, 30, tzinfo=timezone.utc),
+        "budget": 1250000,
+        "translations": {
+            "en": {"greeting": "Dear Review Committee"},
+            "bn": {},
+        },
+    },
+)
+```
+
+If a translation is missing for the requested locale, document generation falls back to the English (`en`) value.
 
 ## Quick Start
 
@@ -99,6 +132,11 @@ pip install -r web/requirements.txt
 
 ```bash
 python -m unittest discover -s tests
+```
+
+```bash
+npm install
+npm run test:a11y
 ```
 
 ### Run the CLI
@@ -177,9 +215,34 @@ The dashboard is intended for v0.4.0+ operations and is already scaffolded in `w
 ### Run locally
 
 ```bash
-pip install flask
+pip install -r web/requirements.txt
 python -m flask --app web.app run
 ```
+
+### Accessibility checks
+
+The dashboard templates now share a keyboard-visible skip link through
+`web/templates/base.html`. To run automated accessibility checks locally:
+
+```bash
+pip install -r web/requirements.txt
+npm install
+npx playwright install chromium
+ADMIN_PASSWORD=admin-secret \
+STAFF_PASSWORD=staff-secret \
+AUDITOR_PASSWORD=auditor-secret \
+python -m flask --app web.app run --host 127.0.0.1 --port 5001
+```
+
+Then, in a second terminal:
+
+```bash
+npm run test:a11y
+```
+
+The accessibility runner uses `@axe-core/playwright` to scan `/dashboard`,
+`/dashboard/tasks`, and `/settings`, and exits non-zero when any axe violation is
+found. The same command runs in GitHub Actions CI.
 
 ### Dashboard screenshot
 
@@ -205,7 +268,7 @@ The dashboard uses HTTP Basic Auth. Use one of these usernames as the role name:
 | `/opportunities` | `GET` | `staff`, `admin`, `auditor` | List opportunities as JSON. |
 | `/opportunities/<signature>` | `GET` | `staff`, `admin`, `auditor` | Show one opportunity, linked application, and submission attempts. |
 | `/opportunities/<signature>/submit` | `POST` | `admin` | Record a submission result for an opportunity. |
-| `/donors` | `GET` / `POST` | `admin`, `auditor` for `GET`; `admin` for `POST` | List or upsert donor records. |
+| `/donors` | `GET` / `POST` | `admin`, `auditor` for `GET`; `admin` for `POST` | List or upsert donor records, including preferred outreach locale. |
 | `/donors/<email>/opt-out` | `POST` | `admin` | Mark a donor as opted out. |
 | `/analytics` | `GET` | `admin`, `auditor` | Return outreach analytics data. |
 | `/audit-log` | `GET` | `admin`, `auditor` | Return the latest audit log entries. |
@@ -213,13 +276,26 @@ The dashboard uses HTTP Basic Auth. Use one of these usernames as the role name:
 | `/settings/organization` | `POST` | `admin` | Update the organization profile. |
 | `/settings/search` | `POST` | `admin` | Update donation-search keyword filters and trusted sources. |
 | `/settings/credentials` | `POST` | `admin` | Register a credential alias (never exposes secret values). |
-| `/settings/discover` | `POST` | `admin` | Run every portal connector now and persist new opportunities — proves the bot can search for funding. |
+| `/settings/discover` | `POST` | `admin` | Run discovery immediately in cron mode, or enqueue it as a Celery task when `ENABLE_TASK_QUEUE=1`. |
 | `/settings/test-outreach` | `POST` | `admin` | Compose (dry-run) or send a donor outreach email — proves the bot can communicate with donors. |
 | `/tasks/<id>/status` | `POST` | `staff`, `admin`, `auditor` | Transition a task through `todo`, `in-progress`, `blocked`, and `done` with state-machine validation. |
 | `/feedback` | `POST` | `staff`, `admin` | Submit partner feature-request or bug-report feedback. |
 | `/metrics` | `GET` | `admin`, `auditor` | Prometheus-compatible text metrics for Grafana scraping, including task totals and status counts. |
-| `/health` | `GET` | Public | Health-check endpoint. |
-| `/health/queue` | `GET` | Public | Queue health snapshot including active tasks, pending depth, and worker status. |
+| `/health` | `GET` | Public | Health-check endpoint with embedded queue mode and queue-health snapshot. |
+| `/health/queue` | `GET` | Public | Queue health snapshot including queue depth, worker status, and cron/queue migration mode. |
+
+### Keyboard navigation and screen reader checks
+
+The dashboard pages keep a predictable tab order based on the visible layout and add shortcut help directly in the UI.
+
+- `Tab` / `Shift+Tab` move through links, forms, and action buttons in page order.
+- `Enter` and `Space` activate dashboard action buttons, including the settings proof actions.
+- Global shortcuts: `Alt+Shift+D` (dashboard), `Alt+Shift+S` (settings), `Alt+Shift+M` (main content), `Alt+Shift+K` (keyboard shortcut help).
+- Dashboard shortcuts: `Alt+Shift+O` focuses recent opportunities and `Alt+Shift+A` focuses recent applications.
+- Settings shortcuts: `Alt+Shift+O` focuses organization profile, `Alt+Shift+F` focuses donation search settings, `Alt+Shift+C` focuses credential aliases, `Alt+Shift+R` runs discovery, and `Alt+Shift+T` focuses donor outreach.
+- Screen reader QA should confirm landmarks, headings, live-region status messages, and the keyboard shortcut help card on both `/dashboard` and `/settings`.
+
+Automated accessibility coverage lives in `tests/test_web_app.py` and checks ARIA labels, live regions, keyboard bindings, and shortcut documentation.
 
 ### Prometheus metrics
 
@@ -244,14 +320,22 @@ The `/metrics` endpoint exposes the following gauges and counters in the Prometh
 
 Add a scrape target pointing to `http://<host>:5000/metrics` in your Prometheus configuration or Grafana Agent config, and authenticate with an `admin` or `auditor` dashboard role.
 
+## Outreach template translations
+
+- Store built-in outreach template catalogs in `i18n/outreach_templates/` as UTF-8 JSON files.
+- Keep matching template keys in `en.json` and `bn.json` so every locale can render the same outreach flows.
+- Save each donor's preferred `locale` on the donor profile; outreach composition uses that preference to pick the built-in template automatically.
+- One-off subject/body overrides still work and keep the locale-aware Bengali or English opt-out notice.
+
 ### Queue health monitoring
 
 Set the optional queue-monitoring environment variables when Celery is enabled:
 
 ```bash
+export ENABLE_TASK_QUEUE=1
 export CELERY_BROKER_URL=redis://redis:6379/0
-export CELERY_RESULT_BACKEND=redis://redis:6379/0
-export CELERY_QUEUE_NAME=celery
+export CELERY_RESULT_BACKEND=redis://redis:6379/1
+export CELERY_QUEUE_NAME=funding-bot
 export CELERY_HEALTH_TIMEOUT_SECONDS=2.0
 ```
 
@@ -260,7 +344,7 @@ export CELERY_HEALTH_TIMEOUT_SECONDS=2.0
 ```json
 {
   "status": "ok",
-  "queue_name": "celery",
+  "queue_name": "funding-bot",
   "broker_reachable": true,
   "timeout_seconds": 2.0,
   "active_tasks": 2,
@@ -282,7 +366,7 @@ export CELERY_HEALTH_TIMEOUT_SECONDS=2.0
 Possible `status` values:
 
 - `ok`: broker reachable and worker/task metrics collected
-- `disabled`: queue monitoring not configured (`CELERY_BROKER_URL` missing)
+- `disabled`: queue mode is not enabled (`ENABLE_TASK_QUEUE=0`)
 - `degraded`: broker unreachable, Celery unavailable, or the health probe timed out
 
 When `status` is `degraded`, the endpoint responds with HTTP `503` and includes an `error` field describing the timeout or broker failure.
@@ -342,7 +426,7 @@ The repository includes a `Dockerfile` and `docker-compose.yml`.
    cp .env.example .env
    ```
 
-2. Update values in `.env` for SMTP credentials, database path, and dashboard passwords.
+2. Update values in `.env` for SMTP credentials, database path, dashboard passwords, and queue flags.
 3. Start the stack:
 
    ```bash
@@ -352,6 +436,7 @@ The repository includes a `Dockerfile` and `docker-compose.yml`.
 The Compose stack runs:
 - a CLI container for bot jobs
 - a Flask web container on `http://localhost:5000`
+- optional `redis`, `worker`, and `flower` services when started with the `queue` profile
 - a shared volume for SQLite data at `/app/data`
 
 ## Kubernetes Deployment
@@ -366,7 +451,7 @@ Recommended secret/config inputs:
 
 - SMTP settings: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_USE_TLS`, `SMTP_FROM`
 - dashboard auth: `ADMIN_PASSWORD`, `STAFF_PASSWORD`, `AUDITOR_PASSWORD`
-- persistence/runtime: `BOT_DB_PATH`
+- persistence/runtime: `BOT_DB_PATH`, `ENABLE_TASK_QUEUE`, `ENABLE_LEGACY_CRON`, `CELERY_BROKER_URL`, `CELERY_RESULT_BACKEND`
 
 Use a `CronJob` for scheduled summary delivery and a `Deployment`/`Service` pair for the dashboard. If the `k8s/` manifests are not yet present in your branch, treat this as the target structure for the scaling release.
 
@@ -391,18 +476,23 @@ Celery is the preferred replacement for cron for new asynchronous work in this r
 | --- | --- | --- |
 | `CELERY_BROKER_URL` | `redis://redis:6379/0` | Primary broker URL. Use the RabbitMQ example below to switch brokers. |
 | `CELERY_RESULT_BACKEND` | `redis://redis:6379/1` | Result backend for task metadata and task return values. |
-| `CELERY_DEFAULT_QUEUE` | `funding-bot` | Default queue name for funding bot workers. |
+| `ENABLE_TASK_QUEUE` | `0` | Enable Celery-backed async task execution. |
+| `ENABLE_LEGACY_CRON` | `1` | Keep legacy cron scheduling active during queue migration. |
+| `CELERY_QUEUE_NAME` | `funding-bot` | Default queue name for funding bot workers. |
+| `ENABLE_TASK_QUEUE` | `0` in code / `1` in `.env.example` | Enables queue-backed execution paths. |
+| `ENABLE_LEGACY_CRON` | `1` | Keeps the legacy CLI/cron path available during migration. |
+| `CELERY_TASK_ALWAYS_EAGER` | `0` | Execute queued work inline for tests and local debugging. |
 
 RabbitMQ broker example:
 
 ```bash
-export CELERY_BROKER_URL=******rabbitmq:5672//
+export CELERY_BROKER_URL=amqp://<user>:<password>@rabbitmq:5672//
 ```
 
 ### Running the worker
 
 ```bash
-celery -A celery_app:celery_app worker --loglevel=info --queues funding-bot
+celery --app task_queue.celery_app worker --loglevel=info --queues funding-bot
 ```
 
 ### Docker Compose brokers
@@ -410,24 +500,28 @@ celery -A celery_app:celery_app worker --loglevel=info --queues funding-bot
 `docker-compose.yml` now includes:
 
 - `redis` as the default Celery broker and result backend
-- `rabbitmq` as an alternate broker option
-- `worker` running `celery_app:celery_app`
+- `worker` running `task_queue.celery_app`
+- `flower` for queue monitoring on port `5555`
 
 Start the stack with:
 
 ```bash
-docker compose up --build
+docker compose --profile queue up --build
 ```
 
 ### Legacy cron fallback
 
 Cron can remain as a migration fallback while queue-backed workers are introduced:
 
+- `ENABLE_TASK_QUEUE=0`, `ENABLE_LEGACY_CRON=1` → legacy cron only
+- `ENABLE_TASK_QUEUE=1`, `ENABLE_LEGACY_CRON=1` → hybrid migration mode
+- `ENABLE_TASK_QUEUE=1`, `ENABLE_LEGACY_CRON=0` → queue-first mode
+
 ```cron
 0 9 * * * cd /path/to/funding-bot && python -m funding_bot send-daily-summary
 ```
 
-For Kubernetes deployments, mirror either the legacy CLI schedule with a `CronJob` or the new worker model with a Celery-compatible broker deployment.
+For Kubernetes deployments, mirror either the legacy CLI schedule with a `CronJob` or the new worker model with a Celery-compatible broker deployment. See [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) for full worker, Flower, scaling, and migration guidance.
 
 ## Partner Onboarding
 

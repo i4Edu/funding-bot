@@ -26,6 +26,8 @@ WORKDIR /app
 # __pycache__/, *.pyc, .git/, *.db, tests/, and .env.
 COPY funding_bot.py /app/funding_bot.py
 COPY task_queue.py /app/task_queue.py
+COPY celery_app.py /app/celery_app.py
+COPY tasks /app/tasks
 COPY web /app/web
 
 RUN mkdir -p /app/data && chown -R botuser:botuser /app

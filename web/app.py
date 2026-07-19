@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from funding_bot import (  # noqa: E402
+    DEFAULT_LOCALE_CODE,
     DuplicateSubmissionError,
     FundingBot,
     FundingBotError,
@@ -34,6 +35,16 @@ app = Flask(__name__, template_folder=str(Path(__file__).resolve().parent / "tem
 app.config["JSON_SORT_KEYS"] = False
 MAX_FEEDBACK_MESSAGE_LENGTH = 2000
 DEFAULT_CELERY_HEALTH_TIMEOUT_SECONDS = 2.0
+TASK_SORT_OPTIONS = (
+    ("updated_at", "Recently updated"),
+    ("-updated_at", "Least recently updated"),
+    ("assignee", "Assignee (A-Z)"),
+    ("-assignee", "Assignee (Z-A)"),
+    ("status", "Status (A-Z)"),
+    ("-status", "Status (Z-A)"),
+    ("due_date", "Due date (earliest first)"),
+    ("-due_date", "Due date (latest first)"),
+)
 
 ROLE_PASSWORD_ENV_VARS = {
     "admin": "ADMIN_PASSWORD",
@@ -173,6 +184,13 @@ def _serialize_task(row: Any) -> dict[str, Any]:
     return dict(row)
 
 
+def _serialize_translation_review(review: Any) -> dict[str, Any]:
+    data = dict(review)
+    if "locale_metadata" not in data:
+        data["locale_metadata"] = _bot().get_locale_definition(data.get("locale"))
+    return data
+
+
 def _fetch_opportunity(signature: str) -> dict[str, Any]:
     row = _bot().connection.execute(
         "SELECT * FROM opportunities WHERE signature = ?",
@@ -195,6 +213,59 @@ def _get_request_json() -> dict[str, Any]:
     return payload
 
 
+def _normalize_optional_query_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _task_filter_args() -> tuple[dict[str, str | None], bool]:
+    current_role = getattr(g, "current_role", None)
+    requested_assignee = _normalize_optional_query_value(request.args.get("assignee"))
+    normalized_assignee = requested_assignee.lower() if requested_assignee else None
+    if current_role not in {"admin", "auditor"}:
+        if normalized_assignee and normalized_assignee != current_role:
+            return {}, True
+        normalized_assignee = current_role
+
+    status = _normalize_optional_query_value(request.args.get("status"))
+    due_date_before = _normalize_optional_query_value(request.args.get("due_date_before"))
+    due_date_after = _normalize_optional_query_value(request.args.get("due_date_after"))
+    sort = _normalize_optional_query_value(request.args.get("sort")) or "updated_at"
+    return {
+        "assignee": normalized_assignee,
+        "status": status,
+        "due_date_before": due_date_before,
+        "due_date_after": due_date_after,
+        "sort": sort,
+    }, False
+
+
+def _task_status_counts(tasks: list[dict[str, Any]]) -> dict[str, int]:
+    counts = {status: 0 for status in FundingBot.TASK_STATUSES}
+    for task in tasks:
+        status = str(task.get("status", ""))
+        if status in counts:
+            counts[status] += 1
+    return counts
+
+
+def _task_assignee_options() -> list[str]:
+    rows = _bot().connection.execute(
+        "SELECT DISTINCT assigned_to FROM tasks WHERE assigned_to != '' ORDER BY assigned_to COLLATE NOCASE ASC"
+    ).fetchall()
+    return [str(row["assigned_to"]) for row in rows]
+
+
+def _resolve_ui_locale() -> dict[str, Any]:
+    requested_locale = request.args.get("locale", DEFAULT_LOCALE_CODE)
+    try:
+        return _bot().get_locale_definition(requested_locale)
+    except ValueError:
+        return _bot().get_locale_definition(DEFAULT_LOCALE_CODE)
+
+
 def _dashboard_context() -> dict[str, Any]:
     now = datetime.now(timezone.utc)
     recent_cutoff = (now - timedelta(days=7)).isoformat()
@@ -212,6 +283,9 @@ def _dashboard_context() -> dict[str, Any]:
     ).fetchone()[0]
     donor_communications_count = _bot().connection.execute(
         "SELECT COUNT(*) FROM communications",
+    ).fetchone()[0]
+    pending_translation_reviews_count = _bot().connection.execute(
+        "SELECT COUNT(*) FROM translation_reviews WHERE status = 'pending'",
     ).fetchone()[0]
 
     recent_opportunities = [
@@ -248,24 +322,40 @@ def _dashboard_context() -> dict[str, Any]:
         "applications_submitted_count": applications_submitted_count,
         "pending_applications_count": pending_applications_count,
         "donor_communications_count": donor_communications_count,
+        "pending_translation_reviews_count": pending_translation_reviews_count,
         "my_tasks_count": sum(my_task_counts.values()),
         "my_open_tasks_count": sum(
             count for status, count in my_task_counts.items() if status != "done"
         ),
         "recent_opportunities": recent_opportunities,
         "recent_applications": recent_applications,
+        "ui_locale": _resolve_ui_locale(),
     }
 
 
-def _task_dashboard_context() -> dict[str, Any]:
+def _task_dashboard_context(filters: dict[str, str | None]) -> dict[str, Any]:
     current_role = getattr(g, "current_role", None)
-    tasks = [_serialize_task(task) for task in _bot().list_tasks(assigned_to=current_role)]
-    counts = _bot().get_task_status_counts(assigned_to=current_role)
+    tasks = [
+        _serialize_task(task)
+        for task in _bot().list_tasks(
+            assigned_to=filters["assignee"],
+            status=filters["status"],
+            due_date_before=filters["due_date_before"],
+            due_date_after=filters["due_date_after"],
+            sort=filters["sort"],
+        )
+    ]
+    counts = _task_status_counts(tasks)
     return {
         "current_role": current_role,
         "tasks": tasks,
         "task_counts": counts,
-        "total_tasks": sum(counts.values()),
+        "total_tasks": len(tasks),
+        "task_filters": filters,
+        "task_sort_options": TASK_SORT_OPTIONS,
+        "task_assignee_options": _task_assignee_options(),
+        "can_filter_all_assignees": current_role in {"admin", "auditor"},
+        "ui_locale": _resolve_ui_locale(),
     }
 
 
@@ -298,7 +388,7 @@ def _create_celery_health_app() -> Any:
 
 
 def _fetch_celery_queue_snapshot() -> dict[str, Any]:
-    queue_name = os.environ.get("CELERY_QUEUE_NAME", "celery")
+    queue_name = os.environ.get("CELERY_QUEUE_NAME", "funding-bot")
     timeout_seconds = _queue_health_timeout_seconds()
     celery_app = _create_celery_health_app()
     inspect = celery_app.control.inspect(timeout=timeout_seconds)
@@ -488,8 +578,27 @@ def dashboard() -> str:
 
 @app.get("/dashboard/tasks")
 @require_role("staff", "admin", "auditor")
-def dashboard_tasks() -> str:
-    return render_template("tasks.html", **_task_dashboard_context())
+def dashboard_tasks() -> Response | str:
+    filters, forbidden = _task_filter_args()
+    if forbidden:
+        return _json_error("Forbidden", 403)
+    return render_template("tasks.html", **_task_dashboard_context(filters))
+
+
+@app.get("/tasks")
+@require_role("staff", "admin", "auditor")
+def list_tasks_route() -> Response:
+    filters, forbidden = _task_filter_args()
+    if forbidden:
+        return _json_error("Forbidden", 403)
+    tasks = _bot().list_tasks(
+        assigned_to=filters["assignee"],
+        status=filters["status"],
+        due_date_before=filters["due_date_before"],
+        due_date_after=filters["due_date_after"],
+        sort=filters["sort"],
+    )
+    return jsonify([_serialize_task(task) for task in tasks])
 
 
 @app.get("/opportunities")
@@ -641,8 +750,89 @@ def settings_page() -> str:
         "credentials": bot.list_credentials(),
         "smtp_configured": smtp_configured,
         "smtp_host": os.environ.get("SMTP_HOST", ""),
+        "ui_locale": _resolve_ui_locale(),
+        "supported_locales": bot.list_locale_definitions(),
     }
     return render_template("settings.html", **context)
+
+
+@app.get("/translations")
+@require_role("staff", "admin", "auditor")
+def translation_review_dashboard() -> str:
+    bot = _bot()
+    status = request.args.get("status")
+    locale = request.args.get("review_locale")
+    reviews = [
+        _serialize_translation_review(review)
+        for review in bot.list_translation_reviews(
+            status=status or None,
+            locale=locale or None,
+        )
+    ]
+    counts = {
+        "pending": len([review for review in reviews if review["status"] == "pending"]),
+        "approved": len([review for review in reviews if review["status"] == "approved"]),
+        "rejected": len([review for review in reviews if review["status"] == "rejected"]),
+    }
+    return render_template(
+        "translations.html",
+        current_role=getattr(g, "current_role", None),
+        reviews=reviews,
+        review_counts=counts,
+        selected_status=status or "",
+        selected_review_locale=locale or "",
+        ui_locale=_resolve_ui_locale(),
+        supported_locales=bot.list_locale_definitions(),
+    )
+
+
+@app.get("/translations/locales")
+@require_role("staff", "admin", "auditor")
+def translation_locales() -> Response:
+    return jsonify({"locales": _bot().list_locale_definitions()})
+
+
+@app.get("/translations/reviews")
+@require_role("staff", "admin", "auditor")
+def list_translation_reviews() -> Response:
+    status = request.args.get("status")
+    locale = request.args.get("locale")
+    reviews = [
+        _serialize_translation_review(review)
+        for review in _bot().list_translation_reviews(
+            status=status or None,
+            locale=locale or None,
+        )
+    ]
+    return jsonify({"reviews": reviews, "count": len(reviews)})
+
+
+@app.post("/translations/reviews")
+@require_role("staff", "admin")
+def create_translation_review() -> Response:
+    payload = _get_request_json()
+    review = _bot().submit_translation_review(
+        locale=str(payload.get("locale", "")),
+        translation_key=str(payload.get("translation_key", "")),
+        source_text=str(payload.get("source_text", "")),
+        translated_text=str(payload.get("translated_text", "")),
+        submitter_notes=payload.get("submitter_notes"),
+        submitted_by_role=getattr(g, "current_role", None),
+    )
+    return jsonify(_serialize_translation_review(review)), 201
+
+
+@app.post("/translations/reviews/<int:review_id>/decision")
+@require_role("staff", "admin")
+def decide_translation_review(review_id: int) -> Response:
+    payload = _get_request_json()
+    review = _bot().review_translation(
+        review_id,
+        status=str(payload.get("status", "")),
+        reviewer_notes=payload.get("reviewer_notes"),
+        reviewed_by_role=getattr(g, "current_role", None),
+    )
+    return jsonify(_serialize_translation_review(review))
 
 
 @app.post("/settings/organization")

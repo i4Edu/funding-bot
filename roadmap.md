@@ -43,7 +43,7 @@
 - **Horizontal Scaling** with container orchestration (Docker + Kubernetes) ✅ (`Dockerfile`, `docker-compose.yml`, `k8s/`)
 - **Monitoring** (Prometheus, Grafana dashboards) ✅ (`/metrics` endpoint)
 - **Resilience** with retry/backoff policies ✅ (`submit_application_via_browser` retries)
-- **Multi‑Language Outreach** (English + Bengali templates) — _still open_
+- **Multi‑Language Outreach** (English + Bengali templates) ✅ (`i18n/outreach_templates/` + donor locale-aware outreach selection)
 
 ---
 
@@ -63,5 +63,4 @@
 - **Community Collaboration** across NGOs  
 
 ---
-
 

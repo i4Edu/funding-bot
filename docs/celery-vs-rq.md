@@ -27,7 +27,7 @@ Reasons:
 
 - Default broker: `redis://redis:6379/0`
 - Default result backend: `redis://redis:6379/1`
-- Optional RabbitMQ broker override: `******rabbitmq:5672//`
+- Optional RabbitMQ broker override: `amqp://<user>:<password>@rabbitmq:5672//`
 - App entry point: `celery_app:celery_app`
 - Task module: `tasks/celery_tasks.py`
 

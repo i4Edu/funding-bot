@@ -222,15 +222,15 @@ _A prioritized backlog of 200 actionable tasks expanding on the open items in `r
 
 ### Multi-Language Outreach
 
-36. [ ] Add Bengali translations for outreach email templates
-37. [ ] Add a template locale selection mechanism keyed by donor preference
+36. [x] Add Bengali translations for outreach email templates
+37. [x] Add a template locale selection mechanism keyed by donor preference
 38. [ ] Add fallback to English when a translation is missing
 39. [ ] Add locale-aware date/number formatting in generated documents
 40. [ ] Add a translation review workflow for staff to approve new locale content
 41. [ ] Add RTL-safe rendering checks for future Arabic/Urdu support
-42. [ ] Add locale field to donor profile schema
+42. [x] Add locale field to donor profile schema
 43. [ ] Add CLI option to preview outreach templates in a given locale
-44. [ ] Add automated tests validating all templates render for every supported locale
+44. [x] Add automated tests validating all templates render for every supported locale
 45. [x] Document the process for contributing new language templates
 
 ### Collaboration Tools

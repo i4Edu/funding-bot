@@ -121,6 +121,33 @@ def _extract_dict_keys(value: Any) -> list[str]:
     return sorted(str(field) for field in value)
 
 
+class _DocumentTranslationLookup:
+    """Template translation lookup with English fallback."""
+
+    def __init__(
+        self,
+        *,
+        bot: "FundingBot",
+        locale: str,
+        translations: dict[str, dict[str, Any]],
+    ) -> None:
+        self._bot = bot
+        self._locale = locale
+        self._translations = translations
+
+    def __getitem__(self, key: str) -> str:
+        for locale_name in (self._locale, "en"):
+            locale_translations = self._translations.get(locale_name, {})
+            if key in locale_translations:
+                return str(
+                    self._bot._format_document_value(
+                        locale_translations[key],
+                        locale=self._locale,
+                    )
+                )
+        raise KeyError(key)
+
+
 def _normalize_text_list(values: Iterable[Any] | None) -> list[str]:
     """Normalize strings while preserving first-seen order."""
     normalized: list[str] = []
@@ -135,6 +162,31 @@ def _normalize_text_list(values: Iterable[Any] | None) -> list[str]:
         normalized.append(item)
         seen.add(lowered)
     return normalized
+
+
+def _normalize_connector_key(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+
+
+def _read_numeric_env(
+    names: Iterable[str],
+    default: float,
+    *,
+    minimum: float | None = None,
+    as_int: bool = False,
+) -> float | int:
+    for name in names:
+        raw_value = os.environ.get(name)
+        if raw_value is None:
+            continue
+        try:
+            parsed = int(raw_value) if as_int else float(raw_value)
+        except ValueError:
+            continue
+        if minimum is not None and parsed < minimum:
+            return int(default) if as_int else default
+        return parsed
+    return int(default) if as_int else default
 
 
 class _TTLCache:
@@ -185,6 +237,54 @@ def _parse_secret_payload(raw_value: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         pass
     return {"secret": raw_value}
+
+@staticmethod
+def _normalize_connector_configs(
+    connector_configs: dict[str, Any] | list[dict[str, Any]] | None,
+) -> dict[str, Any]:
+    if connector_configs is None:
+        return {"connectors": []}
+    if isinstance(connector_configs, list):
+        return {"connectors": [dict(item) for item in connector_configs]}
+    if isinstance(connector_configs, dict):
+        normalized = dict(connector_configs)
+        if "connectors" in normalized:
+            normalized["connectors"] = [dict(item) for item in normalized.get("connectors", [])]
+        return normalized
+    raise ConnectorConfigError("Connector configuration must be a dict or list of connector entries.")
+
+def _load_connector_configs(
+    self,
+    connector_configs: dict[str, Any] | list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    if connector_configs is not None:
+        normalized = self._normalize_connector_configs(connector_configs)
+    else:
+        raw_config = os.environ.get(CONNECTOR_CONFIG_ENV_VAR, "").strip()
+        if not raw_config:
+            return []
+        try:
+            parsed = json.loads(raw_config)
+        except json.JSONDecodeError as exc:
+            raise ConnectorConfigError(
+                f"Invalid {CONNECTOR_CONFIG_ENV_VAR} JSON: {exc.msg} at line {exc.lineno} column {exc.colno}."
+            ) from exc
+        normalized = self._normalize_connector_configs(parsed)
+
+    try:
+        validate(instance=normalized, schema=CONNECTOR_CONFIG_SCHEMA)
+    except ValidationError as exc:
+        path = ".".join(str(part) for part in exc.path)
+        field = f" at {path}" if path else ""
+        raise ConnectorConfigError(f"Invalid connector configuration{field}: {exc.message}") from exc
+    return [dict(item) for item in normalized.get("connectors", [])]
+
+def _validate_connector_configs(self) -> None:
+    for config in self.connector_configs:
+        self.connector_registry.validate_config(
+            config,
+            credential_resolver=self.resolve_credential,
+        )
 
 
 def _prometheus_label_value(value: str) -> str:
@@ -286,6 +386,10 @@ class FundingBotError(Exception):
     """Base error for funding bot operations."""
 
 
+class RateLimitExceededError(FundingBotError):
+    """Raised when a connector exhausts its allotted upstream quota."""
+
+
 class DuplicateSubmissionError(FundingBotError):
     """Raised when an opportunity already has an application record."""
 
@@ -300,6 +404,10 @@ class CredentialNotFoundError(FundingBotError):
 
 class ConnectorConfigError(FundingBotError):
     """Raised when connector configuration or credentials are invalid."""
+
+
+class CredentialRefreshError(FundingBotError):
+    """Raised when an OAuth2 access token cannot be retrieved."""
 
 
 class OutreachThrottledError(FundingBotError):
@@ -357,8 +465,40 @@ class ConsentRecord:
         }
 
 
+@dataclass(frozen=True)
+class Task:
+    """Immutable staff task record."""
+
+    title: str
+    description: str
+    assignee: str
+    status: str
+    due_date: str
+    created_at: str
+    updated_at: str
+    id: int | None = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row | None) -> "Task | None":
+        if row is None:
+            return None
+        data = dict(row)
+        if "assignee" not in data and "assigned_to" in data:
+            data["assignee"] = data.pop("assigned_to")
+        return cls(**data)
+
+    def to_dict(self) -> dict[str, Any]:
+        data = asdict(self)
+        data["assigned_to"] = data["assignee"]
+        return data
+
+
 class TaskTransitionError(FundingBotError):
     """Raised when a task status change violates the workflow state machine."""
+
+
+class TaskAssignmentError(FundingBotError):
+    """Raised when a task assignment update cannot be applied."""
 
 
 class TaskNotFoundError(FundingBotError):
@@ -489,6 +629,243 @@ class FileVault:
         return path.read_text(encoding="utf-8").strip()
 
 
+class OAuth2ClientCredentialsVault:
+    """Add OAuth2 client-credentials support on top of another vault."""
+
+    _RESERVED_KEYS = {
+        "auth_type",
+        "oauth2",
+        "credentials",
+        "token_url",
+        "client_id",
+        "client_secret",
+        "scope",
+        "scopes",
+        "audience",
+        "token_auth_method",
+    }
+
+    def __init__(
+        self,
+        backing_vault: CredentialVault | None = None,
+        *,
+        token_http_client: Callable[[str, dict[str, Any], dict[str, str]], Any] | None = None,
+        refresh_skew_seconds: float | None = None,
+    ) -> None:
+        self.backing_vault = backing_vault or EnvVarVault()
+        self.token_http_client = token_http_client or self._default_token_http_client
+        if refresh_skew_seconds is None:
+            try:
+                refresh_skew_seconds = float(os.environ.get("OAUTH2_REFRESH_SKEW_SECONDS", "60"))
+            except ValueError:
+                refresh_skew_seconds = 60.0
+        self.refresh_skew_seconds = max(0.0, refresh_skew_seconds)
+        self._token_cache: dict[str, dict[str, Any]] = {}
+
+    def get_secret(self, name: str) -> str:
+        return self.backing_vault.get_secret(name)
+
+    def resolve_credentials(self, name: str) -> dict[str, Any]:
+        payload = _parse_secret_payload(self.get_secret(name))
+        oauth2_config = self._extract_oauth2_config(payload)
+        if oauth2_config is None:
+            return payload
+
+        token = self._get_oauth2_token(name, oauth2_config)
+        credentials = self._base_credentials(payload)
+        credentials.update(
+            {
+                "auth_type": "oauth2_client_credentials",
+                "access_token": token["access_token"],
+                "token_type": token["token_type"],
+                "expires_at": token["expires_at"],
+                "authorization_header": f'{token["token_type"]} {token["access_token"]}',
+            }
+        )
+        if token.get("scope"):
+            credentials["scope"] = token["scope"]
+        return credentials
+
+    def _extract_oauth2_config(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        if payload.get("auth_type") == "oauth2_client_credentials":
+            candidate = payload.get("oauth2", payload)
+        elif isinstance(payload.get("oauth2"), dict):
+            candidate = payload["oauth2"]
+        elif {"token_url", "client_id", "client_secret"}.issubset(payload):
+            candidate = payload
+        else:
+            return None
+        if not isinstance(candidate, dict):
+            raise CredentialRefreshError("OAuth2 configuration must be a JSON object.")
+        token_url = str(candidate.get("token_url", "")).strip()
+        client_id = str(candidate.get("client_id", "")).strip()
+        client_secret = str(candidate.get("client_secret", "")).strip()
+        if not token_url or not client_id or not client_secret:
+            raise CredentialRefreshError(
+                "OAuth2 client-credentials configuration requires token_url, client_id, and client_secret."
+            )
+        scope = candidate.get("scope")
+        scopes = candidate.get("scopes")
+        if not scope and isinstance(scopes, (list, tuple)):
+            scope = " ".join(str(item).strip() for item in scopes if str(item).strip())
+        return {
+            "token_url": token_url,
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "scope": str(scope).strip() if scope else "",
+            "audience": str(candidate.get("audience", "")).strip(),
+            "token_auth_method": str(candidate.get("token_auth_method", "basic")).strip().lower(),
+        }
+
+    def _base_credentials(self, payload: dict[str, Any]) -> dict[str, Any]:
+        credentials = payload.get("credentials", {})
+        resolved = dict(credentials) if isinstance(credentials, dict) else {}
+        for key, value in payload.items():
+            if key not in self._RESERVED_KEYS:
+                resolved.setdefault(key, value)
+        return resolved
+
+    def _get_oauth2_token(self, cache_key: str, config: dict[str, Any]) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        cached = self._token_cache.get(cache_key)
+        if cached is not None:
+            expires_at = cached["expires_at_datetime"]
+            if (expires_at - now).total_seconds() > self.refresh_skew_seconds:
+                return {
+                    "access_token": cached["access_token"],
+                    "token_type": cached["token_type"],
+                    "expires_at": cached["expires_at"],
+                    "scope": cached.get("scope", ""),
+                }
+
+        form_data = {"grant_type": "client_credentials"}
+        if config.get("scope"):
+            form_data["scope"] = config["scope"]
+        if config.get("audience"):
+            form_data["audience"] = config["audience"]
+
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+        if config["token_auth_method"] == "body":
+            form_data["client_id"] = config["client_id"]
+            form_data["client_secret"] = config["client_secret"]
+        else:
+            token = base64.b64encode(
+                f'{config["client_id"]}:{config["client_secret"]}'.encode("utf-8")
+            ).decode("ascii")
+            headers["Authorization"] = f"Basic {token}"
+
+        try:
+            response = self.token_http_client(config["token_url"], form_data, headers)
+        except Exception as exc:
+            raise CredentialRefreshError(
+                f"Failed to retrieve OAuth2 access token for secret {cache_key!r}: {exc}"
+            ) from exc
+
+        if isinstance(response, str):
+            try:
+                response = json.loads(response)
+            except json.JSONDecodeError as exc:
+                raise CredentialRefreshError(
+                    f"OAuth2 token endpoint for secret {cache_key!r} returned invalid JSON."
+                ) from exc
+        if not isinstance(response, dict):
+            raise CredentialRefreshError(
+                f"OAuth2 token endpoint for secret {cache_key!r} returned an unsupported payload."
+            )
+
+        access_token = str(response.get("access_token", "")).strip()
+        if not access_token:
+            raise CredentialRefreshError(
+                f"OAuth2 token endpoint for secret {cache_key!r} did not return access_token."
+            )
+        token_type = str(response.get("token_type", "Bearer")).strip() or "Bearer"
+        try:
+            expires_in = int(response.get("expires_in", 3600))
+        except (TypeError, ValueError):
+            expires_in = 3600
+        expires_in = max(expires_in, 1)
+        expires_at_datetime = now + timedelta(seconds=expires_in)
+        scope = str(response.get("scope", config.get("scope", ""))).strip()
+        cached = {
+            "access_token": access_token,
+            "token_type": token_type,
+            "expires_at": expires_at_datetime.isoformat(),
+            "expires_at_datetime": expires_at_datetime,
+            "scope": scope,
+        }
+        self._token_cache[cache_key] = cached
+        return {
+            "access_token": access_token,
+            "token_type": token_type,
+            "expires_at": cached["expires_at"],
+            "scope": scope,
+        }
+
+    @staticmethod
+    def _default_token_http_client(
+        url: str,
+        form_data: dict[str, Any],
+        headers: dict[str, str],
+    ) -> dict[str, Any]:
+        request = urllib.request.Request(
+            url,
+            data=urllib.parse.urlencode(form_data).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = response.read().decode("utf-8")
+        parsed = json.loads(payload)
+        if not isinstance(parsed, dict):
+            raise CredentialRefreshError("OAuth2 token endpoint returned a non-object JSON payload.")
+        return parsed
+
+
+class TokenBucketRateLimiter:
+    """In-memory token bucket for per-connector request quotas."""
+
+    def __init__(
+        self,
+        capacity: float,
+        refill_rate_per_second: float,
+        *,
+        time_func: Callable[[], float] | None = None,
+    ) -> None:
+        self.capacity = max(1.0, float(capacity))
+        self.refill_rate_per_second = max(0.0, float(refill_rate_per_second))
+        self._time = time_func or time.monotonic
+        self._tokens = self.capacity
+        self._updated_at = self._time()
+
+    def _refill(self) -> None:
+        now = self._time()
+        elapsed = max(0.0, now - self._updated_at)
+        self._updated_at = now
+        if elapsed > 0 and self.refill_rate_per_second > 0:
+            self._tokens = min(
+                self.capacity,
+                self._tokens + elapsed * self.refill_rate_per_second,
+            )
+
+    def consume(self, tokens: float = 1.0) -> tuple[bool, float]:
+        requested = max(0.0, float(tokens))
+        self._refill()
+        if self._tokens >= requested:
+            self._tokens -= requested
+            return True, 0.0
+        if self.refill_rate_per_second <= 0:
+            return False, float("inf")
+        return False, (requested - self._tokens) / self.refill_rate_per_second
+
+    @property
+    def available_tokens(self) -> float:
+        self._refill()
+        return self._tokens
+
+
 class _BasePortalConnector:
     """Common behavior for demo portal connectors."""
 
@@ -503,6 +880,10 @@ class _BasePortalConnector:
         self,
         http_client: Callable[..., Any] | None = None,
         *,
+        base_url: str | None = None,
+        source_name: str | None = None,
+        credentials: dict[str, Any] | None = None,
+        transport: str = "demo",
         cache_ttl: float | None = None,
         page_size: int | None = None,
         max_retries: int = 2,
@@ -512,8 +893,14 @@ class _BasePortalConnector:
         circuit_recovery_timeout: float = 30.0,
         sleep_func: Callable[[float], None] | None = None,
         time_func: Callable[[], float] | None = None,
+        rate_limit_config: dict[str, float] | None = None,
+        rate_limiter: TokenBucketRateLimiter | None = None,
     ) -> None:
         self.http_client = http_client
+        self.base_url = base_url or self.base_url
+        self.source_name = source_name or self.source_name
+        self.credentials = dict(credentials or {})
+        self.transport = transport
         self.page_size = self._resolve_page_size(page_size)
         cache_ttl = self._resolve_cache_ttl(cache_ttl)
         self._cache = _TTLCache(ttl_seconds=cache_ttl)
@@ -525,9 +912,16 @@ class _BasePortalConnector:
         self._sleep = sleep_func or time.sleep
         self._time = time_func or time.monotonic
         self._logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+        self.rate_limit_config = self._resolve_rate_limit_config(rate_limit_config)
+        self._rate_limiter = rate_limiter or TokenBucketRateLimiter(
+            self.rate_limit_config["capacity"],
+            self.rate_limit_config["refill_rate"],
+            time_func=self._time,
+        )
         self._circuit_state = "closed"
         self._opened_at: float | None = None
         self._last_error: str | None = None
+        self._last_rate_limit_retry_after: float | None = None
         self._metrics: dict[str, Any] = {
             "requests": 0,
             "successful_requests": 0,
@@ -537,14 +931,80 @@ class _BasePortalConnector:
             "short_circuits": 0,
             "consecutive_failures": 0,
             "state_transitions": 0,
+            "rate_limited_requests": 0,
         }
 
+    def _resolve_page_size(self, page_size: int | None) -> int:
+        if page_size is None:
+            candidate = os.environ.get(
+                f"{self._config_prefix()}_PAGE_SIZE",
+                os.environ.get("PORTAL_PAGE_SIZE", self.default_page_size),
+            )
+        else:
+            candidate = page_size
+        try:
+            normalized = int(candidate)
+        except (TypeError, ValueError):
+            normalized = self.default_page_size
+        return max(1, normalized)
+
+    def _resolve_cache_ttl(self, cache_ttl: float | None) -> float:
+        if cache_ttl is None:
+            raw_ttl = os.environ.get(
+                f"{self._config_prefix()}_CACHE_TTL",
+                os.environ.get("PORTAL_CACHE_TTL", "300"),
+            )
+            try:
+                cache_ttl = float(raw_ttl)
+            except ValueError:
+                cache_ttl = 300
+        if cache_ttl <= 0:
+            return 300.0
+        return float(cache_ttl)
+
+    def _config_prefix(self) -> str:
+        return re.sub(r"[^A-Z0-9]+", "_", self.connector_slug.upper())
+
+    def _resolve_rate_limit_config(self, config: dict[str, float] | None) -> dict[str, float]:
+        connector_key = _normalize_connector_key(self.connector_slug or self.source_name).upper()
+        resolved = dict(config or {})
+        resolved.setdefault(
+            "capacity",
+            float(
+                _read_numeric_env(
+                    [
+                        f"{connector_key}_RATE_LIMIT_CAPACITY",
+                        "PORTAL_RATE_LIMIT_DEFAULT_CAPACITY",
+                    ],
+                    5.0,
+                    minimum=1.0,
+                )
+            ),
+        )
+        resolved.setdefault(
+            "refill_rate",
+            float(
+                _read_numeric_env(
+                    [
+                        f"{connector_key}_RATE_LIMIT_REFILL_RATE",
+                        "PORTAL_RATE_LIMIT_DEFAULT_REFILL_RATE",
+                    ],
+                    1.0,
+                    minimum=0.0,
+                )
+            ),
+        )
+        return resolved
+
     def fetch_opportunities(self, keywords: Iterable[str]) -> list[dict[str, Any]]:
-        return list(self.fetch_result(keywords)["opportunities"])
+        try:
+            return list(self.fetch_result(keywords)["opportunities"])
+        except Exception:
+            return []
 
     def fetch_result(self, keywords: Iterable[str]) -> dict[str, Any]:
         keyword_list = self._expand_keywords(keywords)
-        cache_key = (self.base_url, tuple(sorted(keyword_list)))
+        cache_key = self._cache_key(keyword_list)
         if self._cache is not None:
             hit, cached = self._cache.get(cache_key)
             if hit:
@@ -556,10 +1016,18 @@ class _BasePortalConnector:
 
         if self._refresh_circuit_state() == "open":
             self._metrics["short_circuits"] += 1
-            raise RuntimeError(f"{self.source_name} connector circuit breaker is open.")
+            return self._build_degraded_result(keyword_list, reason="circuit_open")
 
-        if self.http_client:
-            result = self._fetch_remote_result(keyword_list)
+        use_remote = self.http_client is not None or self.transport == "http"
+        if use_remote:
+            try:
+                result = self._fetch_remote_result(keyword_list)
+            except Exception as exc:
+                return self._build_degraded_result(
+                    keyword_list,
+                    reason="connector_error",
+                    error=str(exc),
+                )
         else:
             result = {
                 "schema_version": self.result_schema_version,
@@ -580,7 +1048,7 @@ class _BasePortalConnector:
                 "keyword_count": len(keyword_list),
             },
         }
-        if self._cache is not None:
+        if self._cache is not None and payload["metadata"].get("source_status") != "degraded":
             self._cache.set(
                 cache_key,
                 {
@@ -594,14 +1062,57 @@ class _BasePortalConnector:
     def build_cache_key(self, keywords: Iterable[str]) -> str:
         return json.dumps(
             {
-                "base_url": self.base_url,
+                "connector_id": self.connector_slug,
+                "page_size": self.page_size,
                 "keywords": sorted(keyword.lower() for keyword in _normalize_text_list(keywords)),
             },
             sort_keys=True,
         )
 
+    def invalidate_cache(self, keywords: Iterable[str] | None = None) -> None:
+        if self._cache is None:
+            return
+        if keywords is None:
+            self._cache.clear()
+            return
+        self._cache.invalidate(self._cache_key(self._expand_keywords(keywords)))
+
+    def cache_metrics(self) -> dict[str, Any]:
+        stats = self._cache.stats() if self._cache is not None else {}
+        return {
+            **stats,
+            "connector_id": self.connector_slug,
+            "page_size": self.page_size,
+        }
+
+    def _cache_key(self, keywords: Iterable[str]) -> tuple[Any, ...]:
+        return (
+            self.connector_slug,
+            self.page_size,
+            tuple(sorted(keyword.lower() for keyword in _normalize_text_list(keywords))),
+        )
+
     def default_fallback_results(self, keywords: Iterable[str]) -> list[dict[str, Any]]:
         return self._filter_opportunities(self._demo_data(), self._expand_keywords(keywords))
+
+    def _build_degraded_result(
+        self,
+        keywords: Iterable[str],
+        *,
+        reason: str,
+        error: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "schema_version": self.result_schema_version,
+            "opportunities": [],
+            "metadata": {
+                "connector_name": self.source_name,
+                "source_status": "degraded",
+                "degraded_reason": reason,
+                "circuit_state": self._refresh_circuit_state(),
+                "last_error": error or self._last_error,
+            },
+        }
 
     def get_keyword_category_mappings(self) -> dict[str, dict[str, list[str]]]:
         mappings: dict[str, dict[str, list[str]]] = {}
@@ -663,7 +1174,10 @@ class _BasePortalConnector:
     ) -> dict[str, Any]:
         requested_keywords = _normalize_text_list(keywords)
         try:
-            sample_results = self.fetch_opportunities(requested_keywords)
+            result = self.fetch_result(requested_keywords)
+            sample_results = result["opportunities"]
+            metadata = dict(result.get("metadata", {}))
+            degraded = metadata.get("source_status") == "degraded"
             trimmed_results = [
                 {
                     "source": row.get("source"),
@@ -679,14 +1193,16 @@ class _BasePortalConnector:
                 "connector": self.connector_slug,
                 "source": self.source_name,
                 "base_url": self.base_url,
-                "status": "ok",
-                "connectivity_validated": True,
-                "mode": "remote" if self.http_client else "demo",
+                "status": "degraded" if degraded else "ok",
+                "connectivity_validated": not degraded,
+                "mode": "remote" if (self.http_client is not None or self.transport == "http") else "demo",
                 "requested_keywords": requested_keywords,
                 "expanded_keywords": self._expand_keywords(requested_keywords),
                 "sample_result_count": len(sample_results),
                 "sample_results": trimmed_results,
                 "keyword_mappings": self.get_keyword_category_mappings(),
+                "metadata": metadata,
+                "error": metadata.get("last_error"),
             }
         except Exception as exc:
             return {
@@ -695,7 +1211,7 @@ class _BasePortalConnector:
                 "base_url": self.base_url,
                 "status": "error",
                 "connectivity_validated": False,
-                "mode": "remote" if self.http_client else "demo",
+                "mode": "remote" if (self.http_client is not None or self.transport == "http") else "demo",
                 "requested_keywords": requested_keywords,
                 "expanded_keywords": self._expand_keywords(requested_keywords),
                 "sample_result_count": 0,
@@ -708,11 +1224,17 @@ class _BasePortalConnector:
         return self._fetch_remote_result(keywords)["opportunities"]
 
     def _fetch_remote_result(self, keywords: list[str]) -> dict[str, Any]:
+        client = self.http_client or _default_http_json_client
+
+        def operation() -> Any:
+            payload = {"keywords": keywords, "health_check": self._circuit_state == "half-open"}
+            try:
+                return client(self.base_url, payload, self.credentials)
+            except TypeError:
+                return client(self.base_url, payload)
+
         response = self._call_with_retry(
-            lambda: self.http_client(
-                self.base_url,
-                {"keywords": keywords, "health_check": self._circuit_state == "half-open"},
-            )
+            operation
         )
         if isinstance(response, dict):
             payload = response.get("opportunities")
@@ -814,6 +1336,7 @@ class _BasePortalConnector:
     def get_failure_metrics(self) -> dict[str, Any]:
         return {
             **self._metrics,
+            "cache": self.cache_metrics(),
             "state": self._refresh_circuit_state(),
             "last_error": self._last_error,
             "opened_at": self._opened_at,
@@ -983,6 +1506,163 @@ def default_connectors() -> list[PortalConnector]:
     return [GrantsPortalConnector(), CSRNetworkConnector(), NGODirectoryConnector()]
 
 
+CONNECTOR_CONFIG_ENV_VAR = "FUNDING_BOT_CONNECTORS"
+CONNECTOR_CONFIG_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "connectors": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {"type": "string", "minLength": 1},
+                    "enabled": {"type": "boolean"},
+                    "transport": {"type": "string", "enum": ["demo", "http"]},
+                    "base_url": {"type": "string", "minLength": 1},
+                    "credential_alias": {"type": "string", "minLength": 1},
+                    "credentials": {"type": "object"},
+                    "cache_ttl": {"type": "number", "exclusiveMinimum": 0},
+                    "settings": {"type": "object"},
+                },
+                "required": ["type"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["connectors"],
+    "additionalProperties": False,
+}
+
+
+def _default_http_json_client(
+    url: str,
+    payload: dict[str, Any],
+    credentials: dict[str, Any] | None = None,
+) -> Any:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST",
+    )
+    for key, value in (credentials or {}).items():
+        request.add_header(f"X-Connector-{key.replace('_', '-').title()}", str(value))
+
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8") or "{}")
+    except urllib.error.URLError as exc:
+        raise FundingBotError(f"Connector request to {url!r} failed: {exc}") from exc
+
+
+@dataclass(frozen=True)
+class ConnectorPlugin:
+    factory: Callable[..., PortalConnector]
+    credential_schema: dict[str, Any] | None = None
+
+
+class ConnectorRegistry:
+    """Register and instantiate connector plugins."""
+
+    def __init__(self) -> None:
+        self._plugins: dict[str, ConnectorPlugin] = {}
+
+    def register(
+        self,
+        connector_type: str,
+        factory: Callable[..., PortalConnector],
+        *,
+        credential_schema: dict[str, Any] | None = None,
+    ) -> None:
+        normalized = connector_type.strip()
+        if not normalized:
+            raise ValueError("Connector type is required.")
+        self._plugins[normalized] = ConnectorPlugin(
+            factory=factory,
+            credential_schema=credential_schema,
+        )
+
+    def discover(self) -> list[str]:
+        return sorted(self._plugins)
+
+    def create(self, connector_type: str, **kwargs: Any) -> PortalConnector:
+        plugin = self._plugins.get(connector_type)
+        if plugin is None:
+            known = ", ".join(self.discover()) or "none"
+            raise ConnectorConfigError(
+                f"Unknown connector type {connector_type!r}. Registered connector types: {known}."
+            )
+        return plugin.factory(**kwargs)
+
+    def validate_config(
+        self,
+        config: dict[str, Any],
+        *,
+        credential_resolver: Callable[[str], dict[str, Any]],
+    ) -> None:
+        plugin = self._plugins.get(config["type"])
+        if plugin is None:
+            known = ", ".join(self.discover()) or "none"
+            raise ConnectorConfigError(
+                f"Unknown connector type {config['type']!r}. Registered connector types: {known}."
+            )
+
+        if plugin.credential_schema is None:
+            return
+
+        credentials = dict(config.get("credentials") or {})
+        if config.get("credential_alias"):
+            try:
+                credentials = credential_resolver(config["credential_alias"])
+            except CredentialNotFoundError as exc:
+                raise ConnectorConfigError(
+                    f"Connector {config['type']!r} could not resolve credential alias "
+                    f"{config['credential_alias']!r}: {exc}"
+                ) from exc
+
+        try:
+            validate(instance=credentials, schema=plugin.credential_schema)
+        except ValidationError as exc:
+            path = ".".join(str(part) for part in exc.path)
+            field = f" ({path})" if path else ""
+            raise ConnectorConfigError(
+                f"Invalid credentials for connector {config['type']!r}{field}: {exc.message}"
+            ) from exc
+
+    def build_connectors(
+        self,
+        configs: Iterable[dict[str, Any]],
+        *,
+        credential_resolver: Callable[[str], dict[str, Any]],
+    ) -> list[PortalConnector]:
+        built: list[PortalConnector] = []
+        for config in configs:
+            if config.get("enabled", True) is False:
+                continue
+            self.validate_config(config, credential_resolver=credential_resolver)
+            credentials = dict(config.get("credentials") or {})
+            if config.get("credential_alias"):
+                credentials = credential_resolver(config["credential_alias"])
+            settings = dict(config.get("settings") or {})
+            built.append(
+                self.create(
+                    config["type"],
+                    base_url=config.get("base_url"),
+                    credentials=credentials,
+                    transport=config.get("transport", "demo"),
+                    cache_ttl=config.get("cache_ttl"),
+                    **settings,
+                )
+            )
+        return built
+
+
+DEFAULT_CONNECTOR_REGISTRY = ConnectorRegistry()
+DEFAULT_CONNECTOR_REGISTRY.register(GrantsPortalConnector.connector_slug, GrantsPortalConnector)
+DEFAULT_CONNECTOR_REGISTRY.register(CSRNetworkConnector.connector_slug, CSRNetworkConnector)
+DEFAULT_CONNECTOR_REGISTRY.register(NGODirectoryConnector.connector_slug, NGODirectoryConnector)
+
+
 def connector_registry() -> dict[str, type[_BasePortalConnector]]:
     """Return built-in connectors keyed by their CLI slug."""
     return {
@@ -1003,39 +1683,38 @@ def create_connector(connector_name: str, **kwargs: Any) -> _BasePortalConnector
 
 SUPPORTED_OUTREACH_LOCALES = ("en", "bn")
 DEFAULT_OUTREACH_LOCALE = "en"
-DEFAULT_OUTREACH_TEMPLATE_NAME = "thank-you"
-LOCALIZED_OUTREACH_TEMPLATES: dict[str, dict[str, dict[str, str]]] = {
-    "thank-you": {
-        "en": {
-            "subject": "Thank you for supporting {organization_name}",
-            "body": "Dear {donor_name},\n\nThank you for your continued interest in {organization_name}.",
-        },
-        "bn": {
-            "subject": "{organization_name}-কে সমর্থন করার জন্য ধন্যবাদ",
-            "body": "প্রিয় {donor_name},\n\n{organization_name}-এর প্রতি আপনার ধারাবাহিক আগ্রহের জন্য ধন্যবাদ।",
-        },
-    },
-    "impact-update": {
-        "en": {
-            "subject": "Latest impact update from {organization_name}",
-            "body": "Dear {donor_name},\n\nYour support helps advance our mission: {mission}",
-        },
-        "bn": {
-            "subject": "{organization_name}-এর সর্বশেষ প্রভাবের খবর",
-            "body": "প্রিয় {donor_name},\n\nআপনার সহায়তা আমাদের এই মিশন এগিয়ে নিতে সাহায্য করছে: {mission}",
-        },
-    },
-    "meeting-request": {
-        "en": {
-            "subject": "Could we schedule a conversation with {organization_name}?",
-            "body": "Dear {donor_name},\n\nWe would welcome the chance to discuss how {organization_name} can partner with you.",
-        },
-        "bn": {
-            "subject": "{organization_name}-এর সঙ্গে কি একটি আলোচনা নির্ধারণ করা যায়?",
-            "body": "প্রিয় {donor_name},\n\n{organization_name} কীভাবে আপনার সঙ্গে অংশীদারিত্ব করতে পারে তা নিয়ে আলোচনা করার সুযোগ পেলে আমরা আনন্দিত হব।",
-        },
-    },
-}
+DEFAULT_OUTREACH_TEMPLATE_NAME = "default"
+OUTREACH_TEMPLATE_CATALOG_DIR = Path(__file__).resolve().parent / "i18n" / "outreach_templates"
+
+
+def _load_localized_outreach_templates() -> dict[str, dict[str, dict[str, str]]]:
+    catalog: dict[str, dict[str, dict[str, str]]] = {}
+    for locale_name in SUPPORTED_OUTREACH_LOCALES:
+        catalog_path = OUTREACH_TEMPLATE_CATALOG_DIR / f"{locale_name}.json"
+        with catalog_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        templates = payload.get("templates")
+        if not isinstance(templates, dict):
+            raise ValueError(
+                f"Outreach template catalog {catalog_path} must contain a 'templates' object."
+            )
+        for template_name, template_body in templates.items():
+            if not isinstance(template_name, str) or not isinstance(template_body, dict):
+                raise ValueError(f"Invalid template entry {template_name!r} in {catalog_path}.")
+            subject = template_body.get("subject", "")
+            body = template_body.get("body", "")
+            if not isinstance(subject, str) or not isinstance(body, str):
+                raise ValueError(
+                    f"Outreach template {template_name!r} in {catalog_path} must define string subject and body."
+                )
+            catalog.setdefault(template_name, {})[locale_name] = {
+                "subject": subject,
+                "body": body,
+            }
+    return catalog
+
+
+LOCALIZED_OUTREACH_TEMPLATES = _load_localized_outreach_templates()
 
 
 def _validate_locale(locale: str | None) -> str:
@@ -1157,22 +1836,48 @@ class SMTPEmailSender:
 
 
 class FundingBot:
-    TASK_STATUSES = ("todo", "in-progress", "done", "blocked")
+    TASK_STATUSES = ("pending", "in_progress", "completed", "blocked")
+    TASK_STATUS_ALIASES = {
+        "todo": "pending",
+        "pending": "pending",
+        "in-progress": "in_progress",
+        "in_progress": "in_progress",
+        "done": "completed",
+        "completed": "completed",
+        "blocked": "blocked",
+    }
     TASK_STATUS_TRANSITIONS = {
-        "todo": frozenset({"in-progress", "blocked"}),
-        "in-progress": frozenset({"todo", "done", "blocked"}),
-        "blocked": frozenset({"todo", "in-progress"}),
-        "done": frozenset(),
+        "pending": frozenset({"in_progress", "blocked"}),
+        "in_progress": frozenset({"pending", "completed", "blocked"}),
+        "blocked": frozenset({"pending", "in_progress"}),
+        "completed": frozenset(),
     }
     DEFAULT_QUEUE_RETRY_LIMIT = 3
     DEFAULT_QUEUE_RETRY_BACKOFF_SECONDS = 5.0
     DEFAULT_QUEUE_RETRY_BACKOFF_MAX_SECONDS = 300.0
-    SUPPORTED_TEMPLATE_LOCALES = frozenset({"en", "bn"})
-    DEFAULT_TEMPLATE_LOCALE = "en"
-    DEFAULT_OUTREACH_TEMPLATE = "default"
-    OUTREACH_TEMPLATE_CATALOG = (
-        Path(__file__).resolve().parent / "i18n" / "outreach_templates"
-    )
+    SUPPORTED_TEMPLATE_LOCALES = frozenset(SUPPORTED_OUTREACH_LOCALES)
+    DEFAULT_TEMPLATE_LOCALE = DEFAULT_OUTREACH_LOCALE
+    DEFAULT_OUTREACH_TEMPLATE = DEFAULT_OUTREACH_TEMPLATE_NAME
+    SUPPORTED_DATA_RESIDENCIES = ("US", "EU", "ASIA")
+    DEFAULT_DATA_RESIDENCY = "US"
+    SUPPORTED_PRIVACY_POLICY_FORMATS = frozenset({"html", "pdf"})
+    DEFAULT_PRIVACY_POLICY_FORMATS = ("html", "pdf")
+    OUTREACH_TEMPLATE_CATALOG = OUTREACH_TEMPLATE_CATALOG_DIR
+    DATA_RETENTION_POLICY_KEY = "data_retention_policy"
+    DATA_RETENTION_DEFAULTS = {
+        "audit_logs_days": 365,
+        "communications_days": 365,
+        "documents_days": 180,
+        "submission_attempts_days": 90,
+        "completed_tasks_days": 180,
+    }
+    DATA_RETENTION_ENV_VARS = {
+        "audit_logs_days": "RETENTION_AUDIT_LOG_DAYS",
+        "communications_days": "RETENTION_COMMUNICATION_DAYS",
+        "documents_days": "RETENTION_DOCUMENT_DAYS",
+        "submission_attempts_days": "RETENTION_SUBMISSION_ATTEMPT_DAYS",
+        "completed_tasks_days": "RETENTION_COMPLETED_TASK_DAYS",
+    }
 
     def __init__(
         self,
@@ -1180,14 +1885,34 @@ class FundingBot:
         *,
         trusted_sources: Iterable[str] | None = None,
         vault: CredentialVault | None = None,
+        connector_registry: ConnectorRegistry | None = None,
+        connector_configs: dict[str, Any] | list[dict[str, Any]] | None = None,
+        oauth_token_http_client: Callable[[str, dict[str, Any], dict[str, str]], Any] | None = None,
+        oauth_refresh_skew_seconds: float | None = None,
     ) -> None:
         self.db_path = str(db_path)
         self.trusted_sources = {source.lower() for source in (trusted_sources or [])}
-        self.vault = vault
+        if (
+            isinstance(vault, OAuth2ClientCredentialsVault)
+            and oauth_token_http_client is None
+            and oauth_refresh_skew_seconds is None
+        ):
+            self.vault = vault
+        else:
+            self.vault = OAuth2ClientCredentialsVault(
+                vault or EnvVarVault(),
+                token_http_client=oauth_token_http_client,
+                refresh_skew_seconds=oauth_refresh_skew_seconds,
+            )
+        self.connector_registry = connector_registry or DEFAULT_CONNECTOR_REGISTRY
+        self._data_residency_status = self.validate_data_storage_location()
         self.connection = sqlite3.connect(self.db_path)
         self.connection.execute("PRAGMA foreign_keys = ON")
+        self.connection.execute("PRAGMA busy_timeout = 5000")
         self.connection.row_factory = sqlite3.Row
         self._create_schema()
+        self.connector_configs = self._load_connector_configs(connector_configs)
+        self._validate_connector_configs()
 
     def close(self) -> None:
         self.connection.close()
@@ -1248,6 +1973,20 @@ class FundingBot:
                 locale TEXT NOT NULL DEFAULT 'en'
             );
 
+            CREATE TABLE IF NOT EXISTS consent_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                donor_email TEXT NOT NULL,
+                channel TEXT NOT NULL DEFAULT 'email',
+                status TEXT NOT NULL,
+                consented_at TEXT NOT NULL,
+                withdrawn_at TEXT,
+                source TEXT NOT NULL,
+                proof TEXT,
+                notes TEXT,
+                recorded_at TEXT NOT NULL,
+                FOREIGN KEY (donor_email) REFERENCES donors(email) ON UPDATE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS communications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 donor_email TEXT NOT NULL,
@@ -1264,6 +2003,21 @@ class FundingBot:
                 format TEXT NOT NULL,
                 path TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS privacy_policy_versions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                jurisdiction TEXT NOT NULL,
+                revision INTEGER NOT NULL,
+                version TEXT NOT NULL,
+                data_residency TEXT NOT NULL,
+                effective_date TEXT NOT NULL,
+                html_path TEXT,
+                pdf_path TEXT,
+                profile_json TEXT NOT NULL,
+                generated_at TEXT NOT NULL,
+                UNIQUE(jurisdiction, revision),
+                UNIQUE(version)
             );
 
             CREATE TABLE IF NOT EXISTS audit_logs (
@@ -1290,8 +2044,21 @@ class FundingBot:
                 FOREIGN KEY (communication_id) REFERENCES communications(id)
             );
 
+            CREATE TABLE IF NOT EXISTS connector_result_cache (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                connector_name TEXT NOT NULL,
+                cache_key TEXT NOT NULL,
+                schema_version INTEGER NOT NULL,
+                fetched_at TEXT NOT NULL,
+                source_status TEXT NOT NULL DEFAULT 'remote',
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT NOT NULL,
+                UNIQUE(connector_name, cache_key)
+            );
+
             CREATE TABLE IF NOT EXISTS task_runs (
                 task_id TEXT PRIMARY KEY,
+                idempotency_key TEXT UNIQUE,
                 task_name TEXT NOT NULL,
                 status TEXT NOT NULL,
                 progress INTEGER NOT NULL DEFAULT 0,
@@ -1299,11 +2066,38 @@ class FundingBot:
                 payload_json TEXT NOT NULL DEFAULT '{}',
                 result_json TEXT,
                 error_message TEXT,
+                worker_id TEXT,
+                duplicate_requests INTEGER NOT NULL DEFAULT 0,
+                shutdown_requested INTEGER NOT NULL DEFAULT 0,
                 callback_name TEXT,
                 callback_payload_json TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 completed_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS task_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL,
+                task_name TEXT NOT NULL,
+                attempt_number INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                happened_at TEXT NOT NULL,
+                backoff_seconds REAL,
+                next_retry_at TEXT,
+                result_json TEXT,
+                error_message TEXT,
+                details_json TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE TABLE IF NOT EXISTS dead_letter_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id TEXT NOT NULL UNIQUE,
+                task_name TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                error_message TEXT NOT NULL,
+                attempts INTEGER NOT NULL,
+                failed_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS tasks (
@@ -1317,6 +2111,33 @@ class FundingBot:
                 source TEXT NOT NULL DEFAULT 'manual',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS task_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                author TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS task_comment_reads (
+                task_id INTEGER NOT NULL,
+                reader_email TEXT NOT NULL,
+                last_read_at TEXT NOT NULL,
+                PRIMARY KEY (task_id, reader_email),
+                FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS task_notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_id INTEGER NOT NULL,
+                recipient_email TEXT NOT NULL,
+                notification_type TEXT NOT NULL,
+                happened_at TEXT NOT NULL,
+                FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS translation_reviews (
@@ -1347,16 +2168,30 @@ class FundingBot:
                 ON audit_logs(happened_at DESC);
             CREATE INDEX IF NOT EXISTS idx_audit_logs_action
                 ON audit_logs(action);
+            CREATE INDEX IF NOT EXISTS idx_consent_records_donor_email
+                ON consent_records(donor_email);
+            CREATE INDEX IF NOT EXISTS idx_consent_records_recorded_at
+                ON consent_records(recorded_at DESC);
             CREATE INDEX IF NOT EXISTS idx_communications_donor_email
                 ON communications(donor_email);
             CREATE INDEX IF NOT EXISTS idx_communications_sent_at
                 ON communications(sent_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_privacy_policy_versions_jurisdiction
+                ON privacy_policy_versions(jurisdiction, revision DESC);
             CREATE INDEX IF NOT EXISTS idx_outreach_events_communication_id
                 ON outreach_events(communication_id);
+            CREATE INDEX IF NOT EXISTS idx_connector_result_cache_lookup
+                ON connector_result_cache(connector_name, cache_key);
             CREATE INDEX IF NOT EXISTS idx_task_runs_status
                 ON task_runs(status);
             CREATE INDEX IF NOT EXISTS idx_task_runs_updated_at
                 ON task_runs(updated_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_task_history_task_id
+                ON task_history(task_id, attempt_number);
+            CREATE INDEX IF NOT EXISTS idx_task_history_status
+                ON task_history(status);
+            CREATE INDEX IF NOT EXISTS idx_dead_letter_queue_task_name
+                ON dead_letter_queue(task_name, failed_at DESC);
             CREATE INDEX IF NOT EXISTS idx_tasks_assigned_to
                 ON tasks(assigned_to);
             CREATE INDEX IF NOT EXISTS idx_tasks_status
@@ -1365,6 +2200,10 @@ class FundingBot:
                 ON tasks(external_id);
             CREATE INDEX IF NOT EXISTS idx_tasks_due_date
                 ON tasks(due_date);
+            CREATE INDEX IF NOT EXISTS idx_task_comments_task_id
+                ON task_comments(task_id, created_at ASC);
+            CREATE INDEX IF NOT EXISTS idx_task_notifications_lookup
+                ON task_notifications(task_id, recipient_email, notification_type, happened_at DESC);
             CREATE INDEX IF NOT EXISTS idx_translation_reviews_status
                 ON translation_reviews(status);
             CREATE INDEX IF NOT EXISTS idx_translation_reviews_locale
@@ -1378,16 +2217,53 @@ class FundingBot:
         self._ensure_column("tasks", "external_id", "TEXT")
         self._ensure_column("tasks", "due_date", "TEXT")
         self._ensure_column("tasks", "source", "TEXT NOT NULL DEFAULT 'manual'")
+        self._ensure_column("tasks", "assignee_email", "TEXT")
+        self._ensure_column("tasks", "assignee_name", "TEXT")
+        self._ensure_column("task_runs", "idempotency_key", "TEXT")
+        self._ensure_column("task_runs", "worker_id", "TEXT")
+        self._ensure_column("task_runs", "duplicate_requests", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("task_runs", "shutdown_requested", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("task_runs", "retry_limit", "INTEGER NOT NULL DEFAULT 3")
+        self._ensure_column("task_runs", "attempts", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("task_runs", "backoff_seconds", "REAL NOT NULL DEFAULT 5")
+        self._ensure_column("task_runs", "backoff_max_seconds", "REAL NOT NULL DEFAULT 300")
+        self._ensure_column("task_runs", "dead_lettered", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("task_runs", "last_attempt_at", "TEXT")
+        self._ensure_column("task_runs", "next_retry_at", "TEXT")
         # Index on donors.segment must be created after the column is guaranteed to exist.
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_donors_segment ON donors(segment)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_task_runs_idempotency_key ON task_runs(idempotency_key)"
         )
         self.connection.commit()
 
     # Allowlist of table/column identifiers that _ensure_column is permitted to touch.
     # All calls are internal and use literals; the allowlist is an extra safety guard.
-    _ALLOWED_ALTER_TABLES = frozenset({"donors", "tasks"})
-    _ALLOWED_ALTER_COLUMNS = frozenset({"segment", "locale", "external_id", "due_date", "source"})
+    _ALLOWED_ALTER_TABLES = frozenset({"donors", "tasks", "task_runs"})
+    _ALLOWED_ALTER_COLUMNS = frozenset(
+        {
+            "segment",
+            "locale",
+            "external_id",
+            "due_date",
+            "source",
+            "assignee_email",
+            "assignee_name",
+            "idempotency_key",
+            "worker_id",
+            "duplicate_requests",
+            "shutdown_requested",
+            "retry_limit",
+            "attempts",
+            "backoff_seconds",
+            "backoff_max_seconds",
+            "dead_lettered",
+            "last_attempt_at",
+            "next_retry_at",
+        }
+    )
 
     def _ensure_column(self, table_name: str, column_name: str, definition: str) -> None:
         if table_name not in self._ALLOWED_ALTER_TABLES:
@@ -1421,6 +2297,137 @@ class FundingBot:
                 raise sqlite3.OperationalError(
                     f"Could not add column {column_name!r} to {table_name!r}: {exc}"
                 ) from exc
+
+    @staticmethod
+    def _connector_name(connector: PortalConnector) -> str:
+        return str(getattr(connector, "source_name", connector.__class__.__name__))
+
+    def _connector_cache_key(self, connector: PortalConnector, keywords: Iterable[str]) -> str:
+        builder = getattr(connector, "build_cache_key", None)
+        if callable(builder):
+            return str(builder(keywords))
+        return json.dumps(
+            {
+                "connector": self._connector_name(connector),
+                "keywords": sorted(keyword.lower() for keyword in _normalize_text_list(keywords)),
+            },
+            sort_keys=True,
+        )
+
+    @staticmethod
+    def _load_fallback_mode() -> str:
+        raw_mode = os.environ.get("PORTAL_FALLBACK_MODE", "cache-first").strip().lower()
+        allowed_modes = {"cache-first", "cache-only", "default-only", "disabled"}
+        if raw_mode not in allowed_modes:
+            logging.getLogger(__name__).warning(
+                "Unknown PORTAL_FALLBACK_MODE=%r; defaulting to cache-first.",
+                raw_mode,
+            )
+            return "cache-first"
+        return raw_mode
+
+    def _store_connector_result(
+        self,
+        *,
+        connector_name: str,
+        cache_key: str,
+        schema_version: int,
+        opportunities: Iterable[dict[str, Any]],
+        metadata: dict[str, Any] | None = None,
+        source_status: str = "remote",
+    ) -> None:
+        payload = [dict(item) for item in opportunities]
+        self.connection.execute(
+            """
+            INSERT INTO connector_result_cache (
+                connector_name, cache_key, schema_version, fetched_at,
+                source_status, metadata_json, result_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(connector_name, cache_key) DO UPDATE SET
+                schema_version = excluded.schema_version,
+                fetched_at = excluded.fetched_at,
+                source_status = excluded.source_status,
+                metadata_json = excluded.metadata_json,
+                result_json = excluded.result_json
+            """,
+            (
+                connector_name,
+                cache_key,
+                int(schema_version),
+                self._to_iso(),
+                source_status,
+                json.dumps(metadata or {}, sort_keys=True),
+                json.dumps(payload, sort_keys=True),
+            ),
+        )
+        self.connection.commit()
+
+    def _load_cached_connector_result(
+        self,
+        connector: PortalConnector,
+        keywords: Iterable[str],
+    ) -> dict[str, Any] | None:
+        connector_name = self._connector_name(connector)
+        cache_key = self._connector_cache_key(connector, keywords)
+        row = self.connection.execute(
+            """
+            SELECT schema_version, source_status, metadata_json, result_json
+            FROM connector_result_cache
+            WHERE connector_name = ? AND cache_key = ?
+            """,
+            (connector_name, cache_key),
+        ).fetchone()
+        if row is None:
+            return None
+        metadata = json.loads(row["metadata_json"] or "{}")
+        payload = json.loads(row["result_json"] or "[]")
+        migrate = getattr(connector, "migrate_result_payload", None)
+        current_version = int(row["schema_version"])
+        target_version = int(getattr(connector, "result_schema_version", _CONNECTOR_RESULT_SCHEMA_VERSION))
+        if callable(migrate):
+            payload = migrate(payload, current_version)
+        else:
+            payload = [dict(item) for item in payload]
+        if current_version != target_version:
+            metadata = {
+                **metadata,
+                "migrated_from_schema_version": current_version,
+                "migrated_at": self._to_iso(),
+            }
+            self._store_connector_result(
+                connector_name=connector_name,
+                cache_key=cache_key,
+                schema_version=target_version,
+                opportunities=payload,
+                metadata=metadata,
+                source_status=row["source_status"],
+            )
+        return {
+            "schema_version": target_version,
+            "opportunities": payload,
+            "metadata": metadata,
+            "source_status": row["source_status"],
+        }
+
+    def _default_connector_fallback(
+        self,
+        connector: PortalConnector,
+        keywords: Iterable[str],
+    ) -> dict[str, Any] | None:
+        fallback = getattr(connector, "default_fallback_results", None)
+        if not callable(fallback):
+            return None
+        payload = [dict(item) for item in fallback(keywords)]
+        return {
+            "schema_version": int(getattr(connector, "result_schema_version", _CONNECTOR_RESULT_SCHEMA_VERSION)),
+            "opportunities": payload,
+            "metadata": {
+                "connector_name": self._connector_name(connector),
+                "fallback_mode": "default",
+                "source_status": "default",
+            },
+            "source_status": "default",
+        }
 
     @staticmethod
     def _utcnow() -> datetime:
@@ -1468,6 +2475,31 @@ class FundingBot:
                 f"Invalid donor segment {segment!r}. Expected one of {sorted(allowed_segments)}."
             )
         return normalized
+
+    @staticmethod
+    def _validate_consent_channel(channel: str | None) -> str:
+        normalized = (channel or "email").strip().lower()
+        allowed_channels = {"email", "sms", "phone", "postal", "general"}
+        if normalized not in allowed_channels:
+            raise ValueError(
+                f"Invalid consent channel {channel!r}. Expected one of {sorted(allowed_channels)}."
+            )
+        return normalized
+
+    @staticmethod
+    def _validate_consent_status(status: str | None) -> str:
+        normalized = (status or "granted").strip().lower()
+        allowed_statuses = {"granted", "withdrawn"}
+        if normalized not in allowed_statuses:
+            raise ValueError(
+                f"Invalid consent status {status!r}. Expected one of {sorted(allowed_statuses)}."
+            )
+        return normalized
+
+    @staticmethod
+    def _default_donor_name_from_email(email: str) -> str:
+        local_part = email.split("@", 1)[0]
+        return local_part.replace(".", " ").replace("_", " ").strip().title() or email
 
     @staticmethod
     def _validate_ui_locale(locale: str | None) -> str:
@@ -1569,8 +2601,45 @@ class FundingBot:
         return normalized
 
     @staticmethod
+    def _normalize_due_date(due_date: datetime | str | None) -> str | None:
+        if due_date is None:
+            return None
+        if isinstance(due_date, datetime):
+            return FundingBot._as_utc(due_date).date().isoformat()
+        normalized = str(due_date).strip()
+        if not normalized:
+            return None
+        try:
+            return datetime.fromisoformat(normalized).date().isoformat()
+        except ValueError:
+            pass
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", normalized):
+            return normalized
+        raise ValueError("Task due_date must be an ISO-8601 date or datetime string.")
+
+    @staticmethod
     def _serialize_task(row: sqlite3.Row) -> dict[str, Any]:
-        return dict(row)
+        task = dict(row)
+        task["due_date"] = FundingBot._normalize_task_due_date(task.get("due_date"))
+        today = FundingBot._as_utc().date().isoformat()
+        task["is_overdue"] = bool(
+            task["due_date"] and task["status"] != "done" and task["due_date"] < today
+        )
+        return task
+
+    @staticmethod
+    def _normalize_task_due_date(due_date: str | None) -> str | None:
+        if due_date is None:
+            return None
+        normalized = str(due_date).strip()
+        if not normalized:
+            return None
+        try:
+            return datetime.fromisoformat(normalized).date().isoformat()
+        except ValueError as exc:
+            raise ValueError(
+                f"Invalid task due_date {due_date!r}. Expected ISO date format YYYY-MM-DD."
+            ) from exc
 
     @classmethod
     def _validate_task_transition(cls, current_status: str, new_status: str) -> None:
@@ -1582,12 +2651,109 @@ class FundingBot:
                 f"Task status cannot transition from {current_status!r} to {new_status!r}."
             )
 
-    def _log_action(self, action: str, **details: Any) -> None:
+    def _log_action(self, action: str, *, commit: bool = True, **details: Any) -> None:
         self.connection.execute(
             "INSERT INTO audit_logs (happened_at, action, details_json) VALUES (?, ?, ?)",
             (self._to_iso(), action, json.dumps(details, sort_keys=True)),
         )
+        if commit:
+            self.connection.commit()
+
+    def record_task_run(
+        self,
+        task_id: str,
+        task_name: str,
+        *,
+        status: str,
+        progress: int = 0,
+        message: str = "",
+        payload: dict[str, Any] | None = None,
+        result: dict[str, Any] | None = None,
+        error_message: str | None = None,
+        callback_name: str | None = None,
+        callback_payload: dict[str, Any] | None = None,
+        completed_at: datetime | None = None,
+    ) -> dict[str, Any]:
+        now = self._to_iso()
+        existing = self.connection.execute(
+            "SELECT created_at, completed_at FROM task_runs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        created_at = existing["created_at"] if existing else now
+        finished_at = (
+            self._to_iso(completed_at)
+            if completed_at is not None
+            else (existing["completed_at"] if existing else None)
+        )
+        self.connection.execute(
+            """
+            INSERT INTO task_runs (
+                task_id, task_name, status, progress, message, payload_json,
+                result_json, error_message, callback_name, callback_payload_json,
+                created_at, updated_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(task_id) DO UPDATE SET
+                task_name = excluded.task_name,
+                status = excluded.status,
+                progress = excluded.progress,
+                message = excluded.message,
+                payload_json = excluded.payload_json,
+                result_json = excluded.result_json,
+                error_message = excluded.error_message,
+                callback_name = excluded.callback_name,
+                callback_payload_json = excluded.callback_payload_json,
+                updated_at = excluded.updated_at,
+                completed_at = excluded.completed_at
+            """,
+            (
+                task_id,
+                task_name,
+                status,
+                max(0, min(100, int(progress))),
+                message,
+                json.dumps(payload or {}, sort_keys=True),
+                json.dumps(result, sort_keys=True) if result is not None else None,
+                error_message,
+                callback_name,
+                json.dumps(callback_payload, sort_keys=True)
+                if callback_payload is not None
+                else None,
+                created_at,
+                now,
+                finished_at,
+            ),
+        )
         self.connection.commit()
+        row = self.connection.execute(
+            "SELECT * FROM task_runs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        return dict(row) if row else {}
+
+    def get_task_run(self, task_id: str) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            "SELECT * FROM task_runs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def list_task_runs(
+        self,
+        *,
+        status: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = "SELECT * FROM task_runs"
+        params: list[Any] = []
+        if status is not None:
+            query += " WHERE status = ?"
+            params.append(status)
+        query += " ORDER BY updated_at DESC"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+        rows = self.connection.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
 
     @staticmethod
     def _signature_for(opportunity: dict[str, Any]) -> str:
@@ -1647,6 +2813,172 @@ class FundingBot:
             "trusted_sources": settings.get("trusted_sources", []),
         }
 
+    @classmethod
+    def _parse_retention_days(cls, field_name: str, value: Any) -> int:
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Field {field_name!r} must be an integer number of days.") from exc
+        if normalized < 1:
+            raise ValueError(f"Field {field_name!r} must be at least 1 day.")
+        return normalized
+
+    @classmethod
+    def _default_data_retention_policy(cls) -> dict[str, int]:
+        policy: dict[str, int] = {}
+        for key, default in cls.DATA_RETENTION_DEFAULTS.items():
+            raw_value = os.environ.get(cls.DATA_RETENTION_ENV_VARS[key], default)
+            try:
+                policy[key] = cls._parse_retention_days(key, raw_value)
+            except ValueError:
+                policy[key] = default
+        return policy
+
+    def load_data_retention_policy(self) -> dict[str, int]:
+        policy = self._default_data_retention_policy()
+        stored = self.load_setting(self.DATA_RETENTION_POLICY_KEY)
+        for key in self.DATA_RETENTION_DEFAULTS:
+            if key in stored:
+                policy[key] = self._parse_retention_days(key, stored[key])
+        return policy
+
+    def store_data_retention_policy(self, policy: dict[str, Any]) -> dict[str, int]:
+        if not isinstance(policy, dict):
+            raise ValueError("Data retention policy must be a JSON-style object.")
+        unknown_fields = sorted(set(policy) - set(self.DATA_RETENTION_DEFAULTS))
+        if unknown_fields:
+            raise ValueError(
+                f"Unknown data retention field(s): {', '.join(unknown_fields)}."
+            )
+
+        merged_policy = self.load_data_retention_policy()
+        for key, value in policy.items():
+            merged_policy[key] = self._parse_retention_days(key, value)
+
+        self.store_setting(self.DATA_RETENTION_POLICY_KEY, merged_policy)
+        self._log_action("data_retention_policy_updated", **merged_policy)
+        return merged_policy
+
+    def enforce_data_retention(
+        self,
+        *,
+        now: datetime | None = None,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        as_of = self._as_utc(now)
+        policy = self.load_data_retention_policy()
+        cutoffs = {
+            key: self._to_iso(as_of - timedelta(days=days))
+            for key, days in policy.items()
+        }
+
+        expired_communication_rows = self.connection.execute(
+            """
+            SELECT id FROM communications
+            WHERE sent_at < ?
+            ORDER BY id
+            """,
+            (cutoffs["communications_days"],),
+        ).fetchall()
+        expired_communication_ids = [row["id"] for row in expired_communication_rows]
+
+        expired_document_rows = self.connection.execute(
+            """
+            SELECT id, path FROM documents
+            WHERE created_at < ?
+            ORDER BY id
+            """,
+            (cutoffs["documents_days"],),
+        ).fetchall()
+        expired_document_ids = [row["id"] for row in expired_document_rows]
+        expired_document_paths = [Path(row["path"]) for row in expired_document_rows]
+
+        deleted_counts = {
+            "audit_logs": self.connection.execute(
+                "SELECT COUNT(*) FROM audit_logs WHERE happened_at < ?",
+                (cutoffs["audit_logs_days"],),
+            ).fetchone()[0],
+            "communications": len(expired_communication_ids),
+            "outreach_events": (
+                self.connection.execute(
+                    """
+                    SELECT COUNT(*) FROM outreach_events
+                    WHERE communication_id IN (
+                        SELECT id FROM communications WHERE sent_at < ?
+                    )
+                    """,
+                    (cutoffs["communications_days"],),
+                ).fetchone()[0]
+                if expired_communication_ids
+                else 0
+            ),
+            "documents": len(expired_document_ids),
+            "submission_attempts": self.connection.execute(
+                "SELECT COUNT(*) FROM submission_attempts WHERE happened_at < ?",
+                (cutoffs["submission_attempts_days"],),
+            ).fetchone()[0],
+            "completed_tasks": self.connection.execute(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'done' AND updated_at < ?",
+                (cutoffs["completed_tasks_days"],),
+            ).fetchone()[0],
+            "document_files_deleted": 0,
+        }
+
+        result = {
+            "dry_run": dry_run,
+            "as_of": self._to_iso(as_of),
+            "policy": policy,
+            "cutoffs": cutoffs,
+            "deleted": deleted_counts,
+        }
+        if dry_run:
+            return result
+
+        with self.connection:
+            self.connection.execute(
+                "DELETE FROM audit_logs WHERE happened_at < ?",
+                (cutoffs["audit_logs_days"],),
+            )
+            self.connection.execute(
+                "DELETE FROM submission_attempts WHERE happened_at < ?",
+                (cutoffs["submission_attempts_days"],),
+            )
+            self.connection.execute(
+                "DELETE FROM tasks WHERE status = 'done' AND updated_at < ?",
+                (cutoffs["completed_tasks_days"],),
+            )
+            self.connection.execute(
+                "DELETE FROM documents WHERE created_at < ?",
+                (cutoffs["documents_days"],),
+            )
+            if expired_communication_ids:
+                placeholders = ", ".join("?" for _ in expired_communication_ids)
+                self.connection.execute(
+                    "DELETE FROM outreach_events WHERE communication_id IN (" + placeholders + ")",
+                    expired_communication_ids,
+                )
+                self.connection.execute(
+                    "DELETE FROM communications WHERE id IN (" + placeholders + ")",
+                    expired_communication_ids,
+                )
+
+        for path in expired_document_paths:
+            try:
+                if path.exists() and path.is_file():
+                    path.unlink()
+                    deleted_counts["document_files_deleted"] += 1
+            except OSError:
+                continue
+
+        self._log_action(
+            "data_retention_enforced",
+            dry_run=False,
+            as_of=result["as_of"],
+            deleted=deleted_counts,
+            policy=policy,
+        )
+        return result
+
     def list_locale_definitions(self) -> list[dict[str, Any]]:
         return [dict(definition) for definition in SUPPORTED_UI_LOCALES.values()]
 
@@ -1680,16 +3012,7 @@ class FundingBot:
             raise CredentialNotFoundError(f"No credential alias registered for {alias!r}.")
 
         env_var_name = row["env_var_name"]
-        if self.vault is not None:
-            try:
-                return self._parse_secret_payload(self.vault.get_secret(env_var_name))
-            except CredentialNotFoundError:
-                pass
-
-        raw_value = os.getenv(env_var_name)
-        if raw_value is None:
-            raise CredentialNotFoundError(f"Environment variable {env_var_name!r} is not set.")
-        return self._parse_secret_payload(raw_value)
+        return self.vault.resolve_credentials(env_var_name)
 
     def upsert_donor(
         self,
@@ -1768,13 +3091,188 @@ class FundingBot:
             ).fetchall()
         return [dict(row) for row in rows]
 
-    def set_donor_opt_out(self, email: str, opted_out: bool = True) -> None:
+    def _insert_consent_record(
+        self,
+        *,
+        donor_email: str,
+        status: str,
+        consented_at: datetime | str | None = None,
+        withdrawn_at: datetime | str | None = None,
+        channel: str = "email",
+        source: str = "manual",
+        proof: str | None = None,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_email = _validate_email(donor_email)
+        normalized_status = self._validate_consent_status(status)
+        normalized_channel = self._validate_consent_channel(channel)
+        consented_iso = self._normalize_filter_timestamp(consented_at) or self._to_iso()
+        withdrawn_iso = self._normalize_filter_timestamp(withdrawn_at)
+        recorded_iso = self._to_iso()
+        cursor = self.connection.execute(
+            """
+            INSERT INTO consent_records (
+                donor_email, channel, status, consented_at, withdrawn_at,
+                source, proof, notes, recorded_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                normalized_email,
+                normalized_channel,
+                normalized_status,
+                consented_iso,
+                withdrawn_iso,
+                source.strip() or "manual",
+                proof,
+                notes,
+                recorded_iso,
+            ),
+        )
+        row = self.connection.execute(
+            "SELECT * FROM consent_records WHERE id = ?",
+            (cursor.lastrowid,),
+        ).fetchone()
+        self.connection.commit()
+        record = ConsentRecord.from_row(row)
+        if record is None:
+            raise FundingBotError("Failed to persist consent record.")
+        self._log_action(
+            "donor_consent_recorded",
+            donor_email=record.donor_email,
+            channel=record.channel,
+            status=record.status,
+            consented_at=record.consented_at,
+            withdrawn_at=record.withdrawn_at,
+            source=record.source,
+        )
+        return record.to_dict()
+
+    def record_consent(
+        self,
+        donor_email: str,
+        *,
+        donor_name: str | None = None,
+        consented_at: datetime | str | None = None,
+        channel: str = "email",
+        source: str = "manual",
+        proof: str | None = None,
+        notes: str | None = None,
+        locale: str | None = None,
+    ) -> dict[str, Any]:
+        normalized_email = _validate_email(donor_email)
+        current = self.connection.execute(
+            "SELECT name, segment, locale FROM donors WHERE email = ?",
+            (normalized_email,),
+        ).fetchone()
+        effective_name = donor_name or (
+            current["name"] if current is not None else self._default_donor_name_from_email(normalized_email)
+        )
+        self.upsert_donor(
+            email=normalized_email,
+            name=effective_name,
+            opted_out=False,
+            segment=current["segment"] if current is not None else None,
+            locale=locale or (current["locale"] if current is not None else None),
+        )
+        return self._insert_consent_record(
+            donor_email=normalized_email,
+            status="granted",
+            consented_at=consented_at,
+            channel=channel,
+            source=source,
+            proof=proof,
+            notes=notes,
+        )
+
+    def list_consent_records(self, donor_email: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM consent_records"
+        params: list[Any] = []
+        if donor_email is not None:
+            query += " WHERE donor_email = ?"
+            params.append(_validate_email(donor_email))
+        query += " ORDER BY recorded_at DESC, id DESC"
+        rows = self.connection.execute(query, params).fetchall()
+        return [
+            record.to_dict()
+            for record in (ConsentRecord.from_row(row) for row in rows)
+            if record is not None
+        ]
+
+    def get_latest_consent_record(
+        self,
+        donor_email: str,
+        *,
+        channel: str = "email",
+    ) -> dict[str, Any] | None:
+        row = self.connection.execute(
+            """
+            SELECT * FROM consent_records
+            WHERE donor_email = ? AND channel = ?
+            ORDER BY recorded_at DESC, id DESC
+            LIMIT 1
+            """,
+            (_validate_email(donor_email), self._validate_consent_channel(channel)),
+        ).fetchone()
+        record = ConsentRecord.from_row(row)
+        return record.to_dict() if record is not None else None
+
+    def set_donor_opt_out(
+        self,
+        email: str,
+        opted_out: bool = True,
+        *,
+        donor_name: str | None = None,
+        source: str = "manual",
+        recorded_at: datetime | str | None = None,
+        notes: str | None = None,
+        channel: str = "email",
+    ) -> None:
+        normalized_email = _validate_email(email)
+        donor = self.connection.execute(
+            "SELECT name, locale FROM donors WHERE email = ?",
+            (normalized_email,),
+        ).fetchone()
+        if donor is None:
+            self.upsert_donor(
+                email=normalized_email,
+                name=donor_name or self._default_donor_name_from_email(normalized_email),
+                opted_out=opted_out,
+            )
+        else:
+            self.connection.execute(
+                "UPDATE donors SET opted_out = ? WHERE email = ?",
+                (int(opted_out), normalized_email),
+            )
+            self.connection.commit()
+
+        if opted_out:
+            latest = self.get_latest_consent_record(normalized_email, channel=channel)
+            consented_at = (latest or {}).get("consented_at")
+            self._insert_consent_record(
+                donor_email=normalized_email,
+                status="withdrawn",
+                consented_at=consented_at or recorded_at,
+                withdrawn_at=recorded_at,
+                channel=channel,
+                source=source,
+                notes=notes or "Donor opted out of future communications.",
+            )
+        else:
+            self.record_consent(
+                normalized_email,
+                donor_name=donor_name or (donor["name"] if donor is not None else None),
+                consented_at=recorded_at,
+                channel=channel,
+                source=source,
+                notes=notes or "Donor communication consent restored.",
+                locale=donor["locale"] if donor is not None else None,
+            )
         self.connection.execute(
             "UPDATE donors SET opted_out = ? WHERE email = ?",
-            (int(opted_out), email),
+            (int(opted_out), normalized_email),
         )
         self.connection.commit()
-        self._log_action("donor_opt_out_updated", email=email, opted_out=opted_out)
+        self._log_action("donor_opt_out_updated", email=normalized_email, opted_out=opted_out)
 
     def discover_opportunities(
         self,
@@ -1871,20 +3369,112 @@ class FundingBot:
         settings = self.load_search_settings()
         keyword_list = list(keywords) if keywords is not None else settings.get("keywords", [])
         source_list = list(trusted_sources) if trusted_sources is not None else settings.get("trusted_sources", [])
-        active_connectors = list(connectors) if connectors is not None else default_connectors()
+        if connectors is not None:
+            active_connectors = list(connectors)
+        elif self.connector_configs:
+            active_connectors = self.connector_registry.build_connectors(
+                self.connector_configs,
+                credential_resolver=self.resolve_credential,
+            )
+        else:
+            active_connectors = default_connectors()
+        fallback_mode = self._load_fallback_mode()
 
         candidates: list[dict[str, Any]] = []
         for connector in active_connectors:
+            connector_name = self._connector_name(connector)
+            cache_key = self._connector_cache_key(connector, keyword_list)
             health = connector.check_health()
             if not health.get("healthy", True):
                 self._log_action(
                     "connector_degraded",
-                    source=getattr(connector, "source_name", connector.__class__.__name__),
+                    source=connector_name,
                     state=health.get("state"),
                     last_error=health.get("last_error"),
                 )
+            try:
+                fetch_result = getattr(connector, "fetch_result", None)
+                if callable(fetch_result):
+                    result = fetch_result(keyword_list)
+                    opportunities = [dict(item) for item in result.get("opportunities", [])]
+                    schema_version = int(
+                        result.get("schema_version", getattr(connector, "result_schema_version", _CONNECTOR_RESULT_SCHEMA_VERSION))
+                    )
+                    metadata = dict(result.get("metadata", {}))
+                    source_status = str(metadata.get("source_status", "remote"))
+                else:
+                    opportunities = [dict(item) for item in connector.fetch_opportunities(keyword_list)]
+                    schema_version = int(getattr(connector, "result_schema_version", _CONNECTOR_RESULT_SCHEMA_VERSION))
+                    metadata = {"connector_name": connector_name, "source_status": "remote"}
+                    source_status = "remote"
+                self._store_connector_result(
+                    connector_name=connector_name,
+                    cache_key=cache_key,
+                    schema_version=schema_version,
+                    opportunities=opportunities,
+                    metadata=metadata,
+                    source_status=source_status,
+                )
+                candidates.extend(opportunities)
                 continue
-            candidates.extend(connector.fetch_opportunities(keyword_list))
+            except Exception as exc:
+                error_message = str(exc)
+
+            fallback_result = None
+            if fallback_mode in {"cache-first", "cache-only"}:
+                fallback_result = self._load_cached_connector_result(connector, keyword_list)
+                if fallback_result is not None:
+                    fallback_result["metadata"] = {
+                        **dict(fallback_result.get("metadata", {})),
+                        "fallback_mode": "cached",
+                        "activation_error": error_message,
+                    }
+                    fallback_result["source_status"] = "cached"
+            if fallback_result is None and fallback_mode == "cache-first":
+                fallback_result = self._default_connector_fallback(connector, keyword_list)
+            elif fallback_result is None and fallback_mode == "default-only":
+                fallback_result = self._default_connector_fallback(connector, keyword_list)
+            elif fallback_mode == "disabled":
+                raise RuntimeError(error_message)
+
+            if fallback_result is None:
+                logging.getLogger(__name__).warning(
+                    "Connector %s failed with no fallback available: %s",
+                    connector_name,
+                    error_message,
+                )
+                continue
+
+            fallback_result["metadata"] = {
+                **dict(fallback_result.get("metadata", {})),
+                "connector_name": connector_name,
+                "cache_key": cache_key,
+                "fallback_activated_at": self._to_iso(),
+            }
+            self._store_connector_result(
+                connector_name=connector_name,
+                cache_key=cache_key,
+                schema_version=int(fallback_result["schema_version"]),
+                opportunities=fallback_result["opportunities"],
+                metadata=fallback_result["metadata"],
+                source_status=str(fallback_result.get("source_status", "cached")),
+            )
+            logging.getLogger(__name__).warning(
+                "Connector %s fallback activated (%s): %s",
+                connector_name,
+                fallback_result["metadata"].get("fallback_mode", fallback_result.get("source_status", "cached")),
+                error_message,
+            )
+            self._log_action(
+                "connector_fallback_activated",
+                source=connector_name,
+                fallback_mode=fallback_result["metadata"].get("fallback_mode", fallback_result.get("source_status", "cached")),
+                error=error_message,
+                cache_key=cache_key,
+                schema_version=int(fallback_result["schema_version"]),
+                result_count=len(fallback_result["opportunities"]),
+            )
+            candidates.extend([dict(item) for item in fallback_result["opportunities"]])
 
         return self.discover_opportunities(
             candidates,
@@ -2068,6 +3658,7 @@ class FundingBot:
         description: str = "",
         status: str = "todo",
         created_at: datetime | None = None,
+        due_date: datetime | str | None = None,
     ) -> dict[str, Any]:
         normalized_title = str(title).strip()
         normalized_assignee = str(assigned_to).strip().lower()
@@ -2078,17 +3669,19 @@ class FundingBot:
 
         normalized_status = self._normalize_task_status(status)
         timestamp = self._to_iso(created_at)
+        normalized_due_date = self._normalize_due_date(due_date)
         cursor = self.connection.execute(
             """
             INSERT INTO tasks (
-                title, description, assigned_to, status, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?)
+                title, description, assigned_to, status, due_date, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 normalized_title,
                 str(description or "").strip(),
                 normalized_assignee,
                 normalized_status,
+                normalized_due_date,
                 timestamp,
                 timestamp,
             ),
@@ -2101,6 +3694,7 @@ class FundingBot:
             title=task["title"],
             assigned_to=task["assigned_to"],
             status=task["status"],
+            due_date=task["due_date"],
         )
         return task
 
@@ -2110,11 +3704,47 @@ class FundingBot:
             raise FundingBotError(f"Task {task_id!r} does not exist.")
         return self._serialize_task(row)
 
+    def assign_task(
+        self,
+        task_id: int,
+        *,
+        assigned_to: str,
+        changed_by: str,
+    ) -> dict[str, Any]:
+        task = self.get_task(task_id)
+        normalized_assignee = str(assigned_to).strip().lower()
+        normalized_changed_by = str(changed_by).strip().lower()
+        if not normalized_assignee:
+            raise ValueError("Task assignee is required.")
+        if task["assigned_to"] == normalized_assignee:
+            return task
+
+        updated_at = self._to_iso()
+        with self.connection:
+            updated = self.connection.execute(
+                "UPDATE tasks SET assigned_to = ?, updated_at = ? WHERE id = ?",
+                (normalized_assignee, updated_at, task_id),
+            )
+            if updated.rowcount == 0:
+                raise TaskAssignmentError(f"Task {task_id!r} does not exist.")
+        self._log_action(
+            "task_assignment_changed",
+            task_id=task_id,
+            title=task["title"],
+            previous_assigned_to=task["assigned_to"],
+            assigned_to=normalized_assignee,
+            changed_by=normalized_changed_by,
+        )
+        return self.get_task(task_id)
+
     def list_tasks(
         self,
         *,
         assigned_to: str | None = None,
         status: str | None = None,
+        due_date_before: datetime | str | None = None,
+        due_date_after: datetime | str | None = None,
+        sort: str | None = None,
     ) -> list[dict[str, Any]]:
         query = "SELECT * FROM tasks"
         params: list[Any] = []
@@ -2125,11 +3755,72 @@ class FundingBot:
         if status:
             clauses.append("status = ?")
             params.append(self._normalize_task_status(status))
+        normalized_due_date_before = self._normalize_due_date(due_date_before)
+        if normalized_due_date_before:
+            clauses.append("due_date IS NOT NULL AND due_date <= ?")
+            params.append(normalized_due_date_before)
+        normalized_due_date_after = self._normalize_due_date(due_date_after)
+        if normalized_due_date_after:
+            clauses.append("due_date IS NOT NULL AND due_date >= ?")
+            params.append(normalized_due_date_after)
         if clauses:
             query += " WHERE " + " AND ".join(clauses)
-        query += " ORDER BY updated_at DESC, id DESC"
+        query += " ORDER BY " + self._task_sort_clause(sort)
         rows = self.connection.execute(query, params).fetchall()
         return [self._serialize_task(row) for row in rows]
+
+    def reassign_task(
+        self,
+        task_id: int,
+        *,
+        assigned_to: str,
+        changed_by: str,
+    ) -> dict[str, Any]:
+        task = self.get_task(task_id)
+        normalized_assignee = str(assigned_to).strip().lower()
+        if not normalized_assignee:
+            raise ValueError("Task assignee is required.")
+        if task["assigned_to"] == normalized_assignee:
+            return task
+
+        updated_at = self._to_iso()
+        with self.connection:
+            updated = self.connection.execute(
+                "UPDATE tasks SET assigned_to = ?, updated_at = ? WHERE id = ?",
+                (normalized_assignee, updated_at, task_id),
+            )
+            if updated.rowcount == 0:
+                raise FundingBotError(f"Task {task_id!r} does not exist.")
+        self._log_action(
+            "task_reassigned",
+            task_id=task_id,
+            title=task["title"],
+            previous_assigned_to=task["assigned_to"],
+            assigned_to=normalized_assignee,
+            changed_by=str(changed_by).strip().lower(),
+        )
+        return self.get_task(task_id)
+
+    @staticmethod
+    def _task_sort_clause(sort: str | None) -> str:
+        sort_key = (sort or "").strip().lower()
+        sort_map = {
+            "": "updated_at DESC, id DESC",
+            "updated_at": "updated_at DESC, id DESC",
+            "-updated_at": "updated_at ASC, id ASC",
+            "assignee": "assigned_to COLLATE NOCASE ASC, due_date IS NULL ASC, due_date ASC, id ASC",
+            "-assignee": "assigned_to COLLATE NOCASE DESC, due_date IS NULL ASC, due_date DESC, id DESC",
+            "status": "status COLLATE NOCASE ASC, due_date IS NULL ASC, due_date ASC, id ASC",
+            "-status": "status COLLATE NOCASE DESC, due_date IS NULL ASC, due_date DESC, id DESC",
+            "due_date": "due_date IS NULL ASC, due_date ASC, id ASC",
+            "-due_date": "due_date IS NULL ASC, due_date DESC, id DESC",
+        }
+        if sort_key not in sort_map:
+            raise ValueError(
+                "Invalid task sort. Expected one of "
+                "['assignee', '-assignee', 'due_date', '-due_date', 'status', '-status']."
+            )
+        return sort_map[sort_key]
 
     def get_task_status_counts(self, *, assigned_to: str | None = None) -> dict[str, int]:
         query = "SELECT status, COUNT(*) AS total FROM tasks"
@@ -2180,6 +3871,270 @@ class FundingBot:
         updated_task = self.get_task(task_id)
         updated_task["notification"] = notification
         return updated_task
+
+    @staticmethod
+    def _serialize_task_run(row: sqlite3.Row) -> dict[str, Any]:
+        record = dict(row)
+        record["payload"] = json.loads(record.pop("payload_json") or "{}")
+        result_json = record.pop("result_json")
+        record["result"] = json.loads(result_json) if result_json else None
+        callback_payload_json = record.pop("callback_payload_json")
+        record["callback_payload"] = (
+            json.loads(callback_payload_json) if callback_payload_json else None
+        )
+        record["shutdown_requested"] = bool(record.get("shutdown_requested"))
+        return record
+
+    @staticmethod
+    def generate_idempotency_key(task_name: str, payload: dict[str, Any] | None = None) -> str:
+        canonical_payload = json.dumps(payload or {}, sort_keys=True, separators=(",", ":"))
+        raw_key = f"{str(task_name).strip().lower()}|{canonical_payload}"
+        return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+    def get_task_run(self, idempotency_key: str) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM task_runs WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        if row is None:
+            raise FundingBotError(f"Task run with idempotency key {idempotency_key!r} does not exist.")
+        return self._serialize_task_run(row)
+
+    def _claim_task_run(
+        self,
+        *,
+        task_name: str,
+        payload: dict[str, Any] | None,
+        idempotency_key: str | None,
+        worker_id: str | None,
+    ) -> tuple[str, bool, dict[str, Any]]:
+        normalized_task_name = str(task_name).strip()
+        if not normalized_task_name:
+            raise ValueError("Task name is required.")
+        claimed_key = idempotency_key or self.generate_idempotency_key(normalized_task_name, payload)
+        timestamp = self._to_iso()
+        payload_json = json.dumps(payload or {}, sort_keys=True)
+        try:
+            with self.connection:
+                self.connection.execute(
+                    """
+                    INSERT INTO task_runs (
+                        task_id,
+                        idempotency_key,
+                        task_name,
+                        status,
+                        progress,
+                        message,
+                        payload_json,
+                        worker_id,
+                        duplicate_requests,
+                        shutdown_requested,
+                        created_at,
+                        updated_at
+                    ) VALUES (?, ?, ?, 'running', 0, 'Task started.', ?, ?, 0, 0, ?, ?)
+                    """,
+                    (
+                        claimed_key,
+                        claimed_key,
+                        normalized_task_name,
+                        payload_json,
+                        worker_id,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            with self.connection:
+                self.connection.execute(
+                    """
+                    UPDATE task_runs
+                    SET duplicate_requests = COALESCE(duplicate_requests, 0) + 1,
+                        updated_at = ?
+                    WHERE idempotency_key = ?
+                    """,
+                    (timestamp, claimed_key),
+                )
+            task_run = self.get_task_run(claimed_key)
+            self._log_action(
+                "queue_task_duplicate_prevented",
+                idempotency_key=claimed_key,
+                task_name=normalized_task_name,
+                status=task_run["status"],
+            )
+            return claimed_key, False, task_run
+        task_run = self.get_task_run(claimed_key)
+        self._log_action(
+            "queue_task_started",
+            idempotency_key=claimed_key,
+            task_name=normalized_task_name,
+            worker_id=worker_id,
+        )
+        return claimed_key, True, task_run
+
+    def _finalize_task_run(
+        self,
+        *,
+        idempotency_key: str,
+        status: str,
+        progress: int,
+        message: str,
+        result: Any = None,
+        error_message: str | None = None,
+    ) -> dict[str, Any]:
+        timestamp = self._to_iso()
+        result_json = json.dumps(result, sort_keys=True, default=str) if result is not None else None
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE task_runs
+                SET status = ?,
+                    progress = ?,
+                    message = ?,
+                    result_json = ?,
+                    error_message = ?,
+                    updated_at = ?,
+                    completed_at = ?
+                WHERE idempotency_key = ?
+                """,
+                (
+                    status,
+                    progress,
+                    message,
+                    result_json,
+                    error_message,
+                    timestamp,
+                    timestamp,
+                    idempotency_key,
+                ),
+            )
+        return self.get_task_run(idempotency_key)
+
+    def request_task_run_shutdown(self, idempotency_key: str, *, signal_name: str | None = None) -> dict[str, Any]:
+        timestamp = self._to_iso()
+        message = "Shutdown requested for in-flight task."
+        if signal_name:
+            message = f"{message} Signal: {signal_name}."
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE task_runs
+                SET shutdown_requested = 1,
+                    message = ?,
+                    updated_at = ?
+                WHERE idempotency_key = ?
+                """,
+                (message, timestamp, idempotency_key),
+            )
+        task_run = self.get_task_run(idempotency_key)
+        self._log_action(
+            "queue_task_shutdown_requested",
+            idempotency_key=idempotency_key,
+            task_name=task_run["task_name"],
+            signal=signal_name,
+        )
+        return task_run
+
+    def get_queue_metrics(self) -> dict[str, int]:
+        row = self.connection.execute(
+            """
+            SELECT
+                SUM(CASE WHEN status = 'running' THEN 1 ELSE 0 END) AS running,
+                SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) AS completed,
+                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed,
+                SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
+                COALESCE(SUM(duplicate_requests), 0) AS duplicate_preventions
+            FROM task_runs
+            """
+        ).fetchone()
+        return {
+            "running": int(row["running"] or 0),
+            "completed": int(row["completed"] or 0),
+            "failed": int(row["failed"] or 0),
+            "cancelled": int(row["cancelled"] or 0),
+            "duplicate_preventions": int(row["duplicate_preventions"] or 0),
+        }
+
+    def execute_queue_task(
+        self,
+        task_name: str,
+        payload: dict[str, Any] | None,
+        task_callable: Callable[[QueueTaskContext, dict[str, Any]], Any],
+        *,
+        idempotency_key: str | None = None,
+        worker_id: str | None = None,
+        install_signal_handlers: bool = True,
+    ) -> dict[str, Any]:
+        claimed_key, claimed, task_run = self._claim_task_run(
+            task_name=task_name,
+            payload=payload,
+            idempotency_key=idempotency_key,
+            worker_id=worker_id,
+        )
+        if not claimed:
+            task_run["duplicate"] = True
+            return task_run
+
+        controller = GracefulShutdownController(
+            lambda signum: self.request_task_run_shutdown(
+                claimed_key,
+                signal_name=signal.Signals(signum).name,
+            )
+        )
+        if install_signal_handlers:
+            controller.install()
+        context = QueueTaskContext(bot=self, idempotency_key=claimed_key, controller=controller)
+        try:
+            context.checkpoint("Shutdown requested before queue task execution started.")
+            result = task_callable(context, dict(payload or {}))
+            context.checkpoint("Shutdown requested after queue task checkpoint.")
+        except GracefulShutdownRequested as exc:
+            task_run = self._finalize_task_run(
+                idempotency_key=claimed_key,
+                status="cancelled",
+                progress=0,
+                message=str(exc),
+                error_message=str(exc),
+            )
+            self._log_action(
+                "queue_task_cancelled",
+                idempotency_key=claimed_key,
+                task_name=task_run["task_name"],
+            )
+            task_run["duplicate"] = False
+            return task_run
+        except Exception as exc:
+            task_run = self._finalize_task_run(
+                idempotency_key=claimed_key,
+                status="failed",
+                progress=0,
+                message="Task failed.",
+                error_message=str(exc),
+            )
+            self._log_action(
+                "queue_task_failed",
+                idempotency_key=claimed_key,
+                task_name=task_run["task_name"],
+                error_message=str(exc),
+            )
+            raise
+        finally:
+            if install_signal_handlers:
+                controller.restore()
+
+        task_run = self._finalize_task_run(
+            idempotency_key=claimed_key,
+            status="completed",
+            progress=100,
+            message="Task completed.",
+            result=result,
+        )
+        self._log_action(
+            "queue_task_completed",
+            idempotency_key=claimed_key,
+            task_name=task_run["task_name"],
+        )
+        task_run["duplicate"] = False
+        return task_run
 
     def _get_opportunity(self, signature: str) -> sqlite3.Row:
         row = self.connection.execute(
@@ -2438,6 +4393,14 @@ class FundingBot:
         if donor["opted_out"]:
             raise OptOutError(f"{donor_email} has opted out of outreach.")
 
+        consent_context = context or {}
+        latest_consent = self.get_latest_consent_record(
+            donor_email,
+            channel=consent_context.get("consent_channel", "email"),
+        )
+        if latest_consent is not None and latest_consent["status"] == "withdrawn":
+            raise OptOutError(f"{donor_email} has opted out of outreach.")
+
         send_time = self._as_utc(sent_at)
         if donor["last_contact_at"]:
             last_contact = self._as_utc(datetime.fromisoformat(donor["last_contact_at"]))
@@ -2458,7 +4421,28 @@ class FundingBot:
             ),
         }
         merged_context.update(profile)
-        merged_context.update(context or {})
+        merged_context.update(consent_context)
+
+        if latest_consent is None:
+            self.record_consent(
+                donor_email,
+                donor_name=donor_name,
+                consented_at=send_time,
+                channel=merged_context.get("consent_channel", "email"),
+                source=str(merged_context.get("consent_source", "outreach_delivery")),
+                proof=(
+                    str(merged_context["consent_proof"])
+                    if merged_context.get("consent_proof") is not None
+                    else None
+                ),
+                notes=(
+                    str(merged_context["consent_notes"])
+                    if merged_context.get("consent_notes") is not None
+                    else "Consent record captured automatically when outreach was first sent."
+                ),
+                locale=donor["locale"],
+            )
+
         subject = subject_template.format(**merged_context)
         body = body_template.format(**merged_context).rstrip()
         if merged_context["opt_out_url"] not in body:
@@ -2638,6 +4622,7 @@ class FundingBot:
             ]
         export = {
             "donor": dict(donor) if donor else None,
+            "consent_records": self.list_consent_records(donor_email),
             "communications": [dict(row) for row in communications],
             "outreach_events": events,
             "audit_logs": [
@@ -2704,6 +4689,105 @@ class FundingBot:
             anonymized_email=anonymized_email,
         )
 
+    @staticmethod
+    def _require_babel() -> None:
+        if (
+            babel_format_date is None
+            or babel_format_datetime is None
+            or babel_format_decimal is None
+        ):
+            raise FundingBotError(
+                "Document localization requires Babel. Install it with `pip install Babel`."
+            )
+
+    @classmethod
+    def _validate_document_locale(cls, locale: str | None) -> str:
+        normalized = (locale or cls.DEFAULT_TEMPLATE_LOCALE).strip().lower().replace("_", "-")
+        canonical = _DOCUMENT_LOCALE_ALIASES.get(normalized)
+        if canonical is None:
+            raise ValueError(
+                f"Unsupported document locale {locale!r}. Expected one of "
+                f"{sorted(cls.SUPPORTED_TEMPLATE_LOCALES)}."
+            )
+        return canonical
+
+    @classmethod
+    def _document_locale_settings(cls, locale: str | None) -> dict[str, str]:
+        return dict(_DOCUMENT_LOCALE_CONFIG[cls._validate_document_locale(locale)])
+
+    @classmethod
+    def _normalize_document_translations(
+        cls,
+        *sources: dict[str, Any] | None,
+    ) -> dict[str, dict[str, Any]]:
+        normalized: dict[str, dict[str, Any]] = {}
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            for locale_name, values in source.items():
+                if not isinstance(locale_name, str) or not isinstance(values, dict):
+                    continue
+                try:
+                    canonical_locale = cls._validate_document_locale(locale_name)
+                except ValueError:
+                    continue
+                bucket = normalized.setdefault(canonical_locale, {})
+                bucket.update(values)
+        return normalized
+
+    @classmethod
+    def _format_document_value(cls, value: Any, *, locale: str) -> Any:
+        normalized_locale = cls._validate_document_locale(locale)
+        settings = cls._document_locale_settings(normalized_locale)
+
+        if isinstance(value, datetime):
+            cls._require_babel()
+            return babel_format_datetime(
+                cls._as_utc(value),
+                format=settings["datetime_format"],
+                locale=settings["babel_locale"],
+            )
+        if isinstance(value, date):
+            cls._require_babel()
+            return babel_format_date(
+                value,
+                format=settings["date_format"],
+                locale=settings["babel_locale"],
+            )
+        if isinstance(value, Decimal | Number) and not isinstance(value, bool):
+            cls._require_babel()
+            return babel_format_decimal(value, locale=settings["babel_locale"])
+        return value
+
+    @classmethod
+    def _build_document_context(
+        cls,
+        profile: dict[str, Any],
+        context: dict[str, Any] | None,
+        *,
+        locale: str,
+    ) -> dict[str, Any]:
+        merged_context = dict(profile)
+        merged_context.update(context or {})
+
+        translations = cls._normalize_document_translations(
+            profile.get("translations") if isinstance(profile, dict) else None,
+            (context or {}).get("translations"),
+        )
+        rendered_context = {
+            key: cls._format_document_value(value, locale=locale)
+            for key, value in merged_context.items()
+            if key != "translations"
+        }
+        rendered_context["document_locale"] = locale
+        rendered_context["t"] = _DocumentTranslationLookup(
+            bot=cls,
+            locale=locale,
+            translations=translations,
+        )
+        rendered_context["translate"] = rendered_context["t"]
+        return rendered_context
+
     def generate_document(
         self,
         *,
@@ -2712,11 +4796,16 @@ class FundingBot:
         output_dir: str | os.PathLike[str],
         context: dict[str, Any] | None = None,
         formats: Iterable[str] = ("pdf", "docx"),
+        locale: str | None = None,
     ) -> dict[str, str]:
         profile = self.load_organization_profile()
-        merged_context = dict(profile)
-        merged_context.update(context or {})
-        rendered = template.format(**merged_context).strip() + "\n"
+        document_locale = self._validate_document_locale(locale)
+        rendered_context = self._build_document_context(
+            profile,
+            context,
+            locale=document_locale,
+        )
+        rendered = template.format_map(rendered_context).strip() + "\n"
 
         target_dir = Path(output_dir)
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -2744,7 +4833,12 @@ class FundingBot:
             )
 
         self.connection.commit()
-        self._log_action("documents_generated", kind=kind, formats=sorted(generated))
+        self._log_action(
+            "documents_generated",
+            kind=kind,
+            formats=sorted(generated),
+            locale=document_locale,
+        )
         return generated
 
     def _write_pdf(self, path: Path, text: str) -> None:
@@ -2986,9 +5080,11 @@ class FundingBot:
         ).fetchall()
         submitted_apps = self.connection.execute(
             """
-            SELECT donor_name, portal_url, status FROM applications
-            WHERE substr(submitted_at, 1, 10) = ?
-            ORDER BY submitted_at
+            SELECT a.donor_name, a.portal_url, a.status, o.title
+            FROM applications a
+            JOIN opportunities o ON o.signature = a.opportunity_signature
+            WHERE substr(a.submitted_at, 1, 10) = ?
+            ORDER BY a.submitted_at
             """,
             (date,),
         ).fetchall()
@@ -3002,9 +5098,11 @@ class FundingBot:
         ).fetchall()
         pending = self.connection.execute(
             """
-            SELECT donor_name, status, next_action FROM applications
-            WHERE status IN ('pending', 'submitted', 'in_review')
-            ORDER BY submitted_at
+            SELECT a.donor_name, a.status, a.next_action, o.title
+            FROM applications a
+            JOIN opportunities o ON o.signature = a.opportunity_signature
+            WHERE a.status IN ('pending', 'submitted', 'in_review')
+            ORDER BY a.submitted_at
             """
         ).fetchall()
 
@@ -3019,12 +5117,12 @@ class FundingBot:
         )
         application_lines = format_lines(
             submitted_apps,
-            lambda row: f"   • {row['donor_name']} – {row['status'].replace('_', ' ').title()}",
+            lambda row: f"   • {row['title']} – {row['status'].replace('_', ' ').title()}",
             "No applications submitted",
         )
         pending_lines = format_lines(
             pending,
-            lambda row: f"   • {row['donor_name']} – {row['status'].replace('_', ' ').title()} ({row['next_action']})",
+            lambda row: f"   • {row['title']} – {row['status'].replace('_', ' ').title()} ({row['next_action']})",
             "No pending applications",
         )
 
@@ -3214,6 +5312,50 @@ def _parse_csv_argument(raw_value: str | None) -> list[str] | None:
     if raw_value is None:
         return None
     return _normalize_text_list(raw_value.split(","))
+
+
+def _queue_async_task(
+    task_label: str,
+    task_callable: Any,
+    *,
+    task_kwargs: dict[str, Any],
+    ready_renderer: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
+    async_result = task_callable.delay(**task_kwargs)
+    print(f"Queued {task_label} task {async_result.id}.")
+    print(f"Task status: {async_result.status}.")
+    if async_result.ready():
+        result = async_result.get(propagate=True)
+        if isinstance(result, dict) and ready_renderer is not None:
+            ready_renderer(result)
+    else:
+        print("Track progress in the task_runs table or the configured Celery result backend.")
+
+
+def _render_discover_task_result(result: dict[str, Any]) -> None:
+    found = result.get("new_opportunities", [])
+    if found:
+        _print_rows(found, ["signature", "source", "donor_name", "title", "category"])
+    else:
+        print("No new opportunities found.")
+
+
+def _render_outreach_task_result(result: dict[str, Any]) -> None:
+    print(f"Subject: {result['subject']}\n")
+    print(result["body"])
+    if result.get("dry_run"):
+        print("\n(dry run: no email was actually sent)")
+    else:
+        print(f"\nOutreach email sent to {result['email']}.")
+
+
+def _render_daily_summary_task_result(result: dict[str, Any]) -> None:
+    print(f"Subject: {result['subject']}\n")
+    print(result["body"])
+    if result.get("dry_run"):
+        print("\n(dry run: no email was actually sent)")
+    else:
+        print(f"\nDaily summary sent to {result['recipient']}.")
 
 
 def _build_arg_parser() -> "argparse.ArgumentParser":
@@ -3468,13 +5610,18 @@ def main(argv: list[str] | None = None) -> None:
     bot = FundingBot(db_path=args.db)
     try:
         if args.command == "send-daily-summary":
-            sender = None if args.dry_run else SMTPEmailSender.from_env()
-            summary = bot.send_daily_summary(recipient=args.recipient, sender=sender)
-            if args.dry_run:
-                print(f"Subject: {summary['subject']}\n")
-                print(summary["body"])
-            else:
-                print(f"Daily summary sent to {args.recipient}.")
+            from celery_tasks import send_daily_summary_task
+
+            _queue_async_task(
+                "send-daily-summary",
+                send_daily_summary_task,
+                task_kwargs={
+                    "db_path": args.db,
+                    "recipient": args.recipient,
+                    "dry_run": args.dry_run,
+                },
+                ready_renderer=_render_daily_summary_task_result,
+            )
         elif args.command == "list-opportunities":
             rows = bot.list_opportunities(status=args.status)
             if args.limit is not None:
@@ -3504,13 +5651,18 @@ def main(argv: list[str] | None = None) -> None:
             else:
                 print(report_json)
         elif args.command == "discover":
-            keywords = _parse_csv_argument(args.keywords)
-            trusted_sources = _parse_csv_argument(args.trusted_sources)
-            found = bot.run_discovery(keywords=keywords, trusted_sources=trusted_sources)
-            if found:
-                _print_rows(found, ["signature", "source", "donor_name", "title", "category"])
-            else:
-                print("No new opportunities found.")
+            from celery_tasks import discover_task
+
+            _queue_async_task(
+                "discover",
+                discover_task,
+                task_kwargs={
+                    "db_path": args.db,
+                    "keywords": _parse_csv_argument(args.keywords),
+                    "trusted_sources": _parse_csv_argument(args.trusted_sources),
+                },
+                ready_renderer=_render_discover_task_result,
+            )
         elif args.command == "test-connector":
             connector = create_connector(args.connector)
             validation = connector.validate_connectivity(
@@ -3519,43 +5671,22 @@ def main(argv: list[str] | None = None) -> None:
             )
             print(json.dumps(validation, indent=2))
         elif args.command == "send-outreach":
-            sender = None if args.dry_run else SMTPEmailSender.from_env()
-            if args.subject is None and args.body is None:
-                if args.locale is not None:
-                    bot.upsert_donor(email=args.email, name=args.name, locale=args.locale)
-                result = bot.send_outreach_from_template(
-                    bot.DEFAULT_OUTREACH_TEMPLATE,
-                    args.email,
-                    args.name,
-                    sender=sender,
-                )
-            else:
-                subject_template, body_template = args.subject, args.body
-                if subject_template is None or body_template is None:
-                    default_subject, default_body = bot._resolve_catalog_template(
-                        bot.DEFAULT_OUTREACH_TEMPLATE,
-                        segment="unknown",
-                        locale=args.locale or bot.DEFAULT_TEMPLATE_LOCALE,
-                    ) or (
-                        "Thank you for supporting {organization_name}",
-                        "Dear {donor_name},\n\nThank you for your continued interest in {organization_name}.",
-                    )
-                    subject_template = subject_template or default_subject
-                    body_template = body_template or default_body
-                result = bot.send_outreach(
-                    donor_email=args.email,
-                    donor_name=args.name,
-                    subject_template=subject_template,
-                    body_template=body_template,
-                    sender=sender,
-                    locale=args.locale,
-                )
-            print(f"Subject: {result['subject']}\n")
-            print(result["body"])
-            if args.dry_run:
-                print("\n(dry run: no email was actually sent)")
-            else:
-                print(f"\nOutreach email sent to {args.email}.")
+            from celery_tasks import send_outreach_task
+
+            _queue_async_task(
+                "send-outreach",
+                send_outreach_task,
+                task_kwargs={
+                    "db_path": args.db,
+                    "donor_email": args.email,
+                    "donor_name": args.name,
+                    "subject_template": args.subject,
+                    "body_template": args.body,
+                    "locale": args.locale,
+                    "dry_run": args.dry_run,
+                },
+                ready_renderer=_render_outreach_task_result,
+            )
         elif args.command == "set-organization-profile":
             try:
                 raw_json = (
