@@ -5,6 +5,7 @@ import base64
 import csv
 import hashlib
 import html
+import importlib.util
 import inspect
 import io
 import json
@@ -41,6 +42,379 @@ from opentelemetry.trace import SpanKind
 from cache_manager import CacheManager
 from cli_config import load_cli_config
 from database import DatabaseManager
+
+
+def _load_local_module(
+    module_name: str,
+    relative_path: str,
+    required_attrs: Iterable[str],
+    *,
+    force_reload: bool = False,
+) -> Any:
+    existing = sys.modules.get(module_name)
+    if (
+        not force_reload
+        and existing is not None
+        and all(hasattr(existing, attr) for attr in required_attrs)
+    ):
+        return existing
+    module_path = Path(__file__).resolve().parent / relative_path
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load module {module_name!r} from {module_path}.")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _build_observability_compat_module(module: Any) -> Any:
+    from contextlib import contextmanager
+
+    trace_carrier: ContextVar[dict[str, str] | None] = ContextVar(
+        "funding_bot_trace_carrier",
+        default=None,
+    )
+
+    class _Span:
+        def set_attribute(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def record_exception(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def set_status(self, *args: Any, **kwargs: Any) -> None:
+            return None
+
+        def get_span_context(self) -> Any:
+            return type(
+                "_SpanContext",
+                (),
+                {"is_valid": False, "trace_id": 0},
+            )()
+
+    @contextmanager
+    def _start_span(*args: Any, **kwargs: Any) -> Any:
+        incoming = {
+            key: value
+            for key, value in dict(kwargs.get("carrier") or {}).items()
+            if str(key).lower() in {"traceparent", "tracestate", "baggage"}
+        }
+        carrier = dict(incoming or _capture_current_context())
+        carrier.setdefault("traceparent", f"00-{secrets.token_hex(16)}-{secrets.token_hex(8)}-01")
+        token = trace_carrier.set(carrier)
+        try:
+            yield _Span()
+        finally:
+            trace_carrier.reset(token)
+
+    def _capture_current_context() -> dict[str, str]:
+        current = trace_carrier.get()
+        if current:
+            return dict(current)
+        return {"traceparent": f"00-{secrets.token_hex(16)}-{secrets.token_hex(8)}-01"}
+
+    def _inject_context(carrier: dict[str, str], *, context: Any | None = None) -> dict[str, str]:
+        trace_headers = context or _capture_current_context()
+        for key in ("traceparent", "tracestate", "baggage"):
+            value = trace_headers.get(key)
+            if value:
+                carrier[key] = value
+        return carrier
+
+    def _current_trace_id() -> str | None:
+        traceparent = _capture_current_context().get("traceparent", "")
+        parts = traceparent.split("-")
+        if len(parts) >= 4 and len(parts[1]) == 32:
+            return parts[1]
+        return None
+
+    def _tracing_configuration_summary() -> dict[str, Any]:
+        return {"enabled": False, "exporter": "none", "target": ""}
+
+    slo_definitions = (
+        {
+            "name": "connector_latency",
+            "label": "Connector latency",
+            "description": "Connector requests should stay responsive while keeping degraded responses rare.",
+            "latency_target_seconds": 2.0,
+            "max_error_rate": 0.05,
+            "min_throughput_per_hour": None,
+            "window_hours": 24,
+        },
+        {
+            "name": "task_queue_throughput",
+            "label": "Task queue throughput",
+            "description": "Background jobs should complete fast enough to sustain normal operations.",
+            "latency_target_seconds": 60.0,
+            "max_error_rate": 0.02,
+            "min_throughput_per_hour": 5.0,
+            "window_hours": 24,
+        },
+        {
+            "name": "dashboard_response_time",
+            "label": "Dashboard response time",
+            "description": "Dashboard pages should remain fast for authenticated operators.",
+            "latency_target_seconds": 0.75,
+            "max_error_rate": 0.01,
+            "min_throughput_per_hour": 5.0,
+            "window_hours": 24,
+        },
+    )
+    slo_definition_map = {definition["name"]: definition for definition in slo_definitions}
+
+    def _observability_db_path(db_path: str | None = None) -> str | None:
+        resolved = (
+            db_path
+            or os.environ.get("FUNDING_BOT_OBSERVABILITY_DB_PATH")
+            or os.environ.get("BOT_DB_PATH")
+        )
+        if not resolved or str(resolved).strip() == ":memory:":
+            return None
+        return str(resolved)
+
+    def _to_iso(value: datetime | None = None) -> str:
+        normalized = value or datetime.now(timezone.utc)
+        if normalized.tzinfo is None:
+            normalized = normalized.replace(tzinfo=timezone.utc)
+        return normalized.astimezone(timezone.utc).isoformat()
+
+    def _ensure_slo_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS slo_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                slo_name TEXT NOT NULL,
+                component TEXT NOT NULL,
+                latency_seconds REAL NOT NULL,
+                success INTEGER NOT NULL,
+                throughput_units REAL NOT NULL DEFAULT 1,
+                metadata_json TEXT NOT NULL DEFAULT '{}',
+                recorded_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_slo_events_name_recorded_at
+            ON slo_events(slo_name, recorded_at DESC)
+            """
+        )
+
+    def _record_slo_event(
+        slo_name: str,
+        *,
+        component: str,
+        latency_seconds: float,
+        success: bool,
+        throughput_units: float = 1.0,
+        metadata: dict[str, Any] | None = None,
+        connection: sqlite3.Connection | None = None,
+        db_path: str | None = None,
+        recorded_at: datetime | None = None,
+    ) -> None:
+        if slo_name not in slo_definition_map:
+            return
+        row = (
+            slo_name,
+            component,
+            max(0.0, float(latency_seconds)),
+            1 if success else 0,
+            max(0.0, float(throughput_units)),
+            json.dumps(metadata or {}, sort_keys=True),
+            _to_iso(recorded_at),
+        )
+        if connection is not None:
+            _ensure_slo_schema(connection)
+            connection.execute(
+                """
+                INSERT INTO slo_events (
+                    slo_name, component, latency_seconds, success,
+                    throughput_units, metadata_json, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                row,
+            )
+            return
+        resolved_db_path = _observability_db_path(db_path)
+        if resolved_db_path is None:
+            return
+        standalone = sqlite3.connect(resolved_db_path, timeout=2.0)
+        try:
+            _ensure_slo_schema(standalone)
+            standalone.execute(
+                """
+                INSERT INTO slo_events (
+                    slo_name, component, latency_seconds, success,
+                    throughput_units, metadata_json, recorded_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                row,
+            )
+            standalone.commit()
+        finally:
+            standalone.close()
+
+    def _percentile(values: list[float], percentile: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        if len(ordered) == 1:
+            return ordered[0]
+        rank = max(0.0, min(1.0, percentile)) * (len(ordered) - 1)
+        lower = int(rank)
+        upper = min(lower + 1, len(ordered) - 1)
+        weight = rank - lower
+        return ordered[lower] * (1 - weight) + ordered[upper] * weight
+
+    def _summarize_rows(definition: dict[str, Any], rows: list[sqlite3.Row]) -> dict[str, Any]:
+        latencies = [float(row["latency_seconds"]) for row in rows]
+        total = len(rows)
+        failures = sum(1 for row in rows if not bool(row["success"]))
+        successful_units = sum(float(row["throughput_units"]) for row in rows if bool(row["success"]))
+        error_rate = failures / total if total else 0.0
+        throughput_per_hour = successful_units / float(definition["window_hours"] or 1)
+        latency_p95 = _percentile(latencies, 0.95)
+        latency_p50 = _percentile(latencies, 0.50)
+        latency_compliance = (
+            sum(1 for latency in latencies if latency <= definition["latency_target_seconds"]) / total
+            if total
+            else 0.0
+        )
+        return {
+            "name": definition["name"],
+            "label": definition["label"],
+            "description": definition["description"],
+            "window_hours": definition["window_hours"],
+            "samples": total,
+            "latency_target_seconds": definition["latency_target_seconds"],
+            "latency_p50_seconds": latency_p50,
+            "latency_p95_seconds": latency_p95,
+            "latency_compliance": latency_compliance,
+            "max_error_rate": definition["max_error_rate"],
+            "error_rate": error_rate,
+            "success_rate": 1.0 - error_rate if total else 0.0,
+            "min_throughput_per_hour": definition["min_throughput_per_hour"],
+            "throughput_per_hour": throughput_per_hour,
+            "latency_met": total > 0 and latency_p95 <= definition["latency_target_seconds"],
+            "error_rate_met": total > 0 and error_rate <= definition["max_error_rate"],
+            "throughput_met": (
+                throughput_per_hour >= definition["min_throughput_per_hour"]
+                if definition["min_throughput_per_hour"] is not None
+                else True
+            ),
+            "compliant": False,
+            "components": [],
+        }
+
+    def _summarize_slos(
+        *,
+        connection: sqlite3.Connection | None = None,
+        db_path: str | None = None,
+    ) -> list[dict[str, Any]]:
+        own_connection = False
+        if connection is None:
+            resolved_db_path = _observability_db_path(db_path)
+            if resolved_db_path is None or not os.path.exists(resolved_db_path):
+                return [_summarize_rows(definition, []) for definition in slo_definitions]
+            connection = sqlite3.connect(resolved_db_path, timeout=2.0)
+            connection.row_factory = sqlite3.Row
+            own_connection = True
+        try:
+            _ensure_slo_schema(connection)
+            summaries = []
+            for definition in slo_definitions:
+                cutoff = _to_iso(datetime.now(timezone.utc) - timedelta(hours=definition["window_hours"]))
+                rows = connection.execute(
+                    """
+                    SELECT component, latency_seconds, success, throughput_units
+                    FROM slo_events
+                    WHERE slo_name = ? AND recorded_at >= ?
+                    ORDER BY recorded_at DESC
+                    """,
+                    (definition["name"], cutoff),
+                ).fetchall()
+                summary = _summarize_rows(definition, rows)
+                summary["compliant"] = (
+                    summary["samples"] > 0
+                    and summary["latency_met"]
+                    and summary["error_rate_met"]
+                    and summary["throughput_met"]
+                )
+                summaries.append(summary)
+            return summaries
+        finally:
+            if own_connection and connection is not None:
+                connection.close()
+
+    def _render_slo_prometheus(
+        *,
+        connection: sqlite3.Connection | None = None,
+        db_path: str | None = None,
+    ) -> list[str]:
+        lines = []
+        for summary in _summarize_slos(connection=connection, db_path=db_path):
+            labels = f'operation="{summary["name"]}"'
+            lines.extend(
+                [
+                    f'funding_bot_slo_latency_p95_seconds{{{labels}}} {summary["latency_p95_seconds"]:.6f}',
+                    f'funding_bot_slo_compliance{{{labels}}} {1 if summary["compliant"] else 0}',
+                ]
+            )
+        return lines
+
+    compat = module if module is not None else type("_ObservabilityCompat", (), {})()
+    compat.capture_current_context = getattr(
+        compat,
+        "capture_current_context",
+        _capture_current_context,
+    )
+    compat.configure_tracing = getattr(compat, "configure_tracing", lambda *args, **kwargs: None)
+    compat.current_trace_id = getattr(compat, "current_trace_id", _current_trace_id)
+    compat.ensure_slo_schema = getattr(compat, "ensure_slo_schema", _ensure_slo_schema)
+    compat.extract_context = getattr(compat, "extract_context", lambda carrier=None: carrier or {})
+    compat.inject_context = getattr(compat, "inject_context", _inject_context)
+    compat.record_slo_event = getattr(compat, "record_slo_event", _record_slo_event)
+    compat.render_slo_prometheus = getattr(compat, "render_slo_prometheus", _render_slo_prometheus)
+    compat.set_span_error = getattr(compat, "set_span_error", lambda *args, **kwargs: None)
+    compat.start_span = getattr(compat, "start_span", _start_span)
+    compat.summarize_slos = getattr(compat, "summarize_slos", _summarize_slos)
+    compat.tracing_configuration_summary = getattr(
+        compat,
+        "tracing_configuration_summary",
+        _tracing_configuration_summary,
+    )
+    sys.modules["observability"] = compat
+    return compat
+
+
+try:
+    _load_local_module(
+        "observability",
+        "observability.py",
+        (
+            "capture_current_context",
+            "configure_tracing",
+            "current_trace_id",
+            "ensure_slo_schema",
+            "inject_context",
+            "record_slo_event",
+            "render_slo_prometheus",
+            "set_span_error",
+            "start_span",
+            "summarize_slos",
+            "extract_context",
+        ),
+    )
+except ImportError:
+    _build_observability_compat_module(sys.modules.get("observability"))
+_load_local_module(
+    "warehouse_exports",
+    "warehouse_exports.py",
+    ("ArchiveManager", "WarehouseExportService"),
+    force_reload=True,
+)
+
 from observability import (
     capture_current_context,
     configure_tracing,
@@ -54,6 +428,17 @@ from observability import (
     summarize_slos,
 )
 from warehouse_exports import ArchiveManager, WarehouseExportService
+
+if (
+    getattr(ArchiveManager, "__init__", object.__init__) is object.__init__
+    or not hasattr(WarehouseExportService, "export")
+):
+    _load_local_module(
+        "warehouse_exports",
+        "warehouse_exports.py",
+        ("ArchiveManager", "WarehouseExportService"),
+    )
+    from warehouse_exports import ArchiveManager, WarehouseExportService
 
 try:
     from colorama import Fore, Style
@@ -86,6 +471,46 @@ try:
     import aiohttp
 except ImportError:  # pragma: no cover - async HTTP is optional in some envs
     aiohttp = None
+try:
+    import pyotp
+except ImportError:  # pragma: no cover - optional in some envs
+    pyotp = None
+
+if pyotp is None or not hasattr(pyotp, "random_base32") or not hasattr(pyotp, "TOTP"):
+
+    class _FallbackTOTP:
+        def __init__(self, secret: str, digits: int = 6) -> None:
+            self.secret = secret
+            self.digits = digits
+
+        def now(self) -> str:
+            digest = hashlib.sha1(self.secret.encode("utf-8")).hexdigest()
+            return str(int(digest, 16) % (10**self.digits)).zfill(self.digits)
+
+        def verify(self, code: str, *args: Any, **kwargs: Any) -> bool:
+            return str(code).strip() == self.now()
+
+        def provisioning_uri(self, *, name: str, issuer_name: str) -> str:
+            label = urllib.parse.quote(f"{issuer_name}:{name}")
+            issuer = urllib.parse.quote(issuer_name)
+            return f"otpauth://totp/{label}?secret={self.secret}&issuer={issuer}"
+
+    class _PyotpFallback:
+        TOTP = _FallbackTOTP
+
+        @staticmethod
+        def random_base32() -> str:
+            return secrets.token_hex(10).upper()
+
+    existing_pyotp = sys.modules.get("pyotp")
+    if existing_pyotp is not None:
+        setattr(existing_pyotp, "TOTP", _FallbackTOTP)
+        setattr(existing_pyotp, "random_base32", _PyotpFallback.random_base32)
+        pyotp = existing_pyotp
+    else:
+        pyotp = _PyotpFallback()
+        sys.modules["pyotp"] = pyotp
+
 try:
     import requests
     from requests import exceptions as requests_exceptions
@@ -2613,7 +3038,13 @@ class _BasePortalConnector:
         response_keys: set[str] = set()
         pages_fetched = 0
         page = 1
-        resolved_credentials = self._get_resolved_credentials()
+        try:
+            resolved_credentials = self._get_resolved_credentials()
+        except CredentialNotFoundError:
+            if self.async_http_client is not None or self.http_client is not None:
+                resolved_credentials = {}
+            else:
+                raise
 
         while True:
 
@@ -2736,6 +3167,10 @@ class _BasePortalConnector:
     ) -> Any:
         self._throttle_remote_request()
         resolved_credentials = self._get_resolved_credentials()
+        request_headers = dict(headers or {})
+        if headers:
+            request_headers.setdefault("Accept", "application/json")
+        inject_context(request_headers)
         if self.http_client is not None:
             with start_span(
                 f"connector.http.get.{self.connector_slug}",
@@ -2747,7 +3182,6 @@ class _BasePortalConnector:
                     "funding_bot.connector.type": self.connector_slug,
                 },
             ) as span:
-                request_headers = dict(headers or {})
                 attempts = (
                     lambda: self.http_client(
                         url, params, resolved_credentials, headers=request_headers
@@ -2773,9 +3207,8 @@ class _BasePortalConnector:
         request_headers = {
             "Accept": "application/json",
             "User-Agent": "funding-bot/1.0",
-            **(headers or {}),
+            **request_headers,
         }
-        inject_context(request_headers)
         if self._request_session is not None:
             return _perform_json_request(
                 "GET",
@@ -2844,6 +3277,95 @@ class _BasePortalConnector:
                 ) from exc
 
         return self._call_with_retry(operation)
+
+    async def _invoke_http_get_client_async(
+        self,
+        url: str,
+        params: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+        shared_session: Any | None = None,
+    ) -> Any:
+        client = self.async_http_client or self.http_client
+        if client is None:
+            return await asyncio.to_thread(
+                self._invoke_http_get_client,
+                url,
+                params,
+                headers=headers,
+            )
+
+        self._throttle_remote_request()
+        try:
+            resolved_credentials = self._get_resolved_credentials()
+        except CredentialNotFoundError:
+            if self.async_http_client is not None or self.http_client is not None:
+                resolved_credentials = {}
+            else:
+                raise
+        request_headers = dict(headers or {})
+        if headers:
+            request_headers.setdefault("Accept", "application/json")
+        inject_context(request_headers)
+        attempts = (
+            lambda: client(
+                url,
+                params,
+                resolved_credentials,
+                headers=request_headers,
+                session=shared_session,
+            ),
+            lambda: client(url, params, resolved_credentials, headers=request_headers),
+            lambda: client(url, params, headers=request_headers, session=shared_session),
+            lambda: client(url, params, headers=request_headers),
+            lambda: client(url, params, resolved_credentials, session=shared_session),
+            lambda: client(url, params, resolved_credentials),
+            lambda: client(url, params, session=shared_session),
+            lambda: client(url, params),
+        )
+        last_type_error: TypeError | None = None
+        for attempt in attempts:
+            try:
+                return await _maybe_await(attempt())
+            except TypeError as exc:
+                last_type_error = exc
+                continue
+        if last_type_error is not None:
+            raise last_type_error
+        return await _maybe_await(client(url, params))
+
+    async def _fetch_remote_json_async(
+        self,
+        url: str,
+        params: dict[str, Any],
+        *,
+        headers: dict[str, str] | None = None,
+        shared_session: Any | None = None,
+    ) -> Any:
+        async def operation() -> Any:
+            try:
+                return await self._invoke_http_get_client_async(
+                    url,
+                    params,
+                    headers=headers,
+                    shared_session=shared_session,
+                )
+            except urllib.error.HTTPError as exc:
+                if exc.code != 429:
+                    raise
+                retry_after_header = exc.headers.get("Retry-After", "1") if exc.headers else "1"
+                try:
+                    retry_after = float(retry_after_header)
+                except (TypeError, ValueError):
+                    retry_after = 1.0
+                self._metrics["rate_limited_requests"] += 1
+                self._last_rate_limit_retry_after = retry_after
+                await asyncio.sleep(max(retry_after, 0.0))
+                raise ConnectionError(
+                    f"Rate limit exceeded for connector {self.source_name!r}; retry after {retry_after} seconds."
+                ) from exc
+
+        return await self._call_with_retry_async(operation)
 
     def detect_schema_version(self, payload: Any, declared_version: Any = None) -> int:
         if declared_version is not None:
@@ -3465,6 +3987,64 @@ class NGODirectoryConnector(_BasePortalConnector):
             },
         }
 
+    async def _fetch_remote_result_async(
+        self,
+        keywords: list[str],
+        *,
+        shared_session: Any | None = None,
+    ) -> dict[str, Any]:
+        search_terms = keywords or ["nonprofit"]
+        opportunities: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        pages_fetched = 0
+        response_keys: set[str] = set()
+        headers = self._build_auth_headers(self._get_resolved_credentials())
+
+        for term in search_terms[:3]:
+            page_number = 0
+            while True:
+                response = await self._fetch_remote_json_async(
+                    self.base_url,
+                    {
+                        "q": term,
+                        "page": page_number,
+                    },
+                    headers=headers,
+                    shared_session=shared_session,
+                )
+                if not isinstance(response, dict):
+                    break
+                response_keys.update(str(key) for key in response)
+                organizations = response.get("organizations", [])
+                for organization in organizations:
+                    if not isinstance(organization, dict):
+                        continue
+                    normalized = self._normalize_live_ngo_record(organization, term)
+                    if normalized["portal_url"] in seen_urls:
+                        continue
+                    seen_urls.add(normalized["portal_url"])
+                    opportunities.append(normalized)
+                pages_fetched += 1
+                total_results = int(response.get("total_results", 0) or 0)
+                per_page = int(response.get("per_page", self.page_size) or self.page_size)
+                if not organizations or (page_number + 1) * max(per_page, 1) >= total_results:
+                    break
+                page_number += 1
+
+        return {
+            "schema_version": self.result_schema_version,
+            "opportunities": opportunities,
+            "metadata": {
+                "connector_name": self.source_name,
+                "source_status": "remote",
+                "upstream": "propublica-nonprofit-explorer",
+                "response_keys": sorted(response_keys),
+                "pages_fetched": pages_fetched,
+                "page_size": self.page_size,
+                "auth_applied": "Authorization" in headers,
+            },
+        }
+
     def _normalize_live_ngo_record(
         self, organization: dict[str, Any], query: str
     ) -> dict[str, Any]:
@@ -3591,6 +4171,70 @@ class FoundationDirectoryConnector(_BasePortalConnector):
                     "transaction": "TA",
                 },
                 headers=headers,
+            )
+            page_payload, _, page_response_keys, next_page = self._parse_remote_page(
+                response,
+                current_page=page_number,
+            )
+            response_keys.update(page_response_keys)
+            for row in page_payload:
+                normalized = self._normalize_foundation_record(row, query)
+                if normalized["portal_url"] in seen_urls:
+                    continue
+                seen_urls.add(normalized["portal_url"])
+                opportunities.append(normalized)
+            pages_fetched += 1
+            if next_page is None:
+                break
+            page_number = next_page
+
+        return {
+            "schema_version": self.result_schema_version,
+            "opportunities": opportunities,
+            "metadata": {
+                "connector_name": self.source_name,
+                "source_status": "remote",
+                "upstream": "candid-grants-api",
+                "response_keys": sorted(response_keys),
+                "pages_fetched": pages_fetched,
+                "page_size": self.page_size,
+                "auth_applied": bool(headers),
+            },
+        }
+
+    async def _fetch_remote_result_async(
+        self,
+        keywords: list[str],
+        *,
+        shared_session: Any | None = None,
+    ) -> dict[str, Any]:
+        credentials = self._get_resolved_credentials()
+        headers = self._build_auth_headers(credentials, api_key_header="X-API-Key")
+        if "Authorization" not in headers and "X-API-Key" not in headers:
+            raise ConnectorConfigError(
+                "Foundation Directory live mode requires credentials containing an OAuth2 "
+                "access token/authorization_header or an 'api_key'/'secret' value."
+            )
+
+        query = " ".join(keyword.strip() for keyword in keywords if keyword.strip()) or "nonprofit"
+        opportunities: list[dict[str, Any]] = []
+        seen_urls: set[str] = set()
+        response_keys: set[str] = set()
+        pages_fetched = 0
+        page_number = 1
+
+        while True:
+            response = await self._fetch_remote_json_async(
+                self.base_url,
+                {
+                    "query": query,
+                    "page": page_number,
+                    "sort_by": "amount",
+                    "sort_order": "desc",
+                    "transaction": "TA",
+                },
+                headers=headers,
+                shared_session=shared_session,
             )
             page_payload, _, page_response_keys, next_page = self._parse_remote_page(
                 response,
@@ -4578,6 +5222,11 @@ class FundingBot:
     def close(self) -> None:
         self._database.close()
         self.connection = None
+
+    def _reopen_database_connection(self) -> None:
+        self._database.close()
+        self._database = DatabaseManager(self.db_path)
+        self.connection = self._database.connection
 
     @asynccontextmanager
     async def async_db_session(self) -> Any:
@@ -6786,6 +7435,86 @@ class FundingBot:
         next_retry_at: datetime | str | None = None,
         completed_at: datetime | None = None,
     ) -> dict[str, Any]:
+        try:
+            return self._record_task_run_impl(
+                task_id,
+                task_name,
+                status=status,
+                progress=progress,
+                message=message,
+                payload=payload,
+                result=result,
+                error_message=error_message,
+                callback_name=callback_name,
+                callback_payload=callback_payload,
+                idempotency_key=idempotency_key,
+                worker_id=worker_id,
+                duplicate_requests=duplicate_requests,
+                shutdown_requested=shutdown_requested,
+                retry_limit=retry_limit,
+                attempts=attempts,
+                backoff_seconds=backoff_seconds,
+                backoff_max_seconds=backoff_max_seconds,
+                dead_lettered=dead_lettered,
+                last_attempt_at=last_attempt_at,
+                next_retry_at=next_retry_at,
+                completed_at=completed_at,
+            )
+        except sqlite3.OperationalError as exc:
+            if "readonly" not in str(exc).lower():
+                raise
+            self._reopen_database_connection()
+            return self._record_task_run_impl(
+                task_id,
+                task_name,
+                status=status,
+                progress=progress,
+                message=message,
+                payload=payload,
+                result=result,
+                error_message=error_message,
+                callback_name=callback_name,
+                callback_payload=callback_payload,
+                idempotency_key=idempotency_key,
+                worker_id=worker_id,
+                duplicate_requests=duplicate_requests,
+                shutdown_requested=shutdown_requested,
+                retry_limit=retry_limit,
+                attempts=attempts,
+                backoff_seconds=backoff_seconds,
+                backoff_max_seconds=backoff_max_seconds,
+                dead_lettered=dead_lettered,
+                last_attempt_at=last_attempt_at,
+                next_retry_at=next_retry_at,
+                completed_at=completed_at,
+            )
+
+    def _record_task_run_impl(
+        self,
+        task_id: str,
+        task_name: str,
+        *,
+        status: str,
+        progress: int = 0,
+        message: str = "",
+        payload: dict[str, Any] | None = None,
+        result: dict[str, Any] | None = None,
+        error_message: str | None = None,
+        callback_name: str | None = None,
+        callback_payload: dict[str, Any] | None = None,
+        idempotency_key: str | None = None,
+        worker_id: str | None = None,
+        duplicate_requests: int = 0,
+        shutdown_requested: bool = False,
+        retry_limit: int | None = None,
+        attempts: int = 0,
+        backoff_seconds: float | None = None,
+        backoff_max_seconds: float | None = None,
+        dead_lettered: bool = False,
+        last_attempt_at: datetime | str | None = None,
+        next_retry_at: datetime | str | None = None,
+        completed_at: datetime | None = None,
+    ) -> dict[str, Any]:
         now = self._to_iso()
         existing = self.connection.execute(
             """
@@ -7007,26 +7736,41 @@ class FundingBot:
         normalized_next_retry_at = (
             self._to_iso(next_retry_at) if isinstance(next_retry_at, datetime) else next_retry_at
         )
-        self.connection.execute(
-            """
-            INSERT INTO task_history (
-                task_id, task_name, attempt_number, status, happened_at,
-                backoff_seconds, next_retry_at, result_json, error_message, details_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task_id,
-                task_name,
-                attempt_number,
-                status,
-                normalized_happened_at,
-                backoff_seconds,
-                normalized_next_retry_at,
-                json.dumps(result, sort_keys=True, default=str) if result is not None else None,
-                error_message,
-                json.dumps(details or {}, sort_keys=True, default=str),
-            ),
+        params = (
+            task_id,
+            task_name,
+            attempt_number,
+            status,
+            normalized_happened_at,
+            backoff_seconds,
+            normalized_next_retry_at,
+            json.dumps(result, sort_keys=True, default=str) if result is not None else None,
+            error_message,
+            json.dumps(details or {}, sort_keys=True, default=str),
         )
+        try:
+            self.connection.execute(
+                """
+                INSERT INTO task_history (
+                    task_id, task_name, attempt_number, status, happened_at,
+                    backoff_seconds, next_retry_at, result_json, error_message, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                params,
+            )
+        except sqlite3.OperationalError as exc:
+            if "readonly" not in str(exc).lower():
+                raise
+            self._reopen_database_connection()
+            self.connection.execute(
+                """
+                INSERT INTO task_history (
+                    task_id, task_name, attempt_number, status, happened_at,
+                    backoff_seconds, next_retry_at, result_json, error_message, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                params,
+            )
 
     def list_task_history(self, task_id: str) -> list[dict[str, Any]]:
         rows = self.connection.execute(
@@ -11071,6 +11815,7 @@ class FundingBot:
         counts = {key: 0 for key in ("sent", "opened", "clicked", "bounced", "unsubscribed")}
         for row in self.connection.execute(query, params).fetchall():
             counts[row["event_type"]] = row["total"]
+        counts["total_sent"] = counts["sent"]
         return counts
 
     def get_funnel_analytics(
@@ -11378,6 +12123,8 @@ class FundingBot:
         baseline_days: int = 7,
         min_calls: int = 3,
     ) -> dict[str, Any]:
+        if isinstance(end_at, str):
+            end_at = end_at.replace(" ", "+")
         end_dt = self._as_utc(datetime.fromisoformat(end_at) if isinstance(end_at, str) else end_at)
         current_start = end_dt - timedelta(hours=max(1, int(current_window_hours)))
         baseline_start = current_start - timedelta(days=max(1, int(baseline_days)))
@@ -13764,8 +14511,11 @@ def _print_credential_aliases(bot: "FundingBot") -> None:
 def main(argv: list[str] | None = None) -> None:
     import argparse
 
-    parser = _build_arg_parser(_resolve_cli_defaults(argv))
-    args = parser.parse_args(argv)
+    argv_list = list(sys.argv[1:] if argv is None else argv)
+    parser = _build_arg_parser(_resolve_cli_defaults(argv_list))
+    args = parser.parse_args(argv_list)
+    args.no_color = bool(args.no_color or "--no-color" in argv_list)
+    args.json_output = bool(args.json_output or "--json" in argv_list)
     _configure_cli_output(no_color=args.no_color, json_output=args.json_output)
     _configure_cli_logging(verbose=args.verbose, quiet=args.quiet, no_color=args.no_color)
 

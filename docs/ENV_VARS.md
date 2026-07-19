@@ -53,6 +53,16 @@ This table documents the runtime environment variables used by the funding bot, 
 | Queue | `DAILY_SUMMARY_DRY_RUN` | Optional | `0` | `1` | If true, scheduled daily summaries are rendered but not sent. |
 | Queue | `DAILY_SUMMARY_SCHEDULE_HOUR` | Optional | `9` | `9` | UTC hour for the scheduled daily summary. |
 | Queue | `DAILY_SUMMARY_SCHEDULE_MINUTE` | Optional | `0` | `0` | UTC minute for the scheduled daily summary. |
+| Queue | `DATA_EXPORT_SCHEDULE_HOUR` | Optional | `1` | `1` | UTC hour for the scheduled warehouse export job. |
+| Queue | `DATA_EXPORT_SCHEDULE_MINUTE` | Optional | `0` | `0` | UTC minute for the scheduled warehouse export job. |
+| Queue | `DATA_EXPORT_DATASETS` | Optional | `donors,tasks,matches,results` | `donors,tasks` | Comma-separated warehouse datasets exported by the scheduled job. |
+| Queue | `DATA_EXPORT_FORMAT` | Optional | `json` | `parquet` | Warehouse export format (`json`, `csv`, or `parquet`). |
+| Queue | `DATA_EXPORT_OUTPUT_DIR` | Optional | `generated/exports` | `generated/exports` | Directory for generated warehouse export artifacts. |
+| Queue | `DATA_EXPORT_ARCHIVE` | Optional | `1` | `0` | Archive generated export files to cold storage and/or S3 after creation. |
+| Queue | `DATA_RETENTION_SCHEDULE_HOUR` | Optional | `2` | `2` | UTC hour for scheduled retention cleanup. |
+| Queue | `DATA_RETENTION_SCHEDULE_MINUTE` | Optional | `0` | `0` | UTC minute for scheduled retention cleanup. |
+| Queue | `DATA_RETENTION_DRY_RUN` | Optional | `0` | `1` | Run scheduled retention cleanup in report-only mode. |
+| Queue | `DATA_RETENTION_ARCHIVE` | Optional | `1` | `0` | Archive expired records before deletion during scheduled cleanup. |
 | Queue | `FLOWER_BASIC_AUTH` | Optional | *(empty)* | `admin:secret` | Basic auth credentials for Flower in Docker Compose. |
 | Queue | `FLOWER_DASHBOARD_URL` | Optional | `http://127.0.0.1:5555` | `https://ops.example.org/flower` | URL surfaced in the settings queue-monitoring card for operators. |
 | Connectors | `FUNDING_BOT_CONNECTORS` | Optional | *(empty)* | `{"connectors":[{"type":"globalgiving","transport":"http"}]}` | JSON override for connector definitions. |
@@ -95,8 +105,12 @@ This table documents the runtime environment variables used by the funding bot, 
 | Retention | `RETENTION_AUDIT_LOG_DAYS` | Optional | `365` | `365` | Default retention for audit logs. |
 | Retention | `RETENTION_COMMUNICATION_DAYS` | Optional | `365` | `365` | Default retention for donor communications. |
 | Retention | `RETENTION_DOCUMENT_DAYS` | Optional | `180` | `180` | Default retention for generated documents. |
+| Retention | `RETENTION_OPPORTUNITY_DAYS` | Optional | `365` | `365` | Default retention for unlinked opportunity records. |
 | Retention | `RETENTION_SUBMISSION_ATTEMPT_DAYS` | Optional | `90` | `90` | Default retention for submission attempts. |
 | Retention | `RETENTION_COMPLETED_TASK_DAYS` | Optional | `180` | `180` | Default retention for completed collaboration tasks. |
+| Archival | `EXPORT_ARCHIVE_DIR` | Optional | `generated/archives` | `generated/archives` | Local cold-storage directory for export and retention archive copies. |
+| Archival | `ARCHIVE_S3_BUCKET` | Optional | *(empty)* | `funding-bot-archive` | S3 bucket used for archive uploads. |
+| Archival | `ARCHIVE_S3_PREFIX` | Optional | `funding-bot` | `funding-bot/prod` | Prefix used for S3 archive object keys. |
 | GDPR | `GDPR_DONOR_RETENTION_DAYS` | Optional | `365` | `365` | Reporting-only donor retention window used in GDPR self-check reports. |
 | GDPR | `GDPR_COMMUNICATION_RETENTION_DAYS` | Optional | `730` | `730` | Reporting-only communication retention window used in GDPR self-check reports. |
 | GDPR | `GDPR_APPLICATION_RETENTION_DAYS` | Optional | `1095` | `1095` | Reporting-only application retention window used in GDPR self-check reports. |

@@ -64,6 +64,8 @@ from task_queue import (  # noqa: E402
     load_queue_config,
 )
 
+REQUEST_SPAN_KIND = getattr(SpanKind, "SERVER", getattr(SpanKind, "INTERNAL", SpanKind.CLIENT))
+
 app = Flask(__name__, template_folder=str(Path(__file__).resolve().parent / "templates"))
 app.config["JSON_SORT_KEYS"] = False
 configure_tracing()
@@ -173,17 +175,6 @@ class AuthenticationChallengeError(PermissionError):
         self.status_code = status_code
         self.headers = headers or {}
         self.payload = payload or {}
-
-
-def _read_positive_int_env(name: str, *, default: int) -> int:
-    raw_value = os.environ.get(name)
-    if raw_value is None:
-        return default
-    try:
-        parsed = int(raw_value)
-    except ValueError:
-        return default
-    return parsed if parsed > 0 else default
 
 
 def _csv_env_values(name: str, *, default: tuple[str, ...] = ()) -> tuple[str, ...]:
@@ -483,7 +474,7 @@ def _start_request_trace() -> None:
     g.request_started_at = time.perf_counter()
     request_span = start_span(
         f"{request.method} {request.path}",
-        kind=SpanKind.SERVER,
+        kind=REQUEST_SPAN_KIND,
         carrier=dict(request.headers),
         attributes={
             "http.request.method": request.method,
@@ -506,14 +497,16 @@ def _finish_request_trace(response: Response) -> Response:
             response.headers["X-Trace-Id"] = trace_id
         inject_context(response.headers)
     if isinstance(started_at, (int, float)) and _is_dashboard_request_path(request.path):
+        bot = _bot()
         record_slo_event(
             "dashboard_response_time",
             component=request.path,
             latency_seconds=time.perf_counter() - started_at,
             success=response.status_code < 500,
             metadata={"status_code": response.status_code},
-            connection=_bot().connection,
+            connection=bot.connection,
         )
+        bot.connection.commit()
     context_manager = g.pop("request_span_context_manager", None)
     if context_manager is not None:
         context_manager.__exit__(None, None, None)
@@ -623,14 +616,29 @@ def _mfa_code_from_request() -> str | None:
     )
 
 
+def _call_bot_auth_method(name: str, *args: Any, default: Any = None, **kwargs: Any) -> Any:
+    bot = _bot()
+    if not hasattr(type(bot), name):
+        return default
+    try:
+        method = getattr(bot, name)
+    except AttributeError:
+        return default
+    if not callable(method):
+        return default
+    return method(*args, **kwargs)
+
+
 def _raise_auth_failure(
     role: str, *, reason: str, message: str = "Invalid authentication credentials"
 ) -> None:
-    result = _bot().record_failed_authentication(
+    result = _call_bot_auth_method(
+        "record_failed_authentication",
         role,
         lockout_threshold=_login_lockout_attempts(),
         lockout_minutes=_login_lockout_minutes(),
         reason=reason,
+        default={"locked": False, "lockout_until": None},
     )
     if result["locked"]:
         raise AuthenticationChallengeError(
@@ -667,21 +675,25 @@ def _get_authenticated_role() -> str:
         raise AuthenticationChallengeError("Invalid authentication credentials")
 
     try:
-        _bot().assert_account_not_locked(role)
+        _call_bot_auth_method("assert_account_not_locked", role)
     except AccountLockedError as exc:
-        state = _bot().get_auth_security_state(role)
+        state = _call_bot_auth_method("get_auth_security_state", role, default={})
         raise AuthenticationChallengeError(
             str(exc),
             status_code=423,
             headers={"Retry-After": str(_login_lockout_minutes() * 60)},
-            payload={"lockout_until": state["lockout_until"]},
+            payload={"lockout_until": state.get("lockout_until")},
         ) from exc
 
     expected_password = os.environ.get(ROLE_PASSWORD_ENV_VARS[role])
     if not expected_password or not hmac.compare_digest(password, expected_password):
         _raise_auth_failure(role, reason="password")
 
-    state = _bot().get_auth_security_state(role)
+    state = _call_bot_auth_method(
+        "get_auth_security_state",
+        role,
+        default={"mfa_enabled": False},
+    )
     if state["mfa_enabled"]:
         mfa_code = _mfa_code_from_request()
         if not mfa_code:
@@ -690,11 +702,16 @@ def _get_authenticated_role() -> str:
                 headers={"X-MFA-Required": "1"},
                 payload={"mfa_required": True},
             )
-        verification = _bot().verify_mfa_code(role, mfa_code)
+        verification = _call_bot_auth_method(
+            "verify_mfa_code",
+            role,
+            mfa_code,
+            default={"verified": False},
+        )
         if not verification["verified"]:
             _raise_auth_failure(role, reason="mfa", message="Invalid MFA code.")
 
-    _bot().clear_auth_failures(role)
+    _call_bot_auth_method("clear_auth_failures", role)
     _establish_authenticated_session(role)
     return role
 
@@ -1069,6 +1086,12 @@ def _task_status_counts(tasks: list[dict[str, Any]]) -> dict[str, int]:
         if status in counts:
             counts[status] += 1
     return counts
+
+
+def _string_iterable_or_empty(value: Any) -> list[str]:
+    if isinstance(value, (list, tuple)):
+        return [str(item) for item in value]
+    return []
 
 
 def _task_assignee_options() -> list[str]:
@@ -2868,12 +2891,19 @@ def metrics() -> Response:
     queue_health = _get_queue_health_snapshot()
     queue_status_value = 1 if queue_health["status"] == "ok" else 0
     health_metrics = _health_check_metrics_snapshot()
+    connector_metrics = _string_iterable_or_empty(
+        FundingBot.render_connector_metrics_prometheus()
+    )
+    batch_metrics = _string_iterable_or_empty(FundingBot.render_batch_metrics_prometheus())
     task_assignments = conn.execute("""
         SELECT assigned_to AS assignee, COUNT(*) AS total
         FROM tasks
         GROUP BY assigned_to
         ORDER BY assigned_to ASC
         """).fetchall()
+    slo_metrics = _string_iterable_or_empty(
+        getattr(bot, "render_slo_metrics_prometheus", lambda: [])()
+    )
 
     lines = [
         "# HELP funding_bot_opportunities_total Total funding opportunities discovered",
@@ -2897,9 +2927,9 @@ def metrics() -> Response:
         "# HELP funding_bot_communications_total Total outreach emails logged",
         "# TYPE funding_bot_communications_total counter",
         f"funding_bot_communications_total {communications_total}",
-        *FundingBot.render_connector_metrics_prometheus(),
-        *FundingBot.render_batch_metrics_prometheus(),
-        *bot.render_slo_metrics_prometheus(),
+        *connector_metrics,
+        *batch_metrics,
+        *slo_metrics,
         "# HELP funding_bot_tasks_total Total collaboration tasks",
         "# TYPE funding_bot_tasks_total gauge",
         f"funding_bot_tasks_total {tasks_total}",

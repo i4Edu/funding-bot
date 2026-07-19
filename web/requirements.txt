@@ -16,5 +16,4 @@ opentelemetry-api==1.44.0
 opentelemetry-sdk==1.44.0
 opentelemetry-exporter-otlp-proto-http==1.44.0
 jsonschema>=4.23.0,<5
-pyotp==2.10.0
 coverage>=7.6,<8

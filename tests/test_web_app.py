@@ -613,6 +613,41 @@ class SettingsPanelTests(unittest.TestCase):
             body,
         )
 
+    def test_dashboard_response_includes_trace_headers_and_slo_section(self):
+        response = self.client.get("/dashboard", headers=self.admin_headers)
+
+        self.assertEqual(200, response.status_code)
+        self.assertIn(b"Service-level objectives", response.data)
+        self.assertIn("X-Trace-Id", response.headers)
+        self.assertIn("traceparent", response.headers)
+
+    def test_slo_api_and_metrics_include_slo_data(self):
+        self.client.get("/dashboard", headers=self.admin_headers)
+
+        bot = FundingBot(db_path=str(self.db_path))
+        try:
+            bot.execute_queue_task(
+                "slo-metrics-task",
+                {"value": 1},
+                lambda _context, payload: payload,
+                idempotency_key="slo-metrics-task-1",
+                install_signal_handlers=False,
+            )
+        finally:
+            bot.close()
+
+        api_response = self.client.get("/api/slo", headers=self.admin_headers)
+        self.assertEqual(200, api_response.status_code)
+        payload = api_response.get_json()
+        slo_rows = {row["name"]: row for row in payload["slos"]}
+        self.assertGreaterEqual(slo_rows["dashboard_response_time"]["samples"], 1)
+        self.assertGreaterEqual(slo_rows["task_queue_throughput"]["samples"], 1)
+
+        metrics_response = self.client.get("/metrics", headers=self.admin_headers)
+        body = metrics_response.data.decode("utf-8")
+        self.assertIn('funding_bot_slo_compliance{operation="dashboard_response_time"}', body)
+        self.assertIn('funding_bot_slo_latency_p95_seconds{operation="task_queue_throughput"}', body)
+
     def test_analytics_endpoints_expose_funnel_costs_and_alerts(self):
         bot = FundingBot(db_path=str(self.db_path), trusted_sources={"Grants Portal"})
         try:
@@ -638,6 +673,7 @@ class SettingsPanelTests(unittest.TestCase):
                 due_date="2026-06-30",
                 attributed_connector="Grants Portal",
                 opportunity_signature=signature,
+                created_at=datetime(2026, 6, 22, 8, 30, tzinfo=timezone.utc),
             )
             bot.send_outreach(
                 donor_email="engaged@example.org",
@@ -685,7 +721,10 @@ class SettingsPanelTests(unittest.TestCase):
 
         analytics = self.client.get("/analytics", headers=self.auditor_headers)
         funnel = self.client.get("/analytics/funnel", headers=self.auditor_headers)
-        costs = self.client.get("/analytics/costs", headers=self.auditor_headers)
+        costs = self.client.get(
+            "/analytics/costs?start_at=2026-06-08&end_at=2026-06-08",
+            headers=self.auditor_headers,
+        )
         attribution = self.client.get("/analytics/attribution", headers=self.auditor_headers)
         anomalies = self.client.get(
             "/analytics/anomalies?end_at=2026-06-08T09:00:00+00:00",
@@ -1173,6 +1212,9 @@ class SettingsPanelTests(unittest.TestCase):
         fake_bot = mock.Mock()
         fake_bot.connection = _FakeConnection()
         fake_bot.get_task_status_counts.return_value = {}
+        fake_bot.get_auth_security_state.return_value = {"mfa_enabled": False}
+        setattr(fake_bot, "assert_account_not_locked", mock.Mock(return_value=None))
+        fake_bot.render_slo_metrics_prometheus.return_value = []
 
         with (
             mock.patch.object(web_app_module, "_bot", return_value=fake_bot),

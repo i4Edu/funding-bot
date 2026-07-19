@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -123,7 +124,12 @@ def inject_context(carrier: dict[str, str], *, context: Any | None = None) -> di
 
 
 def capture_current_context() -> dict[str, str]:
-    return inject_context({})
+    carrier = inject_context({})
+    if "traceparent" not in carrier:
+        carrier["traceparent"] = (
+            f"00-{secrets.token_hex(16)}-{secrets.token_hex(8)}-01"
+        )
+    return carrier
 
 
 def current_trace_id() -> str | None:

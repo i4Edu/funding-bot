@@ -200,6 +200,9 @@ npm run test:e2e
 bash scripts/run_mutation_tests.sh
 ```
 
+The mutation helper temporarily uses `pytest.mutmut.ini` so `mutmut` can run
+without pytest-xdist worker crashes.
+
 For dashboard concurrency validation, follow [docs/LOAD_TESTING.md](docs/LOAD_TESTING.md).
 
 When a change intentionally updates stable generated output, refresh the committed snapshots with:

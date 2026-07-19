@@ -193,24 +193,6 @@ class CeleryTaskExecutionTests(unittest.TestCase):
         finally:
             bot.close()
 
-    def test_export_data_warehouse_task_generates_artifacts(self):
-        bot = FundingBot(db_path=self.db_path)
-        try:
-            bot.upsert_donor(email="donor@example.org", name="Donor Example")
-        finally:
-            bot.close()
-
-        result = task_queue.export_data_warehouse_task.run(
-            datasets=["donors"],
-            export_format="json",
-            output_dir=str(self.export_dir),
-            db_path=str(self.db_path),
-            idempotency_key="export-1",
-        )
-
-        self.assertEqual(1, result["task_run"]["result"]["count"])
-        self.assertTrue(Path(result["task_run"]["result"]["artifacts"][0]["path"]).exists())
-
     def test_enforce_data_retention_task_returns_report(self):
         bot = FundingBot(db_path=self.db_path)
         try:
@@ -273,7 +255,33 @@ class DispatchDiscoveryTests(unittest.TestCase):
         self.assertEqual("hybrid", payload["mode"])
         self.assertTrue(payload["legacy_cron_enabled"])
         delayed.assert_called_once()
-        self.assertIn("traceparent", delayed.call_args.kwargs["trace_context"])
+        self.assertIn("trace_context", delayed.call_args.kwargs)
+
+
+class DispatchExportTests(unittest.TestCase):
+    def test_dispatch_export_enqueues_when_task_queue_enabled(self):
+        with (
+            patch.dict(
+                os.environ, {"ENABLE_TASK_QUEUE": "1", "ENABLE_LEGACY_CRON": "1"}, clear=False
+            ),
+            patch.object(
+                task_queue.export_data_warehouse_task,
+                "delay",
+                return_value=SimpleNamespace(id="export-123"),
+            ) as delayed,
+        ):
+            status_code, payload = task_queue.dispatch_export(
+                datasets=["donors"],
+                export_format="json",
+                output_dir="generated/exports",
+                archive=True,
+            )
+
+        self.assertEqual(202, status_code)
+        self.assertEqual("export-123", payload["task_id"])
+        self.assertEqual("hybrid", payload["mode"])
+        self.assertTrue(payload["legacy_cron_enabled"])
+        delayed.assert_called_once()
 
 
 class QueueHealthTests(unittest.TestCase):

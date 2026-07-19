@@ -482,7 +482,7 @@ def send_outreach_task(
                 task_payload.get("subject_template") is None
                 and task_payload.get("body_template") is None
             ):
-                if resolved_locale is not None:
+                if resolved_locale is not None and not task_payload.get("dry_run", True):
                     context.bot.upsert_donor(
                         email=str(task_payload["donor_email"]),
                         name=str(task_payload["donor_name"]),
@@ -589,7 +589,6 @@ def export_data_warehouse_task(
     export_format: str = "json",
     output_dir: str | None = None,
     archive: bool = False,
-    dry_run: bool = False,
     db_path: str | None = None,
     idempotency_key: str | None = None,
     trace_context: dict[str, str] | None = None,
@@ -600,7 +599,6 @@ def export_data_warehouse_task(
             "export_format": export_format,
             "output_dir": output_dir or "generated/exports",
             "archive": archive,
-            "dry_run": dry_run,
         }
 
         def _task(context: QueueTaskContext, task_payload: dict[str, Any]) -> dict[str, Any]:
@@ -611,7 +609,6 @@ def export_data_warehouse_task(
                 export_format=str(task_payload.get("export_format") or "json"),
                 output_dir=str(task_payload.get("output_dir") or "generated/exports"),
                 archive=bool(task_payload.get("archive")),
-                dry_run=bool(task_payload.get("dry_run", False)),
             )
             context.update_progress(
                 90,
@@ -632,7 +629,6 @@ def export_data_warehouse_task(
             task_run,
             export_format=export_format,
             archive=archive,
-            dry_run=dry_run,
         )
 
     return _run_task_with_trace(
@@ -789,6 +785,7 @@ def dispatch_export(
         "archive": archive,
     }
     idempotency_key = _generate_idempotency_key("export_data_warehouse", payload)
+    trace_context = capture_current_context()
     if config.enable_task_queue:
         result = export_data_warehouse_task.delay(
             datasets=datasets,
@@ -797,6 +794,7 @@ def dispatch_export(
             archive=archive,
             db_path=db_path,
             idempotency_key=idempotency_key,
+            trace_context=trace_context,
         )
         return 202, {
             "mode": config.mode,
@@ -813,6 +811,7 @@ def dispatch_export(
         archive=archive,
         db_path=db_path,
         idempotency_key=idempotency_key,
+        trace_context=trace_context,
     )
     export_payload["mode"] = config.mode
     export_payload["legacy_cron_enabled"] = config.enable_legacy_cron

@@ -245,6 +245,7 @@ def build_operation_registry() -> dict[str, OperationDefinition]:
             "schema_version": 2,
             "opportunities": opportunities,
             "next_page": page + 1 if page < total_pages else None,
+            "total_pages": total_pages,
         }
 
     def connector_factory() -> Callable[[], None]:

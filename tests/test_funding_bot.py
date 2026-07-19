@@ -1312,7 +1312,7 @@ class PortalConnectorTests(unittest.TestCase):
         def fake_http_client(url, payload, credentials=None, headers=None):
             calls.append((url, dict(payload), dict(headers or {})))
             self.assertEqual("https://projects.propublica.org/nonprofits/api/v2/search.json", url)
-            self.assertEqual({}, headers or {})
+            self.assertTrue(set((headers or {}).keys()).issubset({"traceparent", "tracestate", "baggage"}))
             if payload["page"] == 0:
                 return {
                     "organizations": [
@@ -2744,6 +2744,7 @@ class OutreachAnalyticsAndGdprTests(unittest.TestCase):
             due_date="2026-06-30",
             attributed_connector="Grants Portal",
             opportunity_signature=signature,
+            created_at=datetime(2026, 6, 22, 8, 30, tzinfo=timezone.utc),
         )
         outreach = self.bot.send_outreach(
             donor_email="engaged@example.org",
@@ -3293,6 +3294,7 @@ class DataRetentionPolicyTests(unittest.TestCase):
                 "audit_logs_days": 30,
                 "communications_days": 30,
                 "documents_days": 30,
+                "opportunities_days": 30,
                 "submission_attempts_days": 30,
                 "completed_tasks_days": 30,
             }
@@ -3398,10 +3400,33 @@ class DataRetentionPolicyTests(unittest.TestCase):
                 "2026-07-10T00:00:00+00:00",
             ),
         )
+        self.bot.connection.execute(
+            """
+            INSERT INTO opportunities (
+                signature, source, donor_name, title, portal_url, summary, category,
+                discovered_at, status, raw_data_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "expired-opportunity-row",
+                "Grants Portal",
+                "Archived Donor",
+                "Expired Opportunity",
+                "https://example.org/expired-opportunity",
+                "Old opportunity",
+                "education",
+                "2026-05-01T00:00:00+00:00",
+                "new",
+                "{}",
+            ),
+        )
         self.bot.connection.commit()
 
+        archive_dir = _reset_test_dir(f"retention-archives-{self._testMethodName}")
         report = self.bot.enforce_data_retention(
-            now=datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+            now=datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc),
+            archive_manager=ArchiveManager(cold_storage_dir=archive_dir),
         )
 
         self.assertFalse(report["dry_run"])
@@ -3409,9 +3434,12 @@ class DataRetentionPolicyTests(unittest.TestCase):
         self.assertEqual(1, report["deleted"]["communications"])
         self.assertEqual(1, report["deleted"]["outreach_events"])
         self.assertEqual(1, report["deleted"]["documents"])
+        self.assertEqual(1, report["deleted"]["opportunities"])
         self.assertEqual(1, report["deleted"]["submission_attempts"])
         self.assertEqual(1, report["deleted"]["completed_tasks"])
         self.assertEqual(1, report["deleted"]["document_files_deleted"])
+        self.assertTrue(report["archival"])
+        self.assertTrue(Path(report["archival"]["path"]).exists())
 
         self.assertFalse(self.expired_document_path.exists())
         self.assertTrue(self.recent_document_path.exists())
@@ -3442,6 +3470,102 @@ class DataRetentionPolicyTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM tasks WHERE status = 'done'"
             ).fetchone()[0],
         )
+        self.assertEqual(
+            0,
+            self.bot.connection.execute(
+                "SELECT COUNT(*) FROM opportunities WHERE signature = 'expired-opportunity-row'"
+            ).fetchone()[0],
+        )
+
+
+class WarehouseExportTests(unittest.TestCase):
+    def setUp(self):
+        self.bot = FundingBot(trusted_sources={"Grants Portal"})
+        self.output_dir = _reset_test_dir(f"warehouse-exports-{self._testMethodName}")
+        self.archive_dir = _reset_test_dir(f"warehouse-archives-{self._testMethodName}")
+        self.bot.upsert_donor(email="donor@example.org", name="Donor Example", locale="en")
+        self.bot.create_task(
+            title="Review pipeline",
+            assignee="staff",
+            description="Check export pipeline",
+            due_date="2026-07-30",
+        )
+        self.bot.connection.execute(
+            """
+            INSERT INTO opportunities (
+                signature, source, donor_name, title, portal_url, summary, category,
+                discovered_at, status, raw_data_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "warehouse-opp-1",
+                "Grants Portal",
+                "Example Foundation",
+                "Example Grant",
+                "https://example.org/grants/1",
+                "Supports education programs.",
+                "education",
+                "2026-07-19T00:00:00+00:00",
+                "new",
+                "{}",
+            ),
+        )
+        self.bot.connection.execute(
+            """
+            INSERT INTO applications (
+                opportunity_signature, donor_name, portal_url, submitted_at, status, next_action, submission_reference
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "warehouse-opp-1",
+                "Example Foundation",
+                "https://example.org/grants/1",
+                "2026-07-19T01:00:00+00:00",
+                "submitted",
+                "Await donor review",
+                "ref-123",
+            ),
+        )
+        self.bot.connection.execute(
+            """
+            INSERT INTO submission_attempts (
+                opportunity_signature, attempt_number, succeeded, error_message, happened_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            ("warehouse-opp-1", 1, 1, None, "2026-07-19T01:05:00+00:00"),
+        )
+        self.bot.connection.commit()
+
+    def tearDown(self):
+        self.bot.close()
+
+    def test_export_data_warehouse_supports_json_csv_and_parquet(self):
+        for export_format in ("json", "csv", "parquet"):
+            export_report = self.bot.export_data_warehouse(
+                datasets=["donors", "tasks", "matches", "results"],
+                export_format=export_format,
+                output_dir=self.output_dir / export_format,
+            )
+            self.assertEqual(4, export_report["count"])
+            self.assertEqual(export_format, export_report["format"])
+            self.assertTrue(all(Path(artifact["path"]).exists() for artifact in export_report["artifacts"]))
+
+    def test_export_data_warehouse_archives_artifacts_and_logs_audit_event(self):
+        export_report = self.bot.export_data_warehouse(
+            datasets=["donors"],
+            export_format="json",
+            output_dir=self.output_dir / "archived",
+            archive=True,
+            archive_manager=ArchiveManager(cold_storage_dir=self.archive_dir),
+        )
+        artifact = export_report["artifacts"][0]
+        self.assertTrue(artifact["archived_locations"])
+        self.assertTrue(Path(artifact["archived_locations"][0]["uri"]).exists())
+        latest_audit = self.bot.connection.execute(
+            "SELECT action FROM audit_logs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual("data_warehouse_exported", latest_audit["action"])
 
 
 class CliDataRetentionCommandsTests(unittest.TestCase):
@@ -3882,12 +4006,13 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
 
 class CliConfigurationFileTests(unittest.TestCase):
     def setUp(self):
-        self.workspace = _reset_test_dir("cli-config")
+        self.workspace = _reset_test_dir("cli-config").resolve()
         self.project_dir = self.workspace / "project"
         self.project_dir.mkdir(parents=True, exist_ok=True)
         self.home_dir = self.workspace / "home"
         self.home_dir.mkdir(parents=True, exist_ok=True)
-        self.original_cwd = Path.cwd()
+        self.db_path = self.project_dir / "cli-config.db"
+        self.original_cwd = Path.cwd().resolve()
         self._previous_always_eager = task_queue.celery_app.conf.task_always_eager
         self._previous_store_eager = getattr(
             task_queue.celery_app.conf, "task_store_eager_result", None
@@ -3929,7 +4054,7 @@ class CliConfigurationFileTests(unittest.TestCase):
         with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
             main(["send-outreach", "--locale", "en"])
         self.assertIn("Locale: en", stdout.getvalue())
-        self.assertIn("Dear Donor", stdout.getvalue())
+        self.assertIn("Hello Donor", stdout.getvalue())
 
     def test_home_yaml_config_and_environment_overrides_are_applied(self):
         home_config_dir = self.home_dir / ".funding-bot"

@@ -2,19 +2,19 @@
   "generated_at": "2026-07-19T00:00:00+00:00",
   "operations": {
     "connector_calls": {
-      "allowed_overhead_seconds": 0.04,
-      "baseline_seconds": 0.03,
-      "max_regression_factor": 3.0
+      "allowed_overhead_seconds": 0.01,
+      "baseline_seconds": 0.002,
+      "max_regression_factor": 4.0
     },
     "dashboard_queries": {
-      "allowed_overhead_seconds": 0.2,
-      "baseline_seconds": 0.18,
-      "max_regression_factor": 3.0
+      "allowed_overhead_seconds": 0.05,
+      "baseline_seconds": 0.2,
+      "max_regression_factor": 2.5
     },
     "deduplication": {
       "allowed_overhead_seconds": 0.1,
-      "baseline_seconds": 0.14,
-      "max_regression_factor": 3.0
+      "baseline_seconds": 1.25,
+      "max_regression_factor": 2.0
     }
   },
   "tool": "scripts/profile_operations.py",

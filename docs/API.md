@@ -140,6 +140,8 @@ AUDITOR_AUTH = HTTPBasicAuth("auditor", "auditor-secret")
 | POST | `/tasks` or `/task-directory` | admin | Create a task |
 | GET | `/tasks/{task_id}` or `/task-directory/{task_id}` | staff, admin, auditor | Get one task |
 | GET | `/api/tasks/export` | admin, auditor | Export filtered tasks |
+| GET | `/api/exports` | admin, auditor | Show export schedule metadata and recent warehouse exports |
+| POST | `/api/exports` | admin, auditor | Generate or enqueue warehouse exports |
 | POST | `/api/tasks/sync` | admin | Upsert a batch of task records |
 | POST | `/api/tasks/import` | admin | Import tasks from CSV |
 | POST | `/tasks/{task_id}/assign`, `/tasks/{task_id}/assignment`, `/task-directory/{task_id}/assignment` | admin | Reassign a task |
@@ -218,6 +220,74 @@ curl -u admin:admin-secret http://127.0.0.1:5000/opportunities
 ```python
 response = requests.get(f"{BASE_URL}/opportunities", auth=ADMIN_AUTH, timeout=30)
 print(response.json())
+```
+
+## Warehouse exports
+
+### GET `/api/exports`
+
+- **Purpose:** return the effective Celery export schedule plus recent export/retention audit entries.
+- **Auth:** Basic Auth required.
+- **Roles:** `admin`, `auditor`
+
+**Response schema (`200`)**
+
+```json
+{
+  "schedule": {
+    "hour": 1,
+    "minute": 0,
+    "datasets": ["donors", "tasks", "matches", "results"],
+    "format": "json",
+    "output_dir": "generated/exports",
+    "archive": true
+  },
+  "exports": [],
+  "count": 0
+}
+```
+
+### POST `/api/exports`
+
+- **Purpose:** create data-warehouse exports for BI/reporting.
+- **Auth:** Basic Auth required.
+- **Roles:** `admin`, `auditor`
+- **Formats:** `json`, `csv`, `parquet`
+- **Datasets:** `donors`, `tasks`, `matches` (opportunity/application matches), `results` (application outcomes)
+
+**Request body**
+
+```json
+{
+  "datasets": ["donors", "tasks", "matches", "results"],
+  "format": "parquet",
+  "output_dir": "generated/exports",
+  "archive": true,
+  "async": false
+}
+```
+
+When `async` is `true` and the task queue is enabled, the endpoint returns `202` with a Celery task identifier. Otherwise it returns `201` with an export manifest.
+
+**Synchronous response (`201`)**
+
+```json
+{
+  "datasets": ["donors", "tasks"],
+  "format": "json",
+  "output_dir": "generated/exports",
+  "archive": true,
+  "count": 2,
+  "artifacts": [
+    {
+      "dataset": "donors",
+      "format": "json",
+      "path": "generated/exports/donors_20260719T010000Z.json",
+      "row_count": 12,
+      "sha256": "..."
+    }
+  ]
+}
 ```
 
 ### GET `/opportunities/{signature}`

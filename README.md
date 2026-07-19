@@ -59,6 +59,8 @@ The project is designed for nonprofit operations teams that need a lightweight w
 - generating PDF and DOCX-ready documents from templates
 - enforcing self-hosted data residency settings (`US`, `EU`, `ASIA`)
 - generating jurisdiction-aware privacy policies in HTML and PDF
+- exporting donors, tasks, match funnels, and application results as JSON/CSV/Parquet
+- archiving retention-cleanup snapshots to cold storage or S3-compatible buckets
 - emailing a daily summary report to staff
 - coordinating shared task assignment, re-assignment, and status tracking
 - generating weekly/monthly GDPR self-check reports for retention and data-subject activity
@@ -160,7 +162,9 @@ Secret donor preferences and organization-profile payloads are encrypted at rest
 ### Database pooling and caching
 
 - SQLAlchemy manages SQLite connections with configurable pool sizing, overflow, timeout, recycle, and pre-ping checks.
-- `/metrics` exports connection-pool, database query, queue, connector, and cache metrics for Prometheus/Grafana.
+- `/metrics` exports connection-pool, database query, queue, connector, cache, and SLO metrics for Prometheus/Grafana.
+- `/dashboard` returns `traceparent` and `X-Trace-Id` headers for correlating operator requests with queue and connector spans.
+- See `docs/OBSERVABILITY.md` for Jaeger, OpenTelemetry, and SLO configuration.
 - The cache layer supports a Redis backend (`FUNDING_BOT_CACHE_BACKEND=redis`) with an in-process fallback for local/test environments.
 - TTL defaults:
   - donor records: 5 minutes
@@ -506,13 +510,11 @@ orchestration logic lives.
 ```bash
 pip install -r requirements-dev.txt
 bash scripts/run_mutation_tests.sh
-
-# Optional: narrow the run while strengthening tests for a specific module
-bash scripts/run_mutation_tests.sh "web.app*"
 ```
 
-The helper script runs the focused pytest baseline first, then executes
-`mutmut run` and exports CI-friendly statistics into `mutants/`.
+The helper script swaps in `pytest.mutmut.ini` to disable xdist during
+mutation runs, executes the focused pytest baseline first, then runs `mutmut`
+and prints the mutation summary from `mutmut results --all`.
 
 ### Run dashboard load tests
 
@@ -1001,6 +1003,7 @@ Use one of these usernames as the role name:
 | `/ready` | `GET` | Public | Dependency-aware readiness endpoint for database, Redis, Celery, and connectors. |
 | `/health/queue` | `GET` | Public | Queue health snapshot including queue depth, worker status, and cron/queue migration mode. |
 | `/monitoring/queue` | `GET` | `staff`, `admin`, `auditor` | Authenticated queue-monitoring payload for the settings UI, including Flower URL, queue depth, retry totals, and task runtime metrics. |
+| `/api/slo` | `GET` | `admin`, `auditor` | Rolling 24-hour SLO summary for connector latency, task queue throughput, and dashboard response time. |
 
 ### Keyboard navigation and screen reader checks
 
@@ -1050,6 +1053,12 @@ The `/metrics` endpoint exposes the following gauges and counters in the Prometh
 | `funding_bot_connector_errors_total{connector_name,connector_type}` | counter | Connector fetch errors by connector |
 | `funding_bot_connector_latency_seconds_sum{connector_name,connector_type}` | counter | Total connector request latency in seconds |
 | `funding_bot_connector_latency_seconds_count{connector_name,connector_type}` | counter | Connector latency observations |
+| `funding_bot_slo_latency_p95_seconds{operation}` | gauge | Rolling p95 latency for each SLO |
+| `funding_bot_slo_error_rate{operation}` | gauge | Rolling error rate for each SLO |
+| `funding_bot_slo_success_rate{operation}` | gauge | Rolling success rate for each SLO |
+| `funding_bot_slo_throughput_per_hour{operation}` | gauge | Rolling successful throughput per hour |
+| `funding_bot_slo_compliance{operation}` | gauge | Whether the SLO is currently meeting all targets (`1` = yes) |
+| `funding_bot_slo_samples_total{operation}` | gauge | Number of recent observations contributing to the SLO |
 | `funding_bot_uptime_seconds` | gauge | Seconds since the web process started |
 | `funding_bot_db_queries_total{statement,status}` | counter | Database queries by SQL statement verb and final status |
 | `funding_bot_db_query_errors_total{statement}` | counter | Database query failures by statement |
@@ -1081,7 +1090,7 @@ The `/metrics` endpoint exposes the following gauges and counters in the Prometh
 | `funding_bot_queue_task_duration_seconds_average` | gauge | Average runtime for completed queue tasks |
 | `funding_bot_queue_task_duration_seconds_max` | gauge | Longest runtime for a completed queue task |
 
-Example Prometheus, Alertmanager, and Grafana assets live under `monitoring/`. Add a scrape target pointing to `http://<host>:5000/metrics`, authenticate with an `admin` or `auditor` dashboard role, and import `monitoring/grafana-dashboards/database-query-performance.json` for the query dashboard. See `docs/ALERTING.md` for alert thresholds, Slack/email wiring, and tuning guidance.
+Example Prometheus, Alertmanager, and Grafana assets live under `monitoring/`. Add a scrape target pointing to `http://<host>:5000/metrics`, authenticate with an `admin` or `auditor` dashboard role, and import `monitoring/grafana-dashboards/database-query-performance.json` plus `monitoring/grafana-dashboards/slo-overview.json` for database and SLO dashboards. See `docs/OBSERVABILITY.md` for Jaeger/OpenTelemetry setup and `docs/ALERTING.md` for alert thresholds, Slack/email wiring, and tuning guidance.
 
 ### Task filter API
 

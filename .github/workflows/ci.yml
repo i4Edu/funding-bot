@@ -135,6 +135,41 @@ jobs:
       - name: Run integration and contract tests
         run: python -m unittest discover -s tests -p 'test_integration.py' -q
 
+  profiling-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install profiling dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run profiling utility tests
+        run: python -m unittest tests.test_profiling_tools -q
+
+      - name: Generate profiling reports and detect regressions
+        run: |
+          python scripts/profile_operations.py \
+            --iterations 5 \
+            --output-dir profiling/reports/ci \
+            --compare-baseline profiling/baselines.json \
+            --check-regressions \
+            --with-flamegraphs
+
+      - name: Upload profiling artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: profiling-reports
+          path: profiling/reports/ci
+
   accessibility:
     runs-on: ubuntu-latest
     steps:
@@ -190,3 +225,57 @@ jobs:
         run: |
           kill "$(cat flask.pid)"
           wait "$(cat flask.pid)" 2>/dev/null || true
+
+  e2e-browser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: "npm"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Install Node dependencies
+        run: npm ci
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Run Playwright browser workflows
+        run: npm run test:e2e
+
+  mutation-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Run mutation baseline
+        run: bash scripts/run_mutation_tests.sh
