@@ -90,8 +90,7 @@ class CeleryTaskExecutionTests(unittest.TestCase):
 
         fake_bot = FakeBot()
         with patch("task_queue.FundingBot", return_value=fake_bot):
-            payload = task_queue.discover_opportunities_task.run(
-                None,
+            payload = task_queue.discover_opportunities_task(
                 keywords=["education"],
                 trusted_sources=["Grants Portal"],
                 db_path=".test_queue.db",
@@ -142,8 +141,7 @@ class CeleryTaskExecutionTests(unittest.TestCase):
 
         fake_bot = FakeBot()
         with patch("task_queue.FundingBot", return_value=fake_bot):
-            payload = task_queue.send_outreach_task.run(
-                None,
+            payload = task_queue.send_outreach_task(
                 donor_email="donor@example.org",
                 donor_name="Donor",
                 subject_template="Hello {donor_name}",
@@ -197,8 +195,7 @@ class CeleryTaskExecutionTests(unittest.TestCase):
         with patch("task_queue.FundingBot", return_value=fake_bot), patch(
             "task_queue.SMTPEmailSender.from_env", return_value=sender
         ):
-            payload = task_queue.send_daily_summary_task.run(
-                None,
+            payload = task_queue.send_daily_summary_task(
                 recipient="ops@example.org",
                 dry_run=False,
                 db_path=".test_queue.db",
@@ -215,7 +212,7 @@ class CeleryTaskExecutionTests(unittest.TestCase):
 class DispatchDiscoveryTests(unittest.TestCase):
     def test_dispatch_discovery_runs_inline_in_cron_mode(self):
         with patch.dict(os.environ, {"ENABLE_TASK_QUEUE": "0", "ENABLE_LEGACY_CRON": "1"}, clear=False), patch(
-            "task_queue.discover_opportunities_task.run",
+            "task_queue._run_discovery_inline",
             return_value={"mode": "queue", "count": 2, "new_opportunities": [{"title": "One"}, {"title": "Two"}]},
         ) as run_task:
             status_code, payload = task_queue.dispatch_discovery(keywords=["education"])

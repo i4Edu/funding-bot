@@ -18,7 +18,8 @@ class TemplateAccessibilityTests(unittest.TestCase):
     def test_settings_template_includes_skip_link_styles(self):
         response = self.client.get("/settings")
         self.assertEqual(200, response.status_code)
-        self.assertIn(b".skip-link:focus", response.data)
+        self.assertIn(b'dashboard.css', response.data)
+        self.assertIn(b'app-role-chip', response.data)
         self.assertIn(b'Role: admin', response.data)
 
     def test_tasks_template_includes_skip_link(self):

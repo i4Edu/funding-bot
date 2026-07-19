@@ -12,6 +12,7 @@ from shutil import rmtree
 from zipfile import ZipFile
 
 from funding_bot import (
+    ConnectionSecurityError,
     DuplicateSubmissionError,
     FundingBot,
     FundingBotError,
@@ -21,6 +22,8 @@ from funding_bot import (
     OutreachThrottledError,
     SMTPEmailSender,
     TaskTransitionError,
+    _default_http_json_client,
+    create_connector,
 )
 
 
@@ -322,6 +325,86 @@ class FundingBotTests(unittest.TestCase):
                 new_status="done",
                 changed_by="staff",
             )
+
+    def test_task_comments_crud_and_unread_tracking(self):
+        task = self.bot.create_task(
+            title="Prepare proposal",
+            assigned_to="staff",
+            assignee_email="staff@example.org",
+        )
+
+        comment = self.bot.create_task_comment(
+            task["id"],
+            author="admin@example.org",
+            content="Please add the latest budget numbers.",
+        )
+        comment_feed = self.bot.list_task_comments(task["id"], viewer_email="staff@example.org")
+        self.assertEqual(1, comment_feed["unread_count"])
+        self.assertEqual(comment["id"], comment_feed["comments"][0]["id"])
+
+        marked = self.bot.mark_task_comments_read(task["id"], reader_email="staff@example.org")
+        self.assertEqual(0, marked["unread_count"])
+
+        updated = self.bot.update_task_comment(
+            task["id"],
+            comment["id"],
+            content="Please add the latest budget and staffing numbers.",
+        )
+        self.assertIn("staffing", updated["content"])
+        self.assertEqual(
+            1,
+            self.bot.get_unread_task_comment_count(task["id"], "staff@example.org"),
+        )
+
+        self.bot.delete_task_comment(task["id"], comment["id"])
+        final_feed = self.bot.list_task_comments(task["id"], viewer_email="staff@example.org")
+        self.assertEqual([], final_feed["comments"])
+        self.assertEqual(0, final_feed["unread_count"])
+
+    def test_task_assignment_notifications_are_sent_and_rate_limited(self):
+        notifications = []
+
+        def fake_sender(to_addr, subject, body):
+            notifications.append({"to": to_addr, "subject": subject, "body": body})
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {"TASK_ASSIGNMENT_NOTIFICATION_RATE_LIMIT_SECONDS": "3600"},
+            clear=False,
+        ):
+            created = self.bot.create_task(
+                title="Review budget",
+                assigned_to="staff",
+                assignee_email="staff@example.org",
+                assignee_name="Staff User",
+                sender=fake_sender,
+                created_at=datetime(2026, 6, 22, 9, 0, tzinfo=timezone.utc),
+            )
+            reassigned = self.bot.update_task_assignment(
+                created["id"],
+                assigned_to="staff",
+                assignee_email="staff@example.org",
+                assignee_name="Staff User",
+                sender=fake_sender,
+                changed_by="admin",
+                changed_at=datetime(2026, 6, 22, 9, 15, tzinfo=timezone.utc),
+            )
+            later = self.bot.update_task_assignment(
+                created["id"],
+                assigned_to="staff",
+                assignee_email="staff@example.org",
+                assignee_name="Staff User",
+                sender=fake_sender,
+                changed_by="admin",
+                changed_at=datetime(2026, 6, 22, 11, 0, tzinfo=timezone.utc),
+            )
+
+        self.assertEqual(2, len(notifications))
+        self.assertEqual("staff@example.org", notifications[0]["to"])
+        self.assertIn("Task assigned", notifications[0]["subject"])
+        self.assertEqual("sent", created["assignment_notification"]["status"])
+        self.assertEqual("rate_limited", reassigned["assignment_notification"]["status"])
+        self.assertEqual("sent", later["assignment_notification"]["status"])
 
     def test_sqlite_foreign_keys_are_enabled(self):
         self.assertEqual(
@@ -899,6 +982,41 @@ class PortalConnectorTests(unittest.TestCase):
             validation["keyword_mappings"]["csr"]["keywords"],
         )
 
+    def test_connector_rejects_insecure_base_url(self):
+        with self.assertRaises(ConnectionSecurityError):
+            create_connector("grants-portal", base_url="http://grants.example.org/opportunities")
+
+    def test_default_http_json_client_enforces_https_and_certificate_validation(self):
+        fake_response = unittest.mock.Mock()
+        fake_response.json.return_value = {"ok": True}
+        fake_response.raise_for_status.return_value = None
+        fake_session = unittest.mock.MagicMock()
+        fake_session.__enter__.return_value = fake_session
+        fake_session.post.return_value = fake_response
+
+        with unittest.mock.patch("funding_bot._build_tls_http_session", return_value=fake_session):
+            payload = _default_http_json_client(
+                "https://grants.example.org/opportunities",
+                {"keywords": ["education"]},
+                {"api_key": "secret"},
+            )
+
+        self.assertEqual({"ok": True}, payload)
+        fake_session.post.assert_called_once_with(
+            "https://grants.example.org/opportunities",
+            json={"keywords": ["education"]},
+            headers={
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "X-Connector-Api-Key": "secret",
+            },
+            timeout=10,
+            verify=True,
+        )
+
+        with self.assertRaises(ConnectionSecurityError):
+            _default_http_json_client("http://grants.example.org/opportunities", {"keywords": []})
+
     def test_crowdfunding_connectors_support_demo_results_for_globalgiving_and_kickstarter(self):
         globalgiving = GlobalGivingConnector()
         kickstarter = KickstarterForGoodConnector()
@@ -1300,9 +1418,10 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
 
     def setUp(self):
         self.bot = FundingBot(trusted_sources={"Grants Portal"})
-        self.bot.store_organization_profile(
-            {"name": "i4Edu", "mission": "Expand access to equitable education."}
-        )
+        self.outreach_context = {
+            "organization_name": "i4Edu",
+            "mission": "Expand access to equitable education.",
+        }
 
     def tearDown(self):
         self.bot.close()
@@ -1368,6 +1487,7 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
             "intro",
             "corp@example.org",
             "Corporate Donor",
+            context=self.outreach_context,
             sender=fake_sender,
             sent_at=datetime(2026, 6, 22, tzinfo=timezone.utc),
         )
@@ -1375,6 +1495,7 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
             "intro",
             "unknown@example.org",
             "Unknown Donor",
+            context=self.outreach_context,
             sender=fake_sender,
             sent_at=datetime(2026, 6, 23, tzinfo=timezone.utc),
         )
@@ -1402,12 +1523,14 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
             "default",
             "bangla@example.org",
             "বাংলা দাতা",
+            context=self.outreach_context,
             sent_at=datetime(2026, 6, 24, tzinfo=timezone.utc),
         )
         english_result = self.bot.send_outreach_from_template(
             "intro",
             "english@example.org",
             "English Donor",
+            context=self.outreach_context,
             sent_at=datetime(2026, 6, 25, tzinfo=timezone.utc),
         )
 
@@ -1746,7 +1869,7 @@ class CliExtensionTests(unittest.TestCase):
             main(["--db", str(self.db_path), "list-donors", "--segment", "corporate"])
 
         output = stdout.getvalue()
-        self.assertIn("email\tname\tsegment\topted_out\tlast_contact_at", output)
+        self.assertIn("email\tname\tsegment\tlocale\topted_out\tlast_contact_at", output)
         self.assertIn("corp@example.org\tCorporate Donor\tcorporate", output)
 
     def test_monthly_audit_report_command_prints_json_to_stdout(self):
@@ -1848,6 +1971,218 @@ class MonthlyAuditReportTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual("monthly_audit_report_generated", latest_audit["action"])
         self.assertEqual("2026-06", json.loads(latest_audit["details_json"])["period"])
+
+
+class DataRetentionPolicyTests(unittest.TestCase):
+    def setUp(self):
+        self.bot = FundingBot(trusted_sources={"Grants Portal"})
+        self.bot.store_organization_profile({"name": "i4Edu"})
+        self.expired_document_path = Path(".test_expired_retention_document.txt")
+        self.recent_document_path = Path(".test_recent_retention_document.txt")
+        for path in (self.expired_document_path, self.recent_document_path):
+            if path.exists():
+                path.unlink()
+        self.expired_document_path.write_text("expired", encoding="utf-8")
+        self.recent_document_path.write_text("recent", encoding="utf-8")
+
+    def tearDown(self):
+        self.bot.close()
+        for path in (self.expired_document_path, self.recent_document_path):
+            if path.exists():
+                path.unlink()
+
+    def test_store_and_enforce_data_retention_policy(self):
+        policy = self.bot.store_data_retention_policy(
+            {
+                "audit_logs_days": 30,
+                "communications_days": 30,
+                "documents_days": 30,
+                "submission_attempts_days": 30,
+                "completed_tasks_days": 30,
+            }
+        )
+        self.assertEqual(30, policy["audit_logs_days"])
+        self.assertEqual(policy, self.bot.load_data_retention_policy())
+
+        self.bot.connection.execute(
+            "INSERT INTO audit_logs (happened_at, action, details_json) VALUES (?, ?, ?)",
+            ("2026-05-01T00:00:00+00:00", "expired_audit", "{}"),
+        )
+        self.bot.connection.execute(
+            "INSERT INTO audit_logs (happened_at, action, details_json) VALUES (?, ?, ?)",
+            ("2026-07-10T00:00:00+00:00", "recent_audit", "{}"),
+        )
+        expired_comm_id = self.bot.connection.execute(
+            """
+            INSERT INTO communications (donor_email, donor_name, subject, body, channel, sent_at)
+            VALUES (?, ?, ?, ?, 'email', ?)
+            """,
+            (
+                "expired@example.org",
+                "Expired Donor",
+                "Expired outreach",
+                "Body",
+                "2026-05-01T00:00:00+00:00",
+            ),
+        ).lastrowid
+        recent_comm_id = self.bot.connection.execute(
+            """
+            INSERT INTO communications (donor_email, donor_name, subject, body, channel, sent_at)
+            VALUES (?, ?, ?, ?, 'email', ?)
+            """,
+            (
+                "recent@example.org",
+                "Recent Donor",
+                "Recent outreach",
+                "Body",
+                "2026-07-10T00:00:00+00:00",
+            ),
+        ).lastrowid
+        self.bot.connection.execute(
+            "INSERT INTO outreach_events (communication_id, event_type, happened_at) VALUES (?, 'sent', ?)",
+            (expired_comm_id, "2026-05-01T00:00:00+00:00"),
+        )
+        self.bot.connection.execute(
+            "INSERT INTO outreach_events (communication_id, event_type, happened_at) VALUES (?, 'sent', ?)",
+            (recent_comm_id, "2026-07-10T00:00:00+00:00"),
+        )
+        self.bot.connection.execute(
+            "INSERT INTO documents (kind, format, path, created_at) VALUES (?, ?, ?, ?)",
+            ("report", "pdf", str(self.expired_document_path), "2026-05-01T00:00:00+00:00"),
+        )
+        self.bot.connection.execute(
+            "INSERT INTO documents (kind, format, path, created_at) VALUES (?, ?, ?, ?)",
+            ("report", "pdf", str(self.recent_document_path), "2026-07-10T00:00:00+00:00"),
+        )
+        self.bot.connection.execute(
+            """
+            INSERT INTO submission_attempts (opportunity_signature, attempt_number, succeeded, error_message, happened_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("expired-opportunity", 1, 0, "timeout", "2026-05-01T00:00:00+00:00"),
+        )
+        self.bot.connection.execute(
+            """
+            INSERT INTO submission_attempts (opportunity_signature, attempt_number, succeeded, error_message, happened_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            ("recent-opportunity", 1, 1, None, "2026-07-10T00:00:00+00:00"),
+        )
+        self.bot.connection.execute(
+            """
+            INSERT INTO tasks (title, description, assigned_to, status, created_at, updated_at)
+            VALUES (?, ?, ?, 'done', ?, ?)
+            """,
+            ("Expired task", "", "staff", "2026-05-01T00:00:00+00:00", "2026-05-01T00:00:00+00:00"),
+        )
+        self.bot.connection.execute(
+            """
+            INSERT INTO tasks (title, description, assigned_to, status, created_at, updated_at)
+            VALUES (?, ?, ?, 'done', ?, ?)
+            """,
+            ("Recent task", "", "staff", "2026-07-10T00:00:00+00:00", "2026-07-10T00:00:00+00:00"),
+        )
+        self.bot.connection.commit()
+
+        report = self.bot.enforce_data_retention(
+            now=datetime(2026, 7, 19, 12, 0, tzinfo=timezone.utc)
+        )
+
+        self.assertFalse(report["dry_run"])
+        self.assertEqual(1, report["deleted"]["audit_logs"])
+        self.assertEqual(1, report["deleted"]["communications"])
+        self.assertEqual(1, report["deleted"]["outreach_events"])
+        self.assertEqual(1, report["deleted"]["documents"])
+        self.assertEqual(1, report["deleted"]["submission_attempts"])
+        self.assertEqual(1, report["deleted"]["completed_tasks"])
+        self.assertEqual(1, report["deleted"]["document_files_deleted"])
+
+        self.assertFalse(self.expired_document_path.exists())
+        self.assertTrue(self.recent_document_path.exists())
+        self.assertIsNone(
+            self.bot.connection.execute(
+                "SELECT 1 FROM audit_logs WHERE action = 'expired_audit'"
+            ).fetchone()
+        )
+        self.assertEqual(
+            1,
+            self.bot.connection.execute("SELECT COUNT(*) FROM communications").fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.bot.connection.execute("SELECT COUNT(*) FROM outreach_events").fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.bot.connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.bot.connection.execute("SELECT COUNT(*) FROM submission_attempts").fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.bot.connection.execute("SELECT COUNT(*) FROM tasks WHERE status = 'done'").fetchone()[0],
+        )
+
+
+class CliDataRetentionCommandsTests(unittest.TestCase):
+    def setUp(self):
+        self.db_path = Path(".test_retention_cli.db")
+        if self.db_path.exists():
+            self.db_path.unlink()
+        FundingBot(db_path=self.db_path).close()
+
+    def tearDown(self):
+        if self.db_path.exists():
+            self.db_path.unlink()
+
+    def test_retention_cli_commands_store_policy_and_report_dry_run(self):
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main([
+                "--db",
+                str(self.db_path),
+                "set-data-retention-policy",
+                "--audit-logs-days",
+                "45",
+                "--communications-days",
+                "60",
+            ])
+        policy = json.loads(stdout.getvalue())
+        self.assertEqual(45, policy["audit_logs_days"])
+        self.assertEqual(60, policy["communications_days"])
+
+        bot = FundingBot(db_path=self.db_path)
+        bot.connection.execute(
+            "INSERT INTO audit_logs (happened_at, action, details_json) VALUES (?, ?, ?)",
+            ("2026-05-01T00:00:00+00:00", "expired_audit", "{}"),
+        )
+        bot.connection.commit()
+        bot.close()
+
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main([
+                "--db",
+                str(self.db_path),
+                "enforce-data-retention",
+                "--dry-run",
+                "--as-of",
+                "2026-07-19T12:00:00+00:00",
+            ])
+        report = json.loads(stdout.getvalue())
+        self.assertTrue(report["dry_run"])
+        self.assertEqual(1, report["deleted"]["audit_logs"])
+
+        bot = FundingBot(db_path=self.db_path)
+        try:
+            self.assertEqual(
+                1,
+                bot.connection.execute(
+                    "SELECT COUNT(*) FROM audit_logs WHERE action = 'expired_audit'"
+                ).fetchone()[0],
+            )
+        finally:
+            bot.close()
 
 
 class SearchSettingsAndDiscoveryTests(unittest.TestCase):

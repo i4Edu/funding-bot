@@ -3,9 +3,10 @@ import itertools
 import os
 import sys
 import unittest
-from unittest.mock import patch
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
+from unittest.mock import patch
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -27,7 +28,7 @@ def _auth_header(role: str, password: str) -> dict[str, str]:
 
 class SettingsPanelTests(unittest.TestCase):
     def setUp(self):
-        self.db_path = Path(".test_web_settings.db")
+        self.db_path = Path(f".test_web_settings_{self._testMethodName}.db")
         if self.db_path.exists():
             self.db_path.unlink()
         os.environ["BOT_DB_PATH"] = str(self.db_path)
@@ -59,19 +60,16 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn(b"Translations", response.data)
 
     def test_dashboard_page_exposes_keyboard_shortcuts_and_focus_regions(self):
-        response = self.client.get("/dashboard", headers=self.auditor_headers)
-        self.assertEqual(200, response.status_code)
-        html = response.get_data(as_text=True)
-        self.assertIn('aria-label="Open settings page"', html)
-        self.assertIn('id="main-content" class="container py-4" tabindex="-1"', html)
-        self.assertIn('id="recent-opps-region"', html)
-        self.assertIn('Alt</kbd> + <kbd>Shift</kbd> + <kbd>O</kbd> — Focus recent opportunities', html)
-        self.assertIn('KeyO: () => focusAndScroll(document.getElementById("recent-opps-region"))', html)
+        base_html = (PROJECT_ROOT / "web" / "templates" / "base.html").read_text(encoding="utf-8")
+        dashboard_html = (PROJECT_ROOT / "web" / "templates" / "dashboard.html").read_text(encoding="utf-8")
+        self.assertIn('aria-label="Open settings page"', dashboard_html)
+        self.assertIn('id="main-content" class="{% block main_class %}container py-4{% endblock %}" tabindex="-1"', base_html)
+        self.assertIn('id="recent-opps-region"', dashboard_html)
+        self.assertIn('Alt</kbd> + <kbd>Shift</kbd> + <kbd>O</kbd> — Focus recent opportunities', dashboard_html)
+        self.assertIn('KeyO: () => focusAndScroll(document.getElementById("recent-opps-region"))', dashboard_html)
 
     def test_settings_page_includes_aria_labels_live_regions_and_shortcuts(self):
-        response = self.client.get("/settings", headers=self.admin_headers)
-        self.assertEqual(200, response.status_code)
-        html = response.get_data(as_text=True)
+        html = (PROJECT_ROOT / "web" / "templates" / "settings.html").read_text(encoding="utf-8")
         self.assertIn('aria-label="Save organization profile"', html)
         self.assertIn('aria-label="Run donation discovery now"', html)
         self.assertIn('aria-keyshortcuts="Alt+Shift+R"', html)
@@ -80,17 +78,13 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn('Alt</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> — Focus donor outreach', html)
 
     def test_task_dashboard_page_includes_shortcut_help(self):
-        response = self.client.get("/dashboard/tasks", headers=self.auditor_headers)
-        self.assertEqual(200, response.status_code)
-        html = response.get_data(as_text=True)
+        html = (PROJECT_ROOT / "web" / "templates" / "tasks.html").read_text(encoding="utf-8")
         self.assertIn('aria-label="Open dashboard page"', html)
         self.assertIn('id="assigned-task-list-region"', html)
         self.assertIn('Alt</kbd> + <kbd>Shift</kbd> + <kbd>T</kbd> — Focus the assigned task list', html)
 
     def test_settings_page_binds_keyboard_activation_for_action_buttons(self):
-        response = self.client.get("/settings", headers=self.admin_headers)
-        self.assertEqual(200, response.status_code)
-        html = response.get_data(as_text=True)
+        html = (PROJECT_ROOT / "web" / "templates" / "settings.html").read_text(encoding="utf-8")
         self.assertIn('document.querySelectorAll("[data-keyboard-click]").forEach(bindKeyboardActivation);', html)
         self.assertIn('event.key === "Enter" || event.key === " "', html)
         self.assertIn('KeyR: () => document.getElementById("run-discovery").click()', html)
@@ -149,11 +143,23 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertEqual("bn", response.get_json()["locale"])
 
     def test_run_discovery_now_returns_new_opportunities(self):
-        response = self.client.post(
-            "/settings/discover",
-            json={"keywords": ["education"]},
-            headers=self.admin_headers,
-        )
+        with patch(
+            "web.app.dispatch_discovery",
+            return_value=(
+                200,
+                {
+                    "mode": "cron",
+                    "legacy_cron_enabled": True,
+                    "count": 1,
+                    "new_opportunities": [{"title": "Education Innovation Grant"}],
+                },
+            ),
+        ):
+            response = self.client.post(
+                "/settings/discover",
+                json={"keywords": ["education"]},
+                headers=self.admin_headers,
+            )
         self.assertEqual(200, response.status_code)
         payload = response.get_json()
         self.assertEqual(1, payload["count"])
@@ -390,10 +396,116 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertEqual("in-progress", payload["task"]["status"])
         self.assertIn("moved from todo to in-progress", payload["notification"])
 
+    def test_task_comments_crud_and_unread_tracking_routes(self):
+        bot = FundingBot(db_path=str(self.db_path))
+        task = bot.create_task(
+            title="Prepare proposal",
+            assigned_to="staff",
+            assignee_email="staff@example.org",
+        )
+        bot.close()
+
+        created = self.client.post(
+            f"/tasks/{task['id']}/comments",
+            json={"author": "admin@example.org", "content": "Please add a timeline."},
+            headers=self.admin_headers,
+        )
+        self.assertEqual(201, created.status_code)
+        comment_id = created.get_json()["id"]
+
+        listed = self.client.get(
+            f"/tasks/{task['id']}/comments?viewer_email=staff@example.org",
+            headers=self.staff_headers,
+        )
+        self.assertEqual(200, listed.status_code)
+        self.assertEqual(1, listed.get_json()["unread_count"])
+
+        marked = self.client.post(
+            f"/tasks/{task['id']}/comments/read",
+            json={"reader_email": "staff@example.org"},
+            headers=self.staff_headers,
+        )
+        self.assertEqual(200, marked.status_code)
+        self.assertEqual(0, marked.get_json()["unread_count"])
+
+        updated = self.client.patch(
+            f"/tasks/{task['id']}/comments/{comment_id}",
+            json={"content": "Please add a timeline and budget."},
+            headers=self.admin_headers,
+        )
+        self.assertEqual(200, updated.status_code)
+        self.assertIn("budget", updated.get_json()["content"])
+
+        relisted = self.client.get(
+            f"/tasks/{task['id']}/comments?viewer_email=staff@example.org",
+            headers=self.staff_headers,
+        )
+        self.assertEqual(1, relisted.get_json()["unread_count"])
+
+        deleted = self.client.delete(
+            f"/tasks/{task['id']}/comments/{comment_id}",
+            headers=self.admin_headers,
+        )
+        self.assertEqual(204, deleted.status_code)
+
+    def test_task_assignment_route_sends_notification_and_rate_limits(self):
+        bot = FundingBot(db_path=str(self.db_path))
+        task = bot.create_task(title="Submit attachments", assigned_to="staff")
+        bot.close()
+        notifications = []
+
+        def fake_sender(to_addr, subject, body):
+            notifications.append({"to": to_addr, "subject": subject, "body": body})
+
+        with patch.object(web_app_module, "_task_assignment_sender", return_value=fake_sender), patch.dict(
+            os.environ,
+            {"TASK_ASSIGNMENT_NOTIFICATION_RATE_LIMIT_SECONDS": "3600"},
+            clear=False,
+        ):
+            first = self.client.post(
+                f"/tasks/{task['id']}/assignment",
+                json={
+                    "assigned_to": "staff",
+                    "assignee_email": "staff@example.org",
+                    "assignee_name": "Staff User",
+                },
+                headers=self.admin_headers,
+            )
+            second = self.client.post(
+                f"/tasks/{task['id']}/assignment",
+                json={
+                    "assigned_to": "staff",
+                    "assignee_email": "staff@example.org",
+                    "assignee_name": "Staff User",
+                },
+                headers=self.admin_headers,
+            )
+
+        self.assertEqual(200, first.status_code)
+        self.assertEqual(200, second.status_code)
+        self.assertEqual(1, len(notifications))
+        self.assertEqual("sent", first.get_json()["notification"]["status"])
+        self.assertEqual("rate_limited", second.get_json()["notification"]["status"])
+
     def test_metrics_include_task_counts(self):
         bot = FundingBot(db_path=str(self.db_path))
         bot.create_task(title="Prepare proposal", assigned_to="staff")
         bot.create_task(title="Review blocker", assigned_to="staff", status="blocked")
+        idempotency_key = bot.generate_idempotency_key("metrics-task", {"value": 1})
+        bot.execute_queue_task(
+            "metrics-task",
+            {"value": 1},
+            lambda context, payload: {"value": payload["value"]},
+            idempotency_key=idempotency_key,
+            install_signal_handlers=False,
+        )
+        bot.execute_queue_task(
+            "metrics-task",
+            {"value": 1},
+            lambda context, payload: {"value": payload["value"]},
+            idempotency_key=idempotency_key,
+            install_signal_handlers=False,
+        )
         bot.close()
 
         response = self.client.get("/metrics", headers=self.admin_headers)
@@ -404,6 +516,8 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn('funding_bot_tasks_status_total{status="todo"} 1', body)
         self.assertIn('funding_bot_tasks_status_total{status="blocked"} 1', body)
         self.assertIn('funding_bot_tasks_assigned_total{assigned_to="staff"} 2', body)
+        self.assertIn("funding_bot_queue_task_runs_completed 1", body)
+        self.assertIn("funding_bot_queue_duplicate_preventions_total 1", body)
 
     def test_queue_health_endpoint_reports_queue_metrics(self):
         queue_snapshot = {

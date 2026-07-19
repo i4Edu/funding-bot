@@ -2,6 +2,7 @@ import json
 import os
 import threading
 import unittest
+import unittest.mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -135,8 +136,9 @@ class ConnectorRegistryIntegrationTests(unittest.TestCase):
             }
         )
 
-        with self.assertRaises(ConnectorConfigError) as exc:
-            FundingBot(connector_registry=self.registry)
+        with unittest.mock.patch("funding_bot._require_https_url", side_effect=lambda url, **_: url):
+            with self.assertRaises(ConnectorConfigError) as exc:
+                FundingBot(connector_registry=self.registry)
 
         self.assertIn("Invalid credentials for connector 'sandbox-portal'", str(exc.exception))
         self.assertIn("'tenant' is a required property", str(exc.exception))
@@ -149,21 +151,22 @@ class ConnectorRegistryIntegrationTests(unittest.TestCase):
             {"api_key": "sandbox-key", "tenant": "tenant-42"}
         )
 
-        bot = FundingBot(
-            db_path=self.db_path,
-            trusted_sources={"Sandbox Registry Connector"},
-            connector_registry=self.registry,
-            connector_configs={
-                "connectors": [
-                    {
-                        "type": "sandbox-portal",
-                        "transport": "http",
-                        "base_url": self.server.url,
-                        "credential_alias": "sandbox",
-                    }
-                ]
-            },
-        )
+        with unittest.mock.patch("funding_bot._require_https_url", side_effect=lambda url, **_: url):
+            bot = FundingBot(
+                db_path=self.db_path,
+                trusted_sources={"Sandbox Registry Connector"},
+                connector_registry=self.registry,
+                connector_configs={
+                    "connectors": [
+                        {
+                            "type": "sandbox-portal",
+                            "transport": "http",
+                            "base_url": self.server.url,
+                            "credential_alias": "sandbox",
+                        }
+                    ]
+                },
+            )
         try:
             found = bot.run_discovery(keywords=["education"])
         finally:

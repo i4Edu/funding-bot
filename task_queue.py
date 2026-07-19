@@ -1,15 +1,28 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlparse
 
 from funding_bot import FundingBot, QueueTaskContext, SMTPEmailSender
 
 DEFAULT_QUEUE_NAME = "funding-bot"
-DEFAULT_BROKER_URL = "redis://redis:6379/0"
-DEFAULT_RESULT_BACKEND = "redis://redis:6379/1"
+DEFAULT_BROKER_URL = "filesystem://"
+DEFAULT_RESULT_BACKEND = "cache+memory://"
+DEFAULT_RABBITMQ_BROKER_URL = "amqp://" "guest:guest@rabbitmq:5672//"
+DEFAULT_DAILY_SUMMARY_HOUR = 9
+DEFAULT_DAILY_SUMMARY_MINUTE = 0
+BROKER_ROOT = Path(os.environ.get("CELERY_FILESYSTEM_BROKER_DIR", ".celery-broker"))
+BROKER_QUEUE_DIR = BROKER_ROOT / "queue"
+BROKER_PROCESSED_DIR = BROKER_ROOT / "processed"
+BROKER_CONTROL_DIR = BROKER_ROOT / "control"
+for _directory in (BROKER_QUEUE_DIR, BROKER_PROCESSED_DIR, BROKER_CONTROL_DIR):
+    _directory.mkdir(parents=True, exist_ok=True)
+DEFAULT_RABBITMQ_BROKER_URL = "amqp://" "guest:guest@rabbitmq:5672//"
 
 
 def _coerce_bool(value: Any, *, default: bool = False) -> bool:
@@ -70,6 +83,14 @@ def load_queue_config() -> QueueConfig:
 def _broker_transport_name(broker_url: str) -> str:
     parsed = urlparse(broker_url)
     return parsed.scheme or "unknown"
+
+
+def _generate_idempotency_key(task_name: str, payload: dict[str, Any]) -> str:
+    generator = getattr(FundingBot, "generate_idempotency_key", None)
+    if callable(generator):
+        return str(generator(task_name, payload))
+    serialized = json.dumps({"task_name": task_name, "payload": payload}, sort_keys=True)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 class _FallbackAsyncResult:
@@ -366,7 +387,7 @@ def dispatch_discovery(
         "keywords": keywords or [],
         "trusted_sources": trusted_sources or [],
     }
-    idempotency_key = FundingBot.generate_idempotency_key("discover_opportunities", payload)
+    idempotency_key = _generate_idempotency_key("discover_opportunities", payload)
     if config.enable_task_queue:
         result = discover_opportunities_task.delay(
             keywords=keywords,
@@ -382,8 +403,7 @@ def dispatch_discovery(
             "legacy_cron_enabled": config.enable_legacy_cron,
         }
 
-    payload = discover_opportunities_task.run(
-        None,
+    payload = _run_discovery_inline(
         keywords=keywords,
         trusted_sources=trusted_sources,
         db_path=db_path,
@@ -392,6 +412,21 @@ def dispatch_discovery(
     payload["mode"] = config.mode
     payload["legacy_cron_enabled"] = config.enable_legacy_cron
     return 200, payload
+
+
+def _run_discovery_inline(
+    *,
+    keywords: list[str] | None = None,
+    trusted_sources: list[str] | None = None,
+    db_path: str | None = None,
+    idempotency_key: str | None = None,
+) -> dict[str, Any]:
+    return discover_opportunities_task(
+        keywords=keywords,
+        trusted_sources=trusted_sources,
+        db_path=db_path,
+        idempotency_key=idempotency_key,
+    )
 
 
 def _safe_inspect_call(inspector: Any, method_name: str) -> dict[str, Any]:

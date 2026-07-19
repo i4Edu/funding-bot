@@ -28,6 +28,8 @@ services:
       ]
     env_file:
       - .env
+    stop_signal: SIGTERM
+    stop_grace_period: 45s
     depends_on:
       - redis
       - rabbitmq
@@ -50,6 +52,8 @@ services:
       ]
     env_file:
       - .env
+    environment:
+      FLOWER_BASIC_AUTH: ${FLOWER_BASIC_AUTH:-}
     depends_on:
       - redis
       - rabbitmq

@@ -44,6 +44,26 @@
                   <label class="form-label" for="org-registration">Registration number</label>
                   <input class="form-control" id="org-registration" name="registration_number" value="{{ organization_profile.get('registration_number', '') }}">
                 </div>
+                <div class="mb-3">
+                  <label class="form-label" for="org-website">Website</label>
+                  <input class="form-control" id="org-website" name="website" value="{{ organization_profile.get('website', '') }}">
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="org-contact-email">Contact email</label>
+                  <input class="form-control" id="org-contact-email" name="contact_email" value="{{ organization_profile.get('contact_email', '') }}">
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="org-privacy-email">Privacy contact email</label>
+                  <input class="form-control" id="org-privacy-email" name="privacy_email" value="{{ organization_profile.get('privacy_email', '') }}">
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="org-address">Address</label>
+                  <textarea class="form-control" id="org-address" name="address" rows="2">{{ organization_profile.get('address', '') }}</textarea>
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="org-jurisdictions">Privacy jurisdictions</label>
+                  <input class="form-control" id="org-jurisdictions" name="privacy_jurisdictions" value="{{ organization_profile.get('privacy_jurisdictions', []) | join(', ') if organization_profile.get('privacy_jurisdictions') is iterable and organization_profile.get('privacy_jurisdictions') is not string else organization_profile.get('privacy_jurisdictions', '') }}" placeholder="EU, US">
+                </div>
                 <button type="submit" class="btn btn-success" aria-label="Save organization profile" data-keyboard-click {{ "disabled" if current_role != "admin" }}>Save profile</button>
               </form>
               <div id="organization-result" class="mt-2 small" role="status" aria-live="polite" aria-atomic="true" aria-label="Organization profile save status" tabindex="-1"></div>
@@ -108,6 +128,39 @@
               </p>
               <button id="run-discovery" class="btn btn-primary" aria-label="Run donation discovery now" aria-controls="discovery-result" aria-describedby="discovery-help" aria-keyshortcuts="Alt+Shift+R" data-keyboard-click {{ "disabled" if current_role != "admin" }}>Run discovery now</button>
               <pre id="discovery-result" class="mt-3 bg-white border rounded p-2 small rtl-safe-pre" style="max-height: 260px; overflow:auto;" role="status" aria-live="polite" aria-atomic="true" aria-label="Discovery results" tabindex="-1"></pre>
+            </div>
+          </section>
+
+          <section class="card border-0 shadow-sm mb-4" role="region" aria-labelledby="privacy-policy-heading">
+            <div class="card-header bg-white"><h2 class="h5 mb-0" id="privacy-policy-heading">Privacy Policy Generator</h2></div>
+            <div class="card-body">
+              <p class="text-muted small">
+                Runtime residency:
+                <span class="badge text-bg-success">{{ residency_status.data_residency }}</span>
+                <span class="text-muted">storage region {{ residency_status.storage_region }}</span>
+              </p>
+              <form id="privacy-policy-form" class="rtl-safe" aria-labelledby="privacy-policy-heading">
+                <div class="mb-3">
+                  <label class="form-label" for="policy-jurisdictions">Jurisdictions (comma-separated)</label>
+                  <input class="form-control" id="policy-jurisdictions" name="jurisdictions" value="{{ organization_profile.get('privacy_jurisdictions', residency_status.data_residency) | join(', ') if organization_profile.get('privacy_jurisdictions') is iterable and organization_profile.get('privacy_jurisdictions') is not string else organization_profile.get('privacy_jurisdictions', residency_status.data_residency) }}">
+                </div>
+                <div class="mb-3">
+                  <label class="form-label" for="policy-effective-date">Effective date</label>
+                  <input class="form-control" id="policy-effective-date" name="effective_date" type="date">
+                </div>
+                <button type="submit" class="btn btn-primary" aria-label="Generate privacy policy" data-keyboard-click {{ "disabled" if current_role != "admin" }}>Generate HTML/PDF</button>
+              </form>
+              <pre id="privacy-policy-result" class="mt-3 bg-white border rounded p-2 small rtl-safe-pre" style="max-height: 260px; overflow:auto;" role="status" aria-live="polite" aria-atomic="true" aria-label="Privacy policy generation results" tabindex="-1"></pre>
+              <div class="mt-3">
+                <h3 class="h6">Recent versions</h3>
+                <ul class="list-group list-group-flush small">
+                  {% for policy in privacy_policy_versions %}
+                  <li class="list-group-item px-0">{{ policy.version }} — {{ policy.jurisdiction }} — {{ policy.generated_at }}</li>
+                  {% else %}
+                  <li class="list-group-item px-0 text-muted">No privacy policies generated yet.</li>
+                  {% endfor %}
+                </ul>
+              </div>
             </div>
           </section>
 
@@ -277,6 +330,19 @@
       document.getElementById("run-discovery").addEventListener("click", async () => {
         const { ok, data } = await postJson("/settings/discover", {});
         writeStatus("discovery-result", ok ? JSON.stringify(data, null, 2) : `Error: ${data.error}`);
+      });
+
+      document.getElementById("privacy-policy-form").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const form = new FormData(event.target);
+        const { ok, data } = await postJson("/settings/privacy-policy", {
+          jurisdictions: splitList(form.get("jurisdictions") || ""),
+          effective_date: form.get("effective_date") || undefined,
+        });
+        writeStatus("privacy-policy-result", ok ? JSON.stringify(data, null, 2) : `Error: ${data.error}`);
+        if (ok) {
+          window.location.reload();
+        }
       });
 
       document.getElementById("outreach-form").addEventListener("submit", async (event) => {

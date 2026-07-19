@@ -15,7 +15,7 @@ For vulnerability reporting, disclosure timelines, incident response, and the pe
 
 The project is designed for nonprofit operations teams that need a lightweight workflow for:
 
-- discovering grants, CSR opportunities, and NGO funding programs from trusted sources
+- discovering grants, CSR opportunities, NGO funding programs, and crowdfunding campaigns from trusted sources
 - storing organizational profile data and credential references
 - tracking applications in SQLite with duplicate protection
 - logging outreach with opt-out safeguards and throttling
@@ -58,7 +58,7 @@ The project is designed for nonprofit operations teams that need a lightweight w
 - daily summary email generation and SMTP delivery support
 
 #### v0.2.0 — Multi-portal + engagement
-- government, CSR, and NGO portal connectors
+- government, CSR, NGO, and crowdfunding connectors
 - donor segmentation (`corporate`, `institutional`, `individual`)
 - donor locale preferences for outreach templates (`en`, `bn`)
 - GDPR-oriented auditability and encrypted credential handling
@@ -245,6 +245,44 @@ Environment variables:
 | `CSR_NETWORK_CACHE_TTL` | inherits `PORTAL_CACHE_TTL` | Cache TTL override for the CSR Network connector. |
 | `NGO_DIRECTORY_PAGE_SIZE` | inherits `PORTAL_PAGE_SIZE` | Page size override for the NGO Directory connector. |
 | `NGO_DIRECTORY_CACHE_TTL` | inherits `PORTAL_CACHE_TTL` | Cache TTL override for the NGO Directory connector. |
+| `GLOBALGIVING_PAGE_SIZE` | inherits `PORTAL_PAGE_SIZE` | Page size override for the GlobalGiving connector. |
+| `GLOBALGIVING_CACHE_TTL` | inherits `PORTAL_CACHE_TTL` | Cache TTL override for the GlobalGiving connector. |
+| `KICKSTARTER_FOR_GOOD_PAGE_SIZE` | inherits `PORTAL_PAGE_SIZE` | Page size override for the Kickstarter for Good connector. |
+| `KICKSTARTER_FOR_GOOD_CACHE_TTL` | inherits `PORTAL_CACHE_TTL` | Cache TTL override for the Kickstarter for Good connector. |
+
+## Connector rate limiting
+
+Remote connector calls also use per-connector token-bucket rate limiting so
+GlobalGiving, Kickstarter for Good, and other upstream APIs can be queried
+without exhausting their quotas.
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `PORTAL_RATE_LIMIT_DEFAULT_CAPACITY` | `5` | Global burst size per connector. |
+| `PORTAL_RATE_LIMIT_DEFAULT_REFILL_RATE` | `1` | Global refill rate in tokens per second. |
+| `GLOBALGIVING_RATE_LIMIT_CAPACITY` | inherits global default | GlobalGiving-specific burst size. |
+| `GLOBALGIVING_RATE_LIMIT_REFILL_RATE` | inherits global default | GlobalGiving-specific refill rate. |
+| `KICKSTARTER_FOR_GOOD_RATE_LIMIT_CAPACITY` | inherits global default | Kickstarter-specific burst size. |
+| `KICKSTARTER_FOR_GOOD_RATE_LIMIT_REFILL_RATE` | inherits global default | Kickstarter-specific refill rate. |
+
+Connector definitions supplied through `FUNDING_BOT_CONNECTORS` may also include a
+`rate_limit` object:
+
+```json
+{
+  "connectors": [
+    {
+      "type": "globalgiving",
+      "transport": "http",
+      "rate_limit": { "capacity": 2, "refill_rate": 0.5 }
+    }
+  ]
+}
+```
+
+When a connector exceeds its quota, discovery degrades gracefully for that
+connector: it returns no rows for that request and exposes `retry_after_seconds`
+metadata instead of raising an exception.
 
 ## Web Dashboard
 
@@ -260,8 +298,10 @@ python -m flask --app web.app run
 ### Accessibility checks
 
 The dashboard templates now share a keyboard-visible skip link through
-`web/templates/base.html`. To run automated accessibility checks locally against the
-template fixture app:
+`web/templates/base.html`, and `web/static/dashboard.css` provides local
+contrast-safe theme tokens so the WCAG audit does not depend on the Bootstrap
+CDN. To run automated accessibility checks locally against the template fixture
+app:
 
 ```bash
 pip install -r web/requirements.txt
@@ -277,8 +317,12 @@ npm run test:a11y
 ```
 
 The accessibility runner uses `@axe-core/playwright` to scan `/dashboard`,
-`/dashboard/tasks`, and `/settings` rendered by the fixture app, and exits non-zero
-when any axe violation is found. The same command runs in GitHub Actions CI.
+`/dashboard/tasks`, and `/settings` in both light and dark mode, then performs
+explicit color-contrast assertions for the role chip, muted helper copy, and
+status badges. The initial contrast audit found two Bootstrap combinations below
+WCAG 2.1 AA for normal text: `text-white-50` on `bg-success` (~2.22:1) and
+`text-muted` on `bg-light` (~4.45:1). The shared dashboard theme replaces those
+with AA-compliant colors, and the same audit command runs in GitHub Actions CI.
 
 ### Dashboard screenshot
 
@@ -302,6 +346,9 @@ The dashboard uses HTTP Basic Auth. Use one of these usernames as the role name:
 | `/dashboard` | `GET` | `staff`, `admin`, `auditor` | HTML operations dashboard (WCAG 2.1 accessible). |
 | `/dashboard/tasks` | `GET` | `staff`, `admin`, `auditor` | HTML task dashboard with assignee, status, due-date filters and assignee/status/due-date sorting. |
 | `/tasks` | `GET` | `staff`, `admin`, `auditor` | List tasks as JSON with assignee, status, due-date filtering and assignee/status/due-date sorting. |
+| `/tasks` | `POST` | `admin` | Create a task with an assignee, optional due date, and initial workflow status. |
+| `/tasks/<id>` | `GET` | `staff`, `admin`, `auditor` | Fetch one task as JSON. Staff users are limited to their own lane. |
+| `/tasks/<id>/assign` | `POST` | `admin` | Assign or reassign a task to another dashboard role. |
 | `/opportunities` | `GET` | `staff`, `admin`, `auditor` | List opportunities as JSON. |
 | `/opportunities/<signature>` | `GET` | `staff`, `admin`, `auditor` | Show one opportunity, linked application, and submission attempts. |
 | `/opportunities/<signature>/submit` | `POST` | `admin` | Record a submission result for an opportunity. |
@@ -472,7 +519,7 @@ touching code or environment variables.
 ### From the CLI
 
 ```bash
-# Search every configured portal connector and store any new opportunities.
+# Search every configured portal connector, including crowdfunding sources, and store any new opportunities.
 python funding_bot.py discover --keywords "education,csr"
 
 # Compose (and, unless --dry-run, send via SMTP) a personalized donor email.
@@ -508,13 +555,14 @@ The repository includes a `Dockerfile` and `docker-compose.yml`.
 3. Start the stack:
 
    ```bash
-   docker compose up
+   docker compose --profile queue up --build
    ```
 
 The Compose stack runs:
 - a CLI container for bot jobs
 - a Flask web container on `http://localhost:5000`
-- optional `redis`, `worker`, and `flower` services when started with the `queue` profile
+- `redis` and `rabbitmq` broker services for Celery
+- a Celery `worker` and optional `flower` monitoring UI on `http://localhost:5555`
 - a shared volume for SQLite data at `/app/data`
 
 ## Kubernetes Deployment

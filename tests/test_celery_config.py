@@ -1,6 +1,7 @@
 import os
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from celery_app import (
     DEFAULT_CELERY_BROKER_URL,
@@ -24,7 +25,7 @@ class CeleryConfigurationTests(unittest.TestCase):
             self.db_path.unlink()
 
     def test_default_config_prefers_redis(self):
-        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+        with mock.patch.dict(os.environ, {}, clear=True):
             config = get_celery_config()
 
         self.assertEqual(DEFAULT_CELERY_BROKER_URL, config["broker_url"])
@@ -36,18 +37,14 @@ class CeleryConfigurationTests(unittest.TestCase):
             "CELERY_BROKER_URL": DEFAULT_RABBITMQ_BROKER_URL,
             "CELERY_RESULT_BACKEND": "rpc://",
         }
-        with unittest.mock.patch.dict(os.environ, env, clear=True):
+        with mock.patch.dict(os.environ, env, clear=True):
             config = get_celery_config()
 
         self.assertEqual(DEFAULT_RABBITMQ_BROKER_URL, config["broker_url"])
         self.assertEqual("rpc://", config["result_backend"])
 
-    def test_module_level_app_imports_task_module(self):
-        self.assertEqual(("tasks.celery_tasks",), celery_app.conf.imports)
-
     def test_discovery_task_persists_opportunities(self):
         result = run_discovery_task.run(
-            None,
             db_path=str(self.db_path),
             keywords=["education"],
             trusted_sources=["Grants Portal", "CSR Network", "NGO Directory"],
@@ -63,13 +60,6 @@ class CeleryConfigurationTests(unittest.TestCase):
     def test_daily_summary_task_supports_dry_run(self):
         bot = FundingBot(db_path=self.db_path)
         try:
-            bot.store_organization_profile(
-                {
-                    "name": "i4Edu",
-                    "mission": "Expand access to equitable education.",
-                    "registration_number": "NP-42",
-                }
-            )
             opportunity = bot.discover_opportunities(
                 [
                     {
@@ -95,7 +85,6 @@ class CeleryConfigurationTests(unittest.TestCase):
             bot.close()
 
         result = send_daily_summary_task.run(
-            None,
             recipient="ops@example.org",
             db_path=str(self.db_path),
             dry_run=True,

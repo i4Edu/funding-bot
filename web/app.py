@@ -274,6 +274,9 @@ def _serialize_donor(row: Any) -> dict[str, Any]:
     data = dict(row)
     data["opted_out"] = bool(data["opted_out"])
     data["preferences"] = _parse_json_column(data.pop("preferences_json", "{}"))
+    data["field_classifications"] = _parse_json_column(
+        data.pop("field_classifications_json", "{}")
+    )
     return data
 
 
@@ -347,8 +350,7 @@ def _fetch_opportunity(signature: str) -> dict[str, Any]:
 
 
 def _fetch_donor(email: str) -> dict[str, Any] | None:
-    row = _bot().connection.execute("SELECT * FROM donors WHERE email = ?", (email,)).fetchone()
-    return _serialize_donor(row) if row else None
+    return _bot().get_donor(email)
 
 
 def _get_request_json() -> dict[str, Any]:
@@ -759,84 +761,6 @@ def dashboard_tasks() -> Response | str:
         return _json_error("Forbidden", 403)
     return render_template("tasks.html", **_task_dashboard_context(filters))
 
-
-@app.get("/tasks")
-@require_role("staff", "admin", "auditor")
-def list_tasks_route() -> Response:
-    filters, forbidden = _task_filter_args()
-    if forbidden:
-        return _json_error("Forbidden", 403)
-    tasks = _bot().list_tasks(
-        assigned_to=filters["assignee"],
-        status=filters["status"],
-        due_date_before=filters["due_date_before"],
-        due_date_after=filters["due_date_after"],
-        sort=filters["sort"],
-    )
-    return jsonify([_serialize_task(task) for task in tasks])
-
-
-@app.post("/tasks")
-@require_role("admin")
-def create_task_route() -> Response:
-    payload = _get_request_json()
-    title = str(payload.get("title", "")).strip()
-    assigned_to = str(payload.get("assigned_to", "")).strip().lower()
-    description = str(payload.get("description", "")).strip()
-    status = str(payload.get("status", "todo")).strip() or "todo"
-    due_date = payload.get("due_date")
-
-    if not title:
-        raise ValueError("Field 'title' is required.")
-    if not assigned_to:
-        raise ValueError("Field 'assigned_to' is required.")
-    if assigned_to not in ROLE_PASSWORD_ENV_VARS:
-        raise ValueError(
-            f"Field 'assigned_to' must be one of {sorted(ROLE_PASSWORD_ENV_VARS)}."
-        )
-    if due_date is not None and not isinstance(due_date, str):
-        raise ValueError("Field 'due_date' must be a string or null.")
-
-    task = _bot().create_task(
-        title=title,
-        assigned_to=assigned_to,
-        description=description,
-        status=status,
-        due_date=due_date,
-    )
-    return jsonify({"task": _serialize_task(task)}), 201
-
-
-@app.get("/tasks/<int:task_id>")
-@require_role("staff", "admin", "auditor")
-def get_task_route(task_id: int) -> Response:
-    task = _bot().get_task(task_id)
-    current_role = getattr(g, "current_role", None)
-    if current_role not in {"admin", "auditor"} and task["assigned_to"] != current_role:
-        return _json_error("Forbidden", 403)
-    return jsonify({"task": _serialize_task(task)})
-
-
-@app.post("/tasks/<int:task_id>/assign")
-@require_role("admin")
-def assign_task_route(task_id: int) -> Response:
-    payload = _get_request_json()
-    assigned_to = str(payload.get("assigned_to", "")).strip().lower()
-    if not assigned_to:
-        raise ValueError("Field 'assigned_to' is required.")
-    if assigned_to not in ROLE_PASSWORD_ENV_VARS:
-        raise ValueError(
-            f"Field 'assigned_to' must be one of {sorted(ROLE_PASSWORD_ENV_VARS)}."
-        )
-
-    task = _bot().reassign_task(
-        task_id,
-        assigned_to=assigned_to,
-        changed_by=getattr(g, "current_role", None) or "unknown",
-    )
-    return jsonify({"task": _serialize_task(task)})
-
-
 @app.get("/opportunities")
 @require_role("staff", "admin", "auditor")
 def list_opportunities() -> Response:
@@ -903,10 +827,7 @@ def submit_opportunity(signature: str) -> Response:
 @app.get("/donors")
 @require_role("admin", "auditor")
 def list_donors() -> Response:
-    donors = [_serialize_donor(row) for row in _bot().connection.execute(
-        "SELECT * FROM donors ORDER BY name COLLATE NOCASE ASC, email ASC"
-    ).fetchall()]
-    return jsonify(donors)
+    return jsonify(_bot().list_donors())
 
 
 @app.post("/donors")
@@ -918,6 +839,8 @@ def upsert_donor() -> Response:
     opted_out = _coerce_bool(payload.get("opted_out", False), "opted_out")
     preferences = payload.get("preferences", {})
     locale = payload.get("locale")
+    data_classification = payload.get("data_classification")
+    field_classifications = payload.get("field_classifications")
 
     if not email:
         raise ValueError("Field 'email' is required.")
@@ -929,6 +852,8 @@ def upsert_donor() -> Response:
         preferences = {}
     if not isinstance(preferences, dict):
         raise ValueError("Field 'preferences' must be an object.")
+    if field_classifications is not None and not isinstance(field_classifications, dict):
+        raise ValueError("Field 'field_classifications' must be an object.")
 
     _bot().upsert_donor(
         email=email,
@@ -936,6 +861,8 @@ def upsert_donor() -> Response:
         opted_out=opted_out,
         preferences=preferences,
         locale=None if locale is None else str(locale),
+        data_classification=None if data_classification is None else str(data_classification),
+        field_classifications=field_classifications,
     )
     donor = _fetch_donor(email)
     return jsonify(donor), 201
@@ -984,6 +911,8 @@ def settings_page() -> str:
         "organization_profile": bot.load_organization_profile(),
         "search_settings": bot.load_search_settings(),
         "credentials": bot.list_credentials(),
+        "residency_status": bot.get_data_residency_status(),
+        "privacy_policy_versions": bot.list_privacy_policy_versions(limit=10),
         "smtp_configured": smtp_configured,
         "smtp_host": os.environ.get("SMTP_HOST", ""),
         "ui_locale": _resolve_ui_locale(),
@@ -1080,7 +1009,16 @@ def update_organization_settings() -> Response:
             "Request body must contain at least one profile field, e.g. "
             "'name', 'mission', or 'registration_number'."
         )
-    _bot().store_organization_profile(payload)
+    data_classification = payload.pop("data_classification", None)
+    field_classifications = payload.pop("field_classifications", None)
+    if field_classifications is not None and not isinstance(field_classifications, dict):
+        raise ValueError("Field 'field_classifications' must be an object.")
+    _bot().store_setting(
+        "profile",
+        payload,
+        data_classification=None if data_classification is None else str(data_classification),
+        field_classifications=field_classifications,
+    )
     return jsonify({"organization_profile": _bot().load_organization_profile()})
 
 
@@ -1088,17 +1026,8 @@ def update_organization_settings() -> Response:
 @require_role("admin")
 def update_search_settings() -> Response:
     payload = _get_request_json()
-    keywords = payload.get("keywords", [])
-    trusted_sources = payload.get("trusted_sources", [])
-    if isinstance(keywords, str):
-        keywords = [item.strip() for item in keywords.split(",") if item.strip()]
-    if isinstance(trusted_sources, str):
-        trusted_sources = [item.strip() for item in trusted_sources.split(",") if item.strip()]
-    if not isinstance(keywords, list) or not isinstance(trusted_sources, list):
-        raise ValueError(
-            "Fields 'keywords' and 'trusted_sources' must be lists (e.g. "
-            "[\"education\", \"csr\"]) or comma-separated strings (e.g. \"education,csr\")."
-        )
+    keywords = _coerce_list(payload.get("keywords", []), "keywords")
+    trusted_sources = _coerce_list(payload.get("trusted_sources", []), "trusted_sources")
 
     settings = _bot().store_search_settings(keywords=keywords, trusted_sources=trusted_sources)
     return jsonify({"search_settings": settings})
@@ -1130,12 +1059,12 @@ def run_discovery_now() -> Response:
     any newly discovered opportunities.
     """
     payload = request.get_json(silent=True) or {}
-    keywords = payload.get("keywords")
-    trusted_sources = payload.get("trusted_sources")
-    if isinstance(keywords, str):
-        keywords = [item.strip() for item in keywords.split(",") if item.strip()]
-    if isinstance(trusted_sources, str):
-        trusted_sources = [item.strip() for item in trusted_sources.split(",") if item.strip()]
+    keywords = _coerce_list(payload.get("keywords"), "keywords") if "keywords" in payload else None
+    trusted_sources = (
+        _coerce_list(payload.get("trusted_sources"), "trusted_sources")
+        if "trusted_sources" in payload
+        else None
+    )
 
     status_code, payload = dispatch_discovery(
         keywords=keywords,
@@ -1143,6 +1072,38 @@ def run_discovery_now() -> Response:
         db_path=os.environ.get("BOT_DB_PATH", "funding_bot.db"),
     )
     return jsonify(payload), status_code
+
+
+@app.post("/settings/privacy-policy")
+@require_role("admin")
+def generate_privacy_policy() -> Response:
+    payload = _get_request_json()
+    output_dir = str(
+        payload.get("output_dir", os.environ.get("PRIVACY_POLICY_OUTPUT_DIR", "generated/privacy_policies"))
+    ).strip()
+    if not output_dir:
+        raise ValueError("Field 'output_dir' must not be empty.")
+
+    generated = _bot().generate_privacy_policies(
+        output_dir=output_dir,
+        jurisdictions=_coerce_list(payload.get("jurisdictions"), "jurisdictions")
+        if payload.get("jurisdictions") is not None
+        else None,
+        formats=_coerce_list(payload.get("formats"), "formats")
+        if payload.get("formats") is not None
+        else None,
+        effective_date=payload.get("effective_date"),
+    )
+    return (
+        jsonify(
+            {
+                "policies": generated,
+                "residency_status": _bot().get_data_residency_status(),
+                "versions": _bot().list_privacy_policy_versions(limit=10),
+            }
+        ),
+        201,
+    )
 
 
 @app.post("/settings/test-outreach")
@@ -1202,6 +1163,120 @@ def send_test_outreach() -> Response:
     return jsonify(result), 201
 
 
+@app.get("/task-directory")
+@require_role("staff", "admin", "auditor")
+def list_tasks_directory_route() -> Response:
+    tasks = _bot().list_tasks(
+        assigned_to=request.args.get("assigned_to"),
+        assignee_email=request.args.get("assignee_email"),
+        status=request.args.get("status"),
+        source=request.args.get("source"),
+        sort=request.args.get("sort"),
+        viewer_email=request.args.get("viewer_email"),
+    )
+    return jsonify(tasks)
+
+
+@app.post("/task-directory")
+@require_role("staff", "admin")
+def create_task_directory_route() -> Response:
+    payload = _get_request_json()
+    title = str(payload.get("title", "")).strip()
+    assigned_to = str(payload.get("assigned_to", "")).strip()
+    if not title:
+        raise ValueError("Field 'title' is required.")
+    if not assigned_to:
+        raise ValueError("Field 'assigned_to' is required.")
+
+    task = _bot().create_task(
+        title=title,
+        assigned_to=assigned_to,
+        description=str(payload.get("description", "")),
+        status=str(payload.get("status", "todo")),
+        due_date=payload.get("due_date"),
+        external_id=payload.get("external_id"),
+        source=str(payload.get("source", "manual")),
+        assignee_email=payload.get("assignee_email"),
+        assignee_name=payload.get("assignee_name"),
+        sender=_task_assignment_sender(),
+    )
+    return jsonify({"task": task, "notification": task.get("assignment_notification")}), 201
+
+
+@app.get("/task-directory/<int:task_id>")
+@require_role("staff", "admin", "auditor")
+def get_task_directory_route(task_id: int) -> Response:
+    task = _bot().get_task(task_id, viewer_email=request.args.get("viewer_email"))
+    return jsonify(task)
+
+
+@app.post("/task-directory/<int:task_id>/assignment")
+@require_role("staff", "admin")
+def assign_task_directory_route(task_id: int) -> Response:
+    payload = _get_request_json()
+    assigned_to = str(payload.get("assigned_to", "")).strip()
+    if not assigned_to:
+        raise ValueError("Field 'assigned_to' is required.")
+    task = _bot().update_task_assignment(
+        task_id,
+        assigned_to=assigned_to,
+        assignee_email=payload.get("assignee_email"),
+        assignee_name=payload.get("assignee_name"),
+        sender=_task_assignment_sender(),
+        changed_by=getattr(g, "current_role", None),
+    )
+    return jsonify({"task": task, "notification": task.get("assignment_notification")})
+
+
+@app.get("/tasks/<int:task_id>/comments")
+@require_role("staff", "admin", "auditor")
+def list_task_comments_route(task_id: int) -> Response:
+    payload = _bot().list_task_comments(task_id, viewer_email=request.args.get("viewer_email"))
+    payload["comments"] = [_serialize_task_comment(comment) for comment in payload["comments"]]
+    return jsonify(payload)
+
+
+@app.post("/tasks/<int:task_id>/comments")
+@require_role("staff", "admin")
+def create_task_comment_route(task_id: int) -> Response:
+    payload = _get_request_json()
+    comment = _bot().create_task_comment(
+        task_id,
+        author=str(payload.get("author", "")),
+        content=str(payload.get("content", "")),
+    )
+    return jsonify(comment), 201
+
+
+@app.patch("/tasks/<int:task_id>/comments/<int:comment_id>")
+@require_role("staff", "admin")
+def update_task_comment_route(task_id: int, comment_id: int) -> Response:
+    payload = _get_request_json()
+    content = str(payload.get("content", "")).strip()
+    if not content:
+        raise ValueError("Field 'content' is required.")
+    comment = _bot().update_task_comment(task_id, comment_id, content=content)
+    return jsonify(comment)
+
+
+@app.delete("/tasks/<int:task_id>/comments/<int:comment_id>")
+@require_role("staff", "admin")
+def delete_task_comment_route(task_id: int, comment_id: int) -> Response:
+    _bot().delete_task_comment(task_id, comment_id)
+    return Response(status=204)
+
+
+@app.post("/tasks/<int:task_id>/comments/read")
+@require_role("staff", "admin", "auditor")
+def mark_task_comments_read_route(task_id: int) -> Response:
+    payload = _get_request_json()
+    reader_email = str(payload.get("reader_email", "")).strip()
+    if not reader_email:
+        raise ValueError("Field 'reader_email' is required.")
+    result = _bot().mark_task_comments_read(task_id, reader_email=reader_email)
+    return jsonify(result)
+
+
 @app.post("/tasks/<int:task_id>/status")
 @require_role("staff", "admin", "auditor")
 def transition_task_status_route(task_id: int) -> Response:
@@ -1258,6 +1333,7 @@ def metrics() -> Response:
     tasks_total = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
     uptime_seconds = time.time() - _APP_START_TIME
     task_counts = bot.get_task_status_counts()
+    queue_metrics = bot.get_queue_metrics()
     queue_health = _get_queue_health_snapshot()
     queue_status_value = 1 if queue_health["status"] == "ok" else 0
     task_assignments = conn.execute(
@@ -1310,6 +1386,18 @@ def metrics() -> Response:
         "# HELP funding_bot_queue_workers Online Celery workers detected",
         "# TYPE funding_bot_queue_workers gauge",
         f"funding_bot_queue_workers {queue_health['worker_count']}",
+        "# HELP funding_bot_queue_task_runs_running Queue task runs currently marked running in SQLite",
+        "# TYPE funding_bot_queue_task_runs_running gauge",
+        f"funding_bot_queue_task_runs_running {queue_metrics['running']}",
+        "# HELP funding_bot_queue_task_runs_completed Queue task runs completed successfully in SQLite",
+        "# TYPE funding_bot_queue_task_runs_completed counter",
+        f"funding_bot_queue_task_runs_completed {queue_metrics['completed']}",
+        "# HELP funding_bot_queue_task_runs_cancelled Queue task runs cancelled during graceful shutdown",
+        "# TYPE funding_bot_queue_task_runs_cancelled counter",
+        f"funding_bot_queue_task_runs_cancelled {queue_metrics['cancelled']}",
+        "# HELP funding_bot_queue_duplicate_preventions_total Duplicate queue executions prevented by idempotency keys",
+        "# TYPE funding_bot_queue_duplicate_preventions_total counter",
+        f"funding_bot_queue_duplicate_preventions_total {queue_metrics['duplicate_preventions']}",
     ]
     lines.extend(
         [

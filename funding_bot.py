@@ -4,6 +4,7 @@ import base64
 import csv
 import hashlib
 import io
+import inspect
 import json
 import logging
 import os
@@ -1071,75 +1072,89 @@ class _BasePortalConnector:
             return []
 
     def fetch_result(self, keywords: Iterable[str]) -> dict[str, Any]:
-        self._last_rate_limit_retry_after = None
-        keyword_list = self._expand_keywords(keywords)
-        cache_key = self._cache_key(keyword_list)
-        if self._cache is not None:
-            hit, cached = self._cache.get(cache_key)
-            if hit:
-                return {
-                    "schema_version": cached["schema_version"],
-                    "opportunities": [dict(item) for item in cached["opportunities"]],
-                    "metadata": dict(cached["metadata"]),
+        started_at = time.perf_counter()
+        degraded = False
+        try:
+            self._last_rate_limit_retry_after = None
+            keyword_list = self._expand_keywords(keywords)
+            cache_key = self._cache_key(keyword_list)
+            if self._cache is not None:
+                hit, cached = self._cache.get(cache_key)
+                if hit:
+                    return {
+                        "schema_version": cached["schema_version"],
+                        "opportunities": [dict(item) for item in cached["opportunities"]],
+                        "metadata": dict(cached["metadata"]),
+                    }
+
+            if self._refresh_circuit_state() == "open":
+                self._metrics["short_circuits"] += 1
+                degraded = True
+                return self._build_degraded_result(keyword_list, reason="circuit_open")
+
+            use_remote = self.http_client is not None or self.transport == "http"
+            if use_remote:
+                allowed, retry_after = self._rate_limiter.consume()
+                if not allowed:
+                    self._metrics["rate_limited_requests"] += 1
+                    self._last_rate_limit_retry_after = retry_after
+                    self._last_error = (
+                        f"{self.source_name} rate limit exceeded; retry in {retry_after:.2f} seconds."
+                    )
+                    degraded = True
+                    return self._build_degraded_result(
+                        keyword_list,
+                        reason="rate_limit_exceeded",
+                        error=self._last_error,
+                    )
+            if use_remote:
+                try:
+                    result = self._fetch_remote_result(keyword_list)
+                except Exception as exc:
+                    degraded = True
+                    return self._build_degraded_result(
+                        keyword_list,
+                        reason="connector_error",
+                        error=str(exc),
+                    )
+            else:
+                result = {
+                    "schema_version": self.result_schema_version,
+                    "opportunities": [dict(item) for item in self._demo_data()],
+                    "metadata": {
+                        "connector_name": self.source_name,
+                        "source_status": "demo",
+                    },
                 }
 
-        if self._refresh_circuit_state() == "open":
-            self._metrics["short_circuits"] += 1
-            return self._build_degraded_result(keyword_list, reason="circuit_open")
-
-        use_remote = self.http_client is not None or self.transport == "http"
-        if use_remote:
-            allowed, retry_after = self._rate_limiter.consume()
-            if not allowed:
-                self._metrics["rate_limited_requests"] += 1
-                self._last_rate_limit_retry_after = retry_after
-                self._last_error = (
-                    f"{self.source_name} rate limit exceeded; retry in {retry_after:.2f} seconds."
-                )
-                return self._build_degraded_result(
-                    keyword_list,
-                    reason="rate_limit_exceeded",
-                    error=self._last_error,
-                )
-        if use_remote:
-            try:
-                result = self._fetch_remote_result(keyword_list)
-            except Exception as exc:
-                return self._build_degraded_result(
-                    keyword_list,
-                    reason="connector_error",
-                    error=str(exc),
-                )
-        else:
-            result = {
-                "schema_version": self.result_schema_version,
-                "opportunities": [dict(item) for item in self._demo_data()],
+            filtered = self._filter_opportunities(result["opportunities"], keyword_list)
+            payload = {
+                "schema_version": result["schema_version"],
+                "opportunities": filtered,
                 "metadata": {
-                    "connector_name": self.source_name,
-                    "source_status": "demo",
+                    **dict(result.get("metadata", {})),
+                    "cache_key": self.build_cache_key(keyword_list),
+                    "keyword_count": len(keyword_list),
                 },
             }
-
-        filtered = self._filter_opportunities(result["opportunities"], keyword_list)
-        payload = {
-            "schema_version": result["schema_version"],
-            "opportunities": filtered,
-            "metadata": {
-                **dict(result.get("metadata", {})),
-                "cache_key": self.build_cache_key(keyword_list),
-                "keyword_count": len(keyword_list),
-            },
-        }
-        if self._cache is not None and payload["metadata"].get("source_status") != "degraded":
-            self._cache.set(
-                cache_key,
-                {
-                    "schema_version": payload["schema_version"],
-                    "opportunities": [dict(item) for item in payload["opportunities"]],
-                    "metadata": dict(payload["metadata"]),
-                },
+            degraded = payload["metadata"].get("source_status") == "degraded"
+            if self._cache is not None and not degraded:
+                self._cache.set(
+                    cache_key,
+                    {
+                        "schema_version": payload["schema_version"],
+                        "opportunities": [dict(item) for item in payload["opportunities"]],
+                        "metadata": dict(payload["metadata"]),
+                    },
+                )
+            return payload
+        finally:
+            _CONNECTOR_METRICS.record(
+                connector_name=self.source_name,
+                connector_type=self.connector_slug,
+                latency_seconds=time.perf_counter() - started_at,
+                errored=degraded,
             )
-        return payload
 
     def build_cache_key(self, keywords: Iterable[str]) -> str:
         return json.dumps(
@@ -1746,15 +1761,14 @@ class CrowdfundingConnector(_BasePortalConnector):
         super().__init__(http_client=http_client, **kwargs)
 
     def _fetch_remote_result(self, keywords: list[str]) -> dict[str, Any]:
-        if self.http_client is None:
-            return super()._fetch_remote_result(keywords)
+        client = self.http_client or _default_http_json_client
         payload = {
             "keywords": keywords,
             "page_size": self.page_size,
             "platform": self.platform,
             "health_check": self._circuit_state == "half-open",
         }
-        response = self._call_with_retry(lambda: self.http_client(self.base_url, payload))
+        response = self._call_with_retry(lambda: client(self.base_url, payload, self.credentials))
         raw_rows, response_keys = self._extract_platform_rows(response)
         normalized_rows = [row for row in (self._normalize_platform_row(item) for item in raw_rows) if row]
         return {
@@ -1962,7 +1976,17 @@ def _default_http_json_client(
 ) -> Any:
     secure_url = _require_https_url(url, purpose="Connector request")
     headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    for key, value in (credentials or {}).items():
+    resolved_credentials = dict(credentials or {})
+    authorization_header = str(resolved_credentials.get("authorization_header", "")).strip()
+    access_token = str(resolved_credentials.get("access_token", "")).strip()
+    if authorization_header:
+        headers["Authorization"] = authorization_header
+    elif access_token:
+        token_type = str(resolved_credentials.get("token_type", "Bearer")).strip() or "Bearer"
+        headers["Authorization"] = f"{token_type} {access_token}"
+    for key, value in resolved_credentials.items():
+        if key in {"auth_type", "access_token", "token_type", "authorization_header", "expires_at"}:
+            continue
         headers[f"X-Connector-{key.replace('_', '-').title()}"] = str(value)
     try:
         with _build_tls_http_session() as session:
@@ -2682,14 +2706,6 @@ class FundingBot:
                 ON task_history(status);
             CREATE INDEX IF NOT EXISTS idx_dead_letter_queue_task_name
                 ON dead_letter_queue(task_name, failed_at DESC);
-            CREATE INDEX IF NOT EXISTS idx_tasks_assignee
-                ON tasks(assignee);
-            CREATE INDEX IF NOT EXISTS idx_tasks_status
-                ON tasks(status);
-            CREATE INDEX IF NOT EXISTS idx_tasks_external_id
-                ON tasks(external_id);
-            CREATE INDEX IF NOT EXISTS idx_tasks_due_date
-                ON tasks(due_date);
             CREATE INDEX IF NOT EXISTS idx_task_comments_task_id
                 ON task_comments(task_id, created_at ASC);
             CREATE INDEX IF NOT EXISTS idx_task_notifications_lookup
@@ -2842,6 +2858,106 @@ class FundingBot:
         )
         self.connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_task_runs_idempotency_key ON task_runs(idempotency_key)"
+        )
+        self.connection.commit()
+
+    def _apply_migrations(self) -> None:
+        migrations_dir = Path(__file__).resolve().parent / "migrations"
+        if not migrations_dir.exists():
+            return
+        applied = {
+            row["name"]
+            for row in self.connection.execute("SELECT name FROM schema_migrations").fetchall()
+        }
+        for migration_path in sorted(migrations_dir.glob("*.sql")):
+            if migration_path.name in applied:
+                continue
+            self.connection.executescript(migration_path.read_text(encoding="utf-8"))
+            self.connection.execute(
+                "INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)",
+                (migration_path.name, self._to_iso()),
+            )
+            self.connection.commit()
+
+    def _ensure_tasks_schema(self) -> None:
+        columns = [
+            row["name"]
+            for row in self.connection.execute("PRAGMA table_info(tasks)").fetchall()
+        ]
+        if not columns or "assignee" in columns:
+            return
+        if "assigned_to" not in columns:
+            return
+        self.connection.executescript(
+            """
+            ALTER TABLE tasks RENAME TO tasks_legacy;
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                external_id TEXT UNIQUE,
+                title TEXT NOT NULL,
+                description TEXT NOT NULL DEFAULT '',
+                assignee TEXT NOT NULL,
+                status TEXT NOT NULL,
+                due_date TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'manual',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                assignee_email TEXT,
+                assignee_name TEXT
+            );
+            INSERT INTO tasks (
+                id, external_id, title, description, assignee, status, due_date,
+                source, created_at, updated_at, assignee_email, assignee_name
+            )
+            SELECT
+                id,
+                external_id,
+                title,
+                COALESCE(description, ''),
+                LOWER(assigned_to),
+                CASE LOWER(status)
+                    WHEN 'todo' THEN 'pending'
+                    WHEN 'in-progress' THEN 'in_progress'
+                    WHEN 'done' THEN 'completed'
+                    ELSE REPLACE(LOWER(status), '-', '_')
+                END,
+                COALESCE(date(due_date), date(updated_at), date(created_at), date('now')),
+                COALESCE(source, 'manual'),
+                created_at,
+                updated_at,
+                assignee_email,
+                assignee_name
+            FROM tasks_legacy;
+            DROP TABLE tasks_legacy;
+            CREATE INDEX IF NOT EXISTS idx_tasks_assignee ON tasks(assignee);
+            CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+            CREATE INDEX IF NOT EXISTS idx_tasks_external_id ON tasks(external_id);
+            CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date);
+            """
+        )
+        self.connection.commit()
+
+    def _apply_migrations(self) -> None:
+        """Apply lightweight schema migrations for existing databases."""
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO schema_migrations (name, applied_at)
+            VALUES (?, ?)
+            """,
+            ("baseline-task-schema", self._to_iso()),
+        )
+        self.connection.commit()
+
+    def _ensure_tasks_schema(self) -> None:
+        """Ensure task collaboration columns exist for upgraded databases."""
+        self._ensure_column("tasks", "external_id", "TEXT")
+        self._ensure_column("tasks", "due_date", "TEXT")
+        self._ensure_column("tasks", "source", "TEXT NOT NULL DEFAULT 'manual'")
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_external_id ON tasks(external_id)"
+        )
+        self.connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date)"
         )
         self.connection.commit()
 
@@ -3078,6 +3194,18 @@ class FundingBot:
         return FundingBot._as_utc(timestamp).isoformat()
 
     @staticmethod
+    def connector_metrics_snapshot() -> list[dict[str, Any]]:
+        return _CONNECTOR_METRICS.snapshot()
+
+    @staticmethod
+    def render_connector_metrics_prometheus() -> list[str]:
+        return _CONNECTOR_METRICS.render_prometheus()
+
+    @staticmethod
+    def reset_connector_metrics() -> None:
+        _CONNECTOR_METRICS.reset()
+
+    @staticmethod
     def _normalize_filter_timestamp(value: datetime | str | None, *, end: bool = False) -> str | None:
         if value is None:
             return None
@@ -3091,13 +3219,68 @@ class FundingBot:
 
     @staticmethod
     def _parse_secret_payload(raw_value: str) -> dict[str, Any]:
+        return _parse_secret_payload(raw_value)
+
+    @staticmethod
+    def _normalize_connector_configs(
+        connector_configs: dict[str, Any] | list[dict[str, Any]] | None,
+    ) -> dict[str, Any]:
+        if connector_configs is None:
+            return {"connectors": []}
+        if isinstance(connector_configs, list):
+            return {"connectors": [dict(item) for item in connector_configs]}
+        if isinstance(connector_configs, dict):
+            normalized = dict(connector_configs)
+            if "connectors" in normalized:
+                normalized["connectors"] = [
+                    dict(item) for item in normalized.get("connectors", [])
+                ]
+            return normalized
+        raise ConnectorConfigError(
+            "Connector configuration must be a dict or list of connector entries."
+        )
+
+    def _load_connector_configs(
+        self,
+        connector_configs: dict[str, Any] | list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        if connector_configs is not None:
+            normalized = self._normalize_connector_configs(connector_configs)
+        else:
+            raw_config = os.environ.get(CONNECTOR_CONFIG_ENV_VAR, "").strip()
+            if not raw_config:
+                return []
+            try:
+                parsed = json.loads(raw_config)
+            except json.JSONDecodeError as exc:
+                raise ConnectorConfigError(
+                    f"Invalid {CONNECTOR_CONFIG_ENV_VAR} JSON: {exc.msg} at line "
+                    f"{exc.lineno} column {exc.colno}."
+                ) from exc
+            normalized = self._normalize_connector_configs(parsed)
+
         try:
-            parsed = json.loads(raw_value)
-            if isinstance(parsed, dict):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-        return {"secret": raw_value}
+            validate(instance=normalized, schema=CONNECTOR_CONFIG_SCHEMA)
+        except ValidationError as exc:
+            path = ".".join(str(part) for part in exc.path)
+            field = f" at {path}" if path else ""
+            raise ConnectorConfigError(
+                f"Invalid connector configuration{field}: {exc.message}"
+            ) from exc
+        return [dict(item) for item in normalized.get("connectors", [])]
+
+    def _validate_connector_configs(self) -> None:
+        for config in self.connector_configs:
+            self.connector_registry.validate_config(
+                config,
+                credential_resolver=self.resolve_credential,
+            )
+
+    def _apply_migrations(self) -> None:
+        """Schema is created in-place; retained for backward-compatible startup."""
+
+    def _ensure_tasks_schema(self) -> None:
+        """Task tables are created in `_create_schema`; retained for compatibility."""
 
     @staticmethod
     def _validate_segment(segment: str | None) -> str:
@@ -3170,6 +3353,169 @@ class FundingBot:
         return normalized
 
     @classmethod
+    def _validate_data_classification(
+        cls,
+        classification: str | None,
+        *,
+        default: str = "internal",
+    ) -> str:
+        return _normalize_data_classification(classification, default=default)
+
+    @classmethod
+    def _classification_rank(cls, classification: str) -> int:
+        return _DATA_CLASSIFICATION_RANK[cls._validate_data_classification(classification)]
+
+    @classmethod
+    def _build_field_classifications(
+        cls,
+        *,
+        defaults: dict[str, str],
+        fields: Iterable[str],
+        overrides: dict[str, Any] | None = None,
+        default_classification: str = "internal",
+    ) -> dict[str, str]:
+        merged: dict[str, str] = {}
+        allowed_fields = {str(field) for field in fields}
+        for field_name in allowed_fields:
+            merged[field_name] = cls._validate_data_classification(
+                defaults.get(field_name),
+                default=default_classification,
+            )
+        for field_name, value in (overrides or {}).items():
+            normalized_name = str(field_name).strip()
+            if not normalized_name:
+                continue
+            if allowed_fields and normalized_name not in allowed_fields:
+                raise ValueError(f"Unknown field classification target {normalized_name!r}.")
+            merged[normalized_name] = cls._validate_data_classification(
+                str(value),
+                default=default_classification,
+            )
+        return dict(sorted(merged.items()))
+
+    @classmethod
+    def _assert_field_classifications_within_record(
+        cls,
+        record_classification: str,
+        field_classifications: dict[str, str],
+    ) -> None:
+        record_rank = cls._classification_rank(record_classification)
+        for field_name, classification in field_classifications.items():
+            if cls._classification_rank(classification) > record_rank:
+                raise ValueError(
+                    f"Field {field_name!r} is classified as {classification!r}, "
+                    f"which exceeds record classification {record_classification!r}."
+                )
+
+    @staticmethod
+    def _encryption_key() -> bytes:
+        seed = os.environ.get("FUNDING_BOT_ENCRYPTION_KEY", "funding-bot-dev-key")
+        return hashlib.sha256(seed.encode("utf-8")).digest()
+
+    @classmethod
+    def _keystream(cls, nonce: bytes, length: int) -> bytes:
+        key = cls._encryption_key()
+        output = bytearray()
+        counter = 0
+        while len(output) < length:
+            output.extend(hashlib.sha256(key + nonce + counter.to_bytes(4, "big")).digest())
+            counter += 1
+        return bytes(output[:length])
+
+    @classmethod
+    def _encrypt_text(cls, plaintext: str) -> str:
+        raw_bytes = plaintext.encode("utf-8")
+        nonce = os.urandom(16)
+        ciphertext = bytes(
+            value ^ mask for value, mask in zip(raw_bytes, cls._keystream(nonce, len(raw_bytes)))
+        )
+        mac = hashlib.sha256(cls._encryption_key() + nonce + ciphertext).hexdigest()
+        payload = json.dumps(
+            {
+                "ciphertext": base64.b64encode(ciphertext).decode("ascii"),
+                "mac": mac,
+                "nonce": base64.b64encode(nonce).decode("ascii"),
+            },
+            sort_keys=True,
+        )
+        return _ENCRYPTED_VALUE_PREFIX + base64.b64encode(payload.encode("utf-8")).decode("ascii")
+
+    @classmethod
+    def _decrypt_text(cls, payload: str) -> str:
+        if not payload.startswith(_ENCRYPTED_VALUE_PREFIX):
+            return payload
+        encoded = payload[len(_ENCRYPTED_VALUE_PREFIX) :]
+        parsed = json.loads(base64.b64decode(encoded).decode("utf-8"))
+        nonce = base64.b64decode(parsed["nonce"])
+        ciphertext = base64.b64decode(parsed["ciphertext"])
+        expected_mac = hashlib.sha256(cls._encryption_key() + nonce + ciphertext).hexdigest()
+        if parsed.get("mac") != expected_mac:
+            raise FundingBotError("Encrypted field failed integrity validation.")
+        plaintext = bytes(
+            value ^ mask
+            for value, mask in zip(ciphertext, cls._keystream(nonce, len(ciphertext)))
+        )
+        return plaintext.decode("utf-8")
+
+    @classmethod
+    def _decode_json_blob(cls, payload: str | None, *, default: Any) -> Any:
+        if not payload:
+            return default
+        return json.loads(cls._decrypt_text(payload))
+
+    @classmethod
+    def _encode_json_blob(
+        cls,
+        value: Any,
+        *,
+        encrypt: bool = False,
+    ) -> str:
+        payload = json.dumps(value, sort_keys=True)
+        return cls._encrypt_text(payload) if encrypt else payload
+
+    @classmethod
+    def _setting_defaults_for(
+        cls,
+        key: str,
+        value: dict[str, Any],
+    ) -> tuple[str, dict[str, str], bool]:
+        if key == "profile":
+            fields = set(str(field) for field in value)
+            fields.update(cls.ORGANIZATION_PROFILE_FIELD_CLASSIFICATIONS)
+            return (
+                cls.SETTING_DEFAULT_CLASSIFICATIONS["profile"],
+                cls._build_field_classifications(
+                    defaults=cls.ORGANIZATION_PROFILE_FIELD_CLASSIFICATIONS,
+                    fields=fields,
+                ),
+                True,
+            )
+        return (
+            cls.SETTING_DEFAULT_CLASSIFICATIONS.get(key, "internal"),
+            cls._build_field_classifications(
+                defaults={str(field): "internal" for field in value},
+                fields=set(str(field) for field in value),
+            ),
+            False,
+        )
+
+    @classmethod
+    def _deserialize_donor_row(cls, row: sqlite3.Row | None) -> dict[str, Any] | None:
+        if row is None:
+            return None
+        donor = dict(row)
+        donor["opted_out"] = bool(donor["opted_out"])
+        donor["preferences"] = cls._decode_json_blob(
+            donor.pop("preferences_json", "{}"),
+            default={},
+        )
+        donor["field_classifications"] = cls._decode_json_blob(
+            donor.pop("field_classifications_json", "{}"),
+            default={},
+        )
+        return donor
+
+    @classmethod
     def _load_outreach_template_catalog(cls, locale: str) -> dict[str, Any]:
         normalized_locale = cls._validate_locale(locale)
         catalog_path = cls.OUTREACH_TEMPLATE_CATALOG / f"{normalized_locale}.json"
@@ -3226,7 +3572,8 @@ class FundingBot:
 
     @classmethod
     def _normalize_task_status(cls, status: str) -> str:
-        normalized = str(status).strip().lower().replace("_", "-")
+        normalized = str(status).strip().lower().replace("-", "_").replace(" ", "_")
+        normalized = cls.TASK_STATUS_ALIASES.get(normalized, normalized)
         if normalized not in cls.TASK_STATUSES:
             raise ValueError(
                 f"Invalid task status {status!r}. Expected one of {list(cls.TASK_STATUSES)}."
@@ -3236,12 +3583,12 @@ class FundingBot:
     @staticmethod
     def _normalize_due_date(due_date: datetime | str | None) -> str | None:
         if due_date is None:
-            return None
+            return FundingBot._as_utc().date().isoformat()
         if isinstance(due_date, datetime):
             return FundingBot._as_utc(due_date).date().isoformat()
         normalized = str(due_date).strip()
         if not normalized:
-            return None
+            return FundingBot._as_utc().date().isoformat()
         try:
             return datetime.fromisoformat(normalized).date().isoformat()
         except ValueError:
@@ -3251,12 +3598,16 @@ class FundingBot:
         raise ValueError("Task due_date must be an ISO-8601 date or datetime string.")
 
     @staticmethod
-    def _serialize_task(row: sqlite3.Row) -> dict[str, Any]:
-        task = dict(row)
+    def _serialize_task(row: sqlite3.Row | Task | dict[str, Any]) -> dict[str, Any]:
+        task = row.to_dict() if isinstance(row, Task) else dict(row)
+        if "assignee" not in task and "assigned_to" in task:
+            task["assignee"] = task["assigned_to"]
+        if "assigned_to" not in task and "assignee" in task:
+            task["assigned_to"] = task["assignee"]
         task["due_date"] = FundingBot._normalize_task_due_date(task.get("due_date"))
         today = FundingBot._as_utc().date().isoformat()
         task["is_overdue"] = bool(
-            task["due_date"] and task["status"] != "done" and task["due_date"] < today
+            task["due_date"] and task["status"] != "completed" and task["due_date"] < today
         )
         task["unread_comment_count"] = int(task.get("unread_comment_count", 0) or 0)
         return task
@@ -3264,10 +3615,10 @@ class FundingBot:
     @staticmethod
     def _normalize_task_due_date(due_date: str | None) -> str | None:
         if due_date is None:
-            return None
+            return FundingBot._as_utc().date().isoformat()
         normalized = str(due_date).strip()
         if not normalized:
-            return None
+            return FundingBot._as_utc().date().isoformat()
         try:
             return datetime.fromisoformat(normalized).date().isoformat()
         except ValueError as exc:
@@ -3538,11 +3889,11 @@ class FundingBot:
                 status,
                 max(0, min(100, int(progress))),
                 message,
-                json.dumps(payload or {}, sort_keys=True),
-                json.dumps(result, sort_keys=True) if result is not None else None,
+                json.dumps(payload or {}, sort_keys=True, default=str),
+                json.dumps(result, sort_keys=True, default=str) if result is not None else None,
                 error_message,
                 callback_name,
-                json.dumps(callback_payload, sort_keys=True)
+                json.dumps(callback_payload, sort_keys=True, default=str)
                 if callback_payload is not None
                 else None,
                 idempotency_key or task_id,
@@ -3608,15 +3959,32 @@ class FundingBot:
         backoff_max_seconds: float | None = None,
     ) -> dict[str, float | int]:
         configured_retry_limit = (
-            self.DEFAULT_QUEUE_RETRY_LIMIT if retry_limit is None else int(retry_limit)
+            int(
+                os.environ.get(
+                    "FUNDING_BOT_TASK_RETRY_LIMIT",
+                    str(self.DEFAULT_QUEUE_RETRY_LIMIT),
+                )
+            )
+            if retry_limit is None
+            else int(retry_limit)
         )
         configured_backoff_seconds = (
-            self.DEFAULT_QUEUE_RETRY_BACKOFF_SECONDS
+            float(
+                os.environ.get(
+                    "FUNDING_BOT_TASK_RETRY_BACKOFF_SECONDS",
+                    str(self.DEFAULT_QUEUE_RETRY_BACKOFF_SECONDS),
+                )
+            )
             if backoff_seconds is None
             else float(backoff_seconds)
         )
         configured_backoff_max_seconds = (
-            self.DEFAULT_QUEUE_RETRY_BACKOFF_MAX_SECONDS
+            float(
+                os.environ.get(
+                    "FUNDING_BOT_TASK_RETRY_BACKOFF_MAX_SECONDS",
+                    str(self.DEFAULT_QUEUE_RETRY_BACKOFF_MAX_SECONDS),
+                )
+            )
             if backoff_max_seconds is None
             else float(backoff_max_seconds)
         )
@@ -4026,26 +4394,105 @@ class FundingBot:
         )
         return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
-    def store_setting(self, key: str, value: dict[str, Any]) -> None:
+    def store_setting(
+        self,
+        key: str,
+        value: dict[str, Any],
+        *,
+        data_classification: str | None = None,
+        field_classifications: dict[str, Any] | None = None,
+    ) -> None:
         """Persist an arbitrary named setting (organization profile, search
         preferences, etc.) as JSON, keyed by ``key``.
 
         This backs the web admin "Settings" panel so operators can configure
         the bot without leaving the dashboard or touching the CLI/env vars.
         """
+        existing = self.connection.execute(
+            """
+            SELECT data_classification, field_classifications_json
+            FROM organization_profile
+            WHERE key = ?
+            """,
+            (key,),
+        ).fetchone()
+        default_classification, default_field_classifications, should_encrypt = (
+            self._setting_defaults_for(key, value)
+        )
+        final_classification = self._validate_data_classification(
+            data_classification if data_classification is not None else (
+                existing["data_classification"] if existing else default_classification
+            ),
+            default=default_classification,
+        )
+        final_field_classifications = self._build_field_classifications(
+            defaults=default_field_classifications,
+            fields=set(default_field_classifications),
+            overrides=field_classifications
+            if field_classifications is not None
+            else (
+                self._decode_json_blob(
+                    existing["field_classifications_json"],
+                    default=default_field_classifications,
+                )
+                if existing
+                else default_field_classifications
+            ),
+        )
+        self._assert_field_classifications_within_record(
+            final_classification,
+            final_field_classifications,
+        )
         self.connection.execute(
-            "INSERT OR REPLACE INTO organization_profile (key, value_json) VALUES (?, ?)",
-            (key, json.dumps(value, sort_keys=True)),
+            """
+            INSERT OR REPLACE INTO organization_profile (
+                key, value_json, data_classification, field_classifications_json
+            ) VALUES (?, ?, ?, ?)
+            """,
+            (
+                key,
+                self._encode_json_blob(value, encrypt=should_encrypt),
+                final_classification,
+                json.dumps(final_field_classifications, sort_keys=True),
+            ),
         )
         self.connection.commit()
-        self._log_action("generic_setting_updated", key=key, value_keys=_extract_dict_keys(value))
+        self._log_action(
+            "generic_setting_updated",
+            key=key,
+            value_keys=_extract_dict_keys(value),
+            data_classification=final_classification,
+            field_classifications=final_field_classifications,
+        )
+        if existing is not None:
+            previous_classification = self._validate_data_classification(
+                existing["data_classification"],
+                default=default_classification,
+            )
+            previous_fields = self._decode_json_blob(
+                existing["field_classifications_json"],
+                default=default_field_classifications,
+            )
+            if (
+                previous_classification != final_classification
+                or previous_fields != final_field_classifications
+            ):
+                self._log_action(
+                    "data_classification_changed",
+                    model="organization_profile",
+                    record_key=key,
+                    previous_data_classification=previous_classification,
+                    data_classification=final_classification,
+                    previous_field_classifications=previous_fields,
+                    field_classifications=final_field_classifications,
+                )
 
     def load_setting(self, key: str) -> dict[str, Any]:
         row = self.connection.execute(
             "SELECT value_json FROM organization_profile WHERE key = ?",
             (key,),
         ).fetchone()
-        return json.loads(row["value_json"]) if row else {}
+        return self._decode_json_blob(row["value_json"], default={}) if row else {}
 
     def store_organization_profile(self, profile: dict[str, Any]) -> None:
         self.store_setting("profile", profile)
@@ -4484,50 +4931,104 @@ class FundingBot:
         preferences: dict[str, Any] | None = None,
         segment: str | None = None,
         locale: str | None = None,
+        data_classification: str | None = None,
+        field_classifications: dict[str, Any] | None = None,
     ) -> None:
         email = _validate_email(email)
-        normalized_segment = self._validate_segment(segment) if segment is not None else None
-        normalized_locale = self._validate_locale(locale) if locale is not None else None
+        existing = self.connection.execute(
+            """
+            SELECT last_contact_at, segment, locale, data_classification, field_classifications_json
+            FROM donors
+            WHERE email = ?
+            """,
+            (email,),
+        ).fetchone()
+        normalized_segment = (
+            self._validate_segment(segment)
+            if segment is not None
+            else (existing["segment"] if existing is not None else "unknown")
+        )
+        normalized_locale = (
+            self._validate_locale(locale)
+            if locale is not None
+            else (existing["locale"] if existing is not None else "en")
+        )
+        final_classification = self._validate_data_classification(
+            data_classification
+            if data_classification is not None
+            else (
+                existing["data_classification"]
+                if existing is not None
+                else self.MODEL_DEFAULT_CLASSIFICATIONS["donors"]
+            ),
+            default=self.MODEL_DEFAULT_CLASSIFICATIONS["donors"],
+        )
+        default_field_classifications = self._build_field_classifications(
+            defaults=self.DONOR_FIELD_CLASSIFICATIONS,
+            fields=self.DONOR_FIELD_CLASSIFICATIONS,
+        )
+        final_field_classifications = self._build_field_classifications(
+            defaults=default_field_classifications,
+            fields=default_field_classifications,
+            overrides=field_classifications
+            if field_classifications is not None
+            else (
+                self._decode_json_blob(
+                    existing["field_classifications_json"],
+                    default=default_field_classifications,
+                )
+                if existing is not None
+                else default_field_classifications
+            ),
+        )
+        self._assert_field_classifications_within_record(
+            final_classification,
+            final_field_classifications,
+        )
         self.connection.execute(
             """
             INSERT INTO donors (
-                email, name, opted_out, preferences_json, last_contact_at, segment, locale
+                email,
+                name,
+                opted_out,
+                preferences_json,
+                last_contact_at,
+                segment,
+                locale,
+                data_classification,
+                field_classifications_json
             )
-            VALUES (
-                ?, ?, ?, ?, COALESCE((SELECT last_contact_at FROM donors WHERE email = ?), NULL),
-                COALESCE((SELECT segment FROM donors WHERE email = ?), COALESCE(?, 'unknown')),
-                COALESCE((SELECT locale FROM donors WHERE email = ?), COALESCE(?, 'en'))
-            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(email) DO UPDATE SET
                 name = excluded.name,
                 opted_out = excluded.opted_out,
                 preferences_json = excluded.preferences_json,
-                segment = CASE
-                    WHEN ? IS NULL THEN donors.segment
-                    ELSE excluded.segment
-                END,
-                locale = CASE
-                    WHEN ? IS NULL THEN donors.locale
-                    ELSE excluded.locale
-                END
+                segment = excluded.segment,
+                locale = excluded.locale,
+                data_classification = excluded.data_classification,
+                field_classifications_json = excluded.field_classifications_json
             """,
             (
                 email,
                 name,
                 int(opted_out),
-                json.dumps(preferences or {}),
-                email,
-                email,
+                self._encode_json_blob(
+                    preferences or {},
+                    encrypt=(
+                        self._classification_rank(final_field_classifications["preferences"])
+                        >= self._classification_rank("confidential")
+                    ),
+                ),
+                existing["last_contact_at"] if existing is not None else None,
                 normalized_segment,
-                email,
                 normalized_locale,
-                normalized_segment,
-                normalized_locale,
+                final_classification,
+                json.dumps(final_field_classifications, sort_keys=True),
             ),
         )
         self.connection.commit()
         logged_profile = self.connection.execute(
-            "SELECT segment, locale FROM donors WHERE email = ?",
+            "SELECT segment, locale, data_classification, field_classifications_json FROM donors WHERE email = ?",
             (email,),
         ).fetchone()
         self._log_action(
@@ -4536,7 +5037,38 @@ class FundingBot:
             opted_out=opted_out,
             segment=logged_profile["segment"],
             locale=logged_profile["locale"],
+            data_classification=logged_profile["data_classification"],
+            field_classifications=self._decode_json_blob(
+                logged_profile["field_classifications_json"],
+                default={},
+            ),
         )
+        if existing is not None:
+            previous_classification = self._validate_data_classification(
+                existing["data_classification"],
+                default=self.MODEL_DEFAULT_CLASSIFICATIONS["donors"],
+            )
+            previous_fields = self._decode_json_blob(
+                existing["field_classifications_json"],
+                default=default_field_classifications,
+            )
+            current_fields = self._decode_json_blob(
+                logged_profile["field_classifications_json"],
+                default=default_field_classifications,
+            )
+            if (
+                previous_classification != logged_profile["data_classification"]
+                or previous_fields != current_fields
+            ):
+                self._log_action(
+                    "data_classification_changed",
+                    model="donors",
+                    record_key=email,
+                    previous_data_classification=previous_classification,
+                    data_classification=logged_profile["data_classification"],
+                    previous_field_classifications=previous_fields,
+                    field_classifications=current_fields,
+                )
 
     def list_donors(self, segment: str | None = None) -> list[dict[str, Any]]:
         """Return donor records, optionally filtered by segment."""
@@ -4550,7 +5082,11 @@ class FundingBot:
             rows = self.connection.execute(
                 "SELECT * FROM donors ORDER BY name, email"
             ).fetchall()
-        return [dict(row) for row in rows]
+        return [donor for donor in (self._deserialize_donor_row(row) for row in rows) if donor]
+
+    def get_donor(self, email: str) -> dict[str, Any] | None:
+        row = self.connection.execute("SELECT * FROM donors WHERE email = ?", (email,)).fetchone()
+        return self._deserialize_donor_row(row)
 
     def _insert_consent_record(
         self,
@@ -6090,6 +6626,47 @@ class FundingBot:
         self._log_action("outreach_sent", donor_email=donor_email, subject=subject)
         return {"email": donor_email, "subject": subject, "body": body, "sent_at": sent_iso}
 
+    def send_outreach_task(
+        self,
+        *,
+        donor_email: str,
+        donor_name: str,
+        subject_template: str,
+        body_template: str,
+        context: dict[str, Any] | None = None,
+        sender: Any | None = None,
+        sent_at: datetime | None = None,
+        locale: str | None = None,
+        retry_limit: int | None = None,
+        backoff_seconds: float | None = None,
+        backoff_max_seconds: float | None = None,
+        sleep_func: Callable[[float], None] | None = None,
+    ) -> dict[str, Any]:
+        return self.execute_queue_task(
+            "send_outreach",
+            {
+                "donor_email": donor_email,
+                "donor_name": donor_name,
+                "locale": locale,
+                "sent_at": self._to_iso(sent_at) if sent_at else None,
+                "context_keys": sorted((context or {}).keys()),
+            },
+            lambda _context, _payload: self.send_outreach(
+                donor_email=donor_email,
+                donor_name=donor_name,
+                subject_template=subject_template,
+                body_template=body_template,
+                context=context,
+                sender=sender,
+                sent_at=sent_at,
+                locale=locale,
+            ),
+            retry_limit=retry_limit,
+            backoff_seconds=backoff_seconds,
+            backoff_max_seconds=backoff_max_seconds,
+            sleep_func=sleep_func,
+        )
+
     def register_outreach_template(
         self,
         name: str,
@@ -6807,6 +7384,34 @@ class FundingBot:
             )
         return summary
 
+    def send_daily_summary_task(
+        self,
+        *,
+        recipient: str | None = None,
+        sender: Any | None = None,
+        report_date: datetime | None = None,
+        retry_limit: int | None = None,
+        backoff_seconds: float | None = None,
+        backoff_max_seconds: float | None = None,
+        sleep_func: Callable[[float], None] | None = None,
+    ) -> dict[str, Any]:
+        return self.execute_queue_task(
+            "send_daily_summary",
+            {
+                "recipient": recipient,
+                "report_date": self._to_iso(report_date) if report_date else None,
+            },
+            lambda _context, _payload: self.send_daily_summary(
+                recipient=recipient,
+                sender=sender,
+                report_date=report_date,
+            ),
+            retry_limit=retry_limit,
+            backoff_seconds=backoff_seconds,
+            backoff_max_seconds=backoff_max_seconds,
+            sleep_func=sleep_func,
+        )
+
     def build_gdpr_compliance_report(
         self,
         *,
@@ -7144,6 +7749,64 @@ def _parse_csv_argument(raw_value: str | None) -> list[str] | None:
     return _normalize_text_list(raw_value.split(","))
 
 
+def _resolve_cli_log_level(*, verbose: bool = False, quiet: bool = False) -> int:
+    if verbose:
+        return logging.INFO
+    if quiet:
+        return logging.ERROR
+    return logging.WARNING
+
+
+def _configure_cli_logging(*, verbose: bool = False, quiet: bool = False) -> int:
+    level = _resolve_cli_log_level(verbose=verbose, quiet=quiet)
+    logging.basicConfig(level=level, format="%(levelname)s:%(name)s:%(message)s", force=True)
+    return level
+
+
+def _missing_required_cli_args(args: Any) -> list[tuple[str, dict[str, Any]]]:
+    missing: list[tuple[str, dict[str, Any]]] = []
+    for spec in getattr(args, "_required_cli_args", ()):
+        value = getattr(args, spec["dest"], None)
+        if isinstance(value, str):
+            value = value.strip()
+        if value in (None, ""):
+            missing.append((spec["dest"], spec))
+    return missing
+
+
+def _prompt_for_cli_value(spec: dict[str, Any]) -> str:
+    prompt = f"{spec['prompt']}: "
+    choices = spec.get("choices")
+    while True:
+        response = input(prompt).strip()
+        if not response:
+            print(f"{spec['flag']} is required.", file=sys.stderr)
+            continue
+        if choices is not None and response not in choices:
+            print(
+                f"Invalid value for {spec['flag']}. Choose one of: {', '.join(choices)}.",
+                file=sys.stderr,
+            )
+            continue
+        return response
+
+
+def _prompt_for_missing_cli_args(
+    parser: "argparse.ArgumentParser", args: "argparse.Namespace"
+) -> "argparse.Namespace":
+    missing = _missing_required_cli_args(args)
+    if not missing:
+        return args
+    if args.non_interactive:
+        parser.error(
+            f"the following arguments are required for {args.command}: "
+            + ", ".join(spec["flag"] for _, spec in missing)
+        )
+    for dest, spec in missing:
+        setattr(args, dest, _prompt_for_cli_value(spec))
+    return args
+
+
 def _queue_async_task(
     task_label: str,
     task_callable: Any,
@@ -7192,6 +7855,7 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     import argparse
 
     default_db_path = os.environ.get("BOT_DB_PATH", "funding_bot.db")
+    connector_choices = tuple(sorted(connector_registry().keys()))
     parser = argparse.ArgumentParser(
         prog="funding-bot",
         description="Nonprofit Funding Automation Bot – command-line interface",
@@ -7204,6 +7868,22 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
             "Path to the SQLite database file "
             f"(default: {default_db_path}, overridable with BOT_DB_PATH)."
         ),
+    )
+    verbosity_group = parser.add_mutually_exclusive_group()
+    verbosity_group.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable informational CLI logging.",
+    )
+    verbosity_group.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Only show CLI errors.",
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Fail instead of prompting when required command options are missing.",
     )
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
 
@@ -7328,8 +8008,7 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
     )
     test_connector_parser.add_argument(
         "--connector",
-        required=True,
-        choices=sorted(connector_registry().keys()),
+        choices=connector_choices,
         metavar="NAME",
         help="Connector slug to validate.",
     )
@@ -7345,13 +8024,23 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
         metavar="N",
         help="Maximum sample results to print (default: 3).",
     )
+    test_connector_parser.set_defaults(
+        _required_cli_args=(
+            {
+                "dest": "connector",
+                "flag": "--connector",
+                "prompt": f"Connector slug ({', '.join(connector_choices)})",
+                "choices": connector_choices,
+            },
+        )
+    )
 
     outreach_parser = subparsers.add_parser(
         "send-outreach",
         help="Compose and send (or preview) a personalized donor outreach email.",
     )
-    outreach_parser.add_argument("--email", required=True, metavar="EMAIL", help="Donor email address.")
-    outreach_parser.add_argument("--name", required=True, metavar="NAME", help="Donor name.")
+    outreach_parser.add_argument("--email", metavar="EMAIL", help="Donor email address.")
+    outreach_parser.add_argument("--name", metavar="NAME", help="Donor name.")
     outreach_parser.add_argument(
         "--subject",
         default=None,
@@ -7374,6 +8063,12 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
         action="store_true",
         help="Compose and log the outreach without sending a real email.",
     )
+    outreach_parser.set_defaults(
+        _required_cli_args=(
+            {"dest": "email", "flag": "--email", "prompt": "Donor email"},
+            {"dest": "name", "flag": "--name", "prompt": "Donor name"},
+        )
+    )
 
     profile_parser = subparsers.add_parser(
         "set-organization-profile",
@@ -7389,12 +8084,21 @@ def _build_arg_parser() -> "argparse.ArgumentParser":
         "register-credential",
         help="Register a credential alias that resolves to an environment variable.",
     )
-    credential_parser.add_argument("--alias", required=True, metavar="ALIAS", help="Credential alias name.")
+    credential_parser.add_argument("--alias", metavar="ALIAS", help="Credential alias name.")
     credential_parser.add_argument(
         "--env-var",
-        required=True,
         metavar="ENV_VAR",
         help="Name of the environment variable holding the secret.",
+    )
+    credential_parser.set_defaults(
+        _required_cli_args=(
+            {"dest": "alias", "flag": "--alias", "prompt": "Credential alias"},
+            {
+                "dest": "env_var",
+                "flag": "--env-var",
+                "prompt": "Environment variable name",
+            },
+        )
     )
 
     retention_policy_parser = subparsers.add_parser(
@@ -7474,10 +8178,13 @@ def main(argv: list[str] | None = None) -> None:
 
     parser = _build_arg_parser()
     args = parser.parse_args(argv)
+    _configure_cli_logging(verbose=args.verbose, quiet=args.quiet)
 
     if args.command is None:
         parser.print_help()
         return
+    args = _prompt_for_missing_cli_args(parser, args)
+    logging.getLogger(__name__).info("Running CLI command %s", args.command)
 
     bot = FundingBot(db_path=args.db)
     try:
