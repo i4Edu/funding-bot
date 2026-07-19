@@ -217,10 +217,10 @@ Kubernetes (scaled)
 
 ## Installation
 
-The core bot uses the Python standard library plus Babel for locale-aware document formatting, and the web/task-queue stack uses Flask, Celery, and the Redis client:
+The core bot uses the Python standard library plus Babel for locale-aware document formatting, and the web/task-queue stack uses Flask and Celery:
 
 ```bash
-pip install -r web/requirements.txt
+pip install -r requirements.txt
 ```
 
 Set `FUNDING_BOT_ENCRYPTION_KEY` in deployed environments so encrypted donor and organization fields use a deployment-specific key.
@@ -265,6 +265,18 @@ If a translation is missing for the requested locale, document generation falls 
 python -m unittest discover -s tests
 ```
 
+### Run integration tests
+
+```bash
+python -m unittest discover -s tests -p 'test_integration.py'
+```
+
+The integration suite uses mocked portal/browser dependencies and an in-memory
+SQLite database so the full discover → apply → summary workflow can be verified
+end-to-end without calling external services. It also includes connector
+contract checks that validate each built-in portal connector against the
+standardized response schema and degraded-error schema.
+
 ```bash
 npm install
 npm run test:a11y
@@ -285,11 +297,15 @@ python -m funding_bot --verbose discover --keywords education
 # Silence non-error logs
 python -m funding_bot --quiet list-opportunities
 
-# Print the daily summary without sending it
+# Queue a dry-run daily summary task
 python -m funding_bot send-daily-summary --dry-run
 
-# Send the daily summary via SMTP
+# Queue delivery of the daily summary via SMTP
 python -m funding_bot send-daily-summary --recipient lupael@i4e.com.bd
+
+# Run Celery worker and beat
+celery -A celery_tasks.app worker --loglevel=info
+celery -A celery_tasks.app beat --loglevel=info
 
 # Generate a weekly GDPR self-check report
 python -m funding_bot gdpr-self-check-report --cadence weekly
@@ -367,10 +383,43 @@ Command reference:
 | `gdpr-self-check-report` | `v1.0.0` | `--cadence {weekly,monthly}`, `--output FILE` | Generate a GDPR self-check report covering consent coverage, retention, exports, and deletions. | Available |
 | `discover` | `v0.3.0` | `--keywords KEYWORDS`, `--trusted-sources SOURCES` | Query every configured portal connector and persist new opportunities (proves donation search). | Available |
 | `test-connector` | `v1.0.0` | `--connector NAME`, `--keywords KEYWORDS`, `--limit N` | Validate one connector in isolation and print sample results plus connector-specific keyword mappings. | Available |
-| `send-outreach` | `v0.3.0` | `--email EMAIL`, `--name NAME`, `--subject TEMPLATE`, `--body TEMPLATE`, `--dry-run` | Compose and send (or preview) a personalized donor outreach email (proves donor communication). | Available |
+| `send-outreach` | `v0.3.0` | `--email EMAIL`, `--name NAME`, `--template-name NAME`, `--locale {en,bn}`, `--subject TEMPLATE`, `--body TEMPLATE`, `--dry-run` | Compose and send (or preview) a personalized donor outreach email, including locale-specific built-in templates. | Available |
 | `set-organization-profile` | `v0.4.0` | `--file FILE` | Store the nonprofit's organization profile from a JSON file (or stdin). | Available |
 | `register-credential` | `v0.4.0` | `--alias ALIAS`, `--env-var ENV_VAR` | Register a credential alias that resolves to an environment variable. | Available |
 | `show-settings` | `v0.4.0` | *(none)* | Print the organization profile, search settings, and credential aliases. | Available |
+
+## OAuth2 Connector Credentials
+
+Connectors that require OAuth2 client-credentials can use the existing
+credential-alias flow. Store a JSON payload in the referenced environment
+variable (or vault secret file), then register that secret with
+`register-credential`.
+
+```json
+{
+  "auth_type": "oauth2_client_credentials",
+  "oauth2": {
+    "token_url": "https://auth.example.org/oauth/token",
+    "client_id": "funding-bot",
+    "client_secret": "replace-me",
+    "scope": "grants.read",
+    "audience": "https://api.example.org"
+  },
+  "credentials": {
+    "tenant": "ngo-team"
+  }
+}
+```
+
+Notes:
+
+- `token_url`, `client_id`, and `client_secret` are required.
+- `scope` or `scopes` is optional.
+- Tokens are cached in memory and refreshed before expiry.
+- Override the pre-expiry refresh buffer with `OAUTH2_REFRESH_SKEW_SECONDS`
+  (default: `60`).
+- Resolved connector credentials expose `access_token`, `token_type`,
+  `expires_at`, and `authorization_header` to HTTP connectors.
 
 ## SMTP Configuration
 
@@ -441,6 +490,10 @@ Environment variables:
 | --- | --- | --- |
 | `PORTAL_PAGE_SIZE` | `100` | Global default page size for paginated connector requests. |
 | `PORTAL_CACHE_TTL` | `300` | Global connector cache TTL in seconds. |
+| `GRANTS_GOV_API_CREDENTIALS` | *(unset)* | Optional Grants.gov auth JSON (`api_key`, `access_token`, or OAuth2 client-credentials config). |
+| `CSR_NETWORK_API_CREDENTIALS` | *(unset)* | Candid Open RFP subscription key JSON for the CSR connector. |
+| `GRANTS_GOV_API_BASE_URL` | `https://api.grants.gov/v1/api/search2` | Grants.gov search endpoint override. |
+| `CSR_NETWORK_API_BASE_URL` | `https://api.candid.org/rfp/v1/opportunity` | CSR connector endpoint override. |
 | `GRANTS_PORTAL_PAGE_SIZE` | inherits `PORTAL_PAGE_SIZE` | Page size override for the Grants Portal connector. |
 | `GRANTS_PORTAL_CACHE_TTL` | inherits `PORTAL_CACHE_TTL` | Cache TTL override for the Grants Portal connector. |
 | `CSR_NETWORK_PAGE_SIZE` | inherits `PORTAL_PAGE_SIZE` | Page size override for the CSR Network connector. |
@@ -564,7 +617,8 @@ GitHub Actions CI.
 The dashboard uses HTTP Basic Auth to establish a signed Flask session. Session
 cookies are issued with `Secure` and `HttpOnly` enabled, and idle sessions
 expire after `DASHBOARD_SESSION_TIMEOUT_MINUTES` (default: `30`). Set
-`FLASK_SECRET_KEY` in deployed environments before serving the dashboard.
+`FLASK_SECRET_KEY` in deployed environments before serving the dashboard. If you
+must test over plain HTTP locally, set `SESSION_COOKIE_SECURE=0`.
 
 Use one of these usernames as the role name:
 
@@ -656,6 +710,10 @@ The `/metrics` endpoint exposes the following gauges and counters in the Prometh
 | `funding_bot_opted_out_donors` | gauge | Donors who have opted out |
 | `funding_bot_audit_log_entries_total` | counter | Total audit log entries |
 | `funding_bot_communications_total` | counter | Total outreach emails logged |
+| `funding_bot_connector_requests_total{connector_name,connector_type}` | counter | Connector fetch requests by connector |
+| `funding_bot_connector_errors_total{connector_name,connector_type}` | counter | Connector fetch errors by connector |
+| `funding_bot_connector_latency_seconds_sum{connector_name,connector_type}` | counter | Total connector request latency in seconds |
+| `funding_bot_connector_latency_seconds_count{connector_name,connector_type}` | counter | Connector latency observations |
 | `funding_bot_uptime_seconds` | gauge | Seconds since the web process started |
 | `funding_bot_queue_health_status` | gauge | Queue health state (`1` = broker reachable and metrics collected; `0` = disabled or degraded) |
 | `funding_bot_queue_broker_up` | gauge | Whether the Celery broker is reachable |
@@ -696,6 +754,7 @@ curl -u admin:$ADMIN_PASSWORD \
 
 - Store built-in outreach template catalogs in `i18n/outreach_templates/` as UTF-8 JSON files.
 - Keep matching template keys in `en.json` and `bn.json` so every locale can render the same outreach flows.
+- Keep matching segment variants and `opt_out_notice` strings in every locale file; startup validation rejects missing translations.
 - Save each donor's preferred `locale` on the donor profile; outreach composition uses that preference to pick the built-in template automatically.
 - One-off subject/body overrides still work and keep the locale-aware Bengali or English opt-out notice.
 
@@ -828,8 +887,13 @@ touching code or environment variables.
 # Search every configured portal connector, including crowdfunding sources, and store any new opportunities.
 python funding_bot.py discover --keywords "education,csr"
 
-# Compose (and, unless --dry-run, send via SMTP) a personalized donor email.
-python funding_bot.py send-outreach --email donor@example.org --name "Jane Donor" --dry-run
+# Preview the built-in Bengali intro template without sending email.
+python funding_bot.py send-outreach \
+  --email donor@example.org \
+  --name "Jane Donor" \
+  --template-name intro \
+  --locale bn \
+  --dry-run
 ```
 
 ### From the web Settings panel

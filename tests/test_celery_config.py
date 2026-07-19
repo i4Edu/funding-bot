@@ -1,12 +1,12 @@
 import os
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from celery_app import (
     DEFAULT_CELERY_BROKER_URL,
     DEFAULT_CELERY_RESULT_BACKEND,
     DEFAULT_RABBITMQ_BROKER_URL,
+    celery_app,
     get_celery_config,
 )
 from funding_bot import FundingBot
@@ -23,8 +23,8 @@ class CeleryConfigurationTests(unittest.TestCase):
         if self.db_path.exists():
             self.db_path.unlink()
 
-    def test_default_config_prefers_redis(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
+    def test_default_config_uses_local_filesystem_broker(self):
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
             config = get_celery_config()
 
         self.assertEqual(DEFAULT_CELERY_BROKER_URL, config["broker_url"])
@@ -36,29 +36,47 @@ class CeleryConfigurationTests(unittest.TestCase):
             "CELERY_BROKER_URL": DEFAULT_RABBITMQ_BROKER_URL,
             "CELERY_RESULT_BACKEND": "rpc://",
         }
-        with mock.patch.dict(os.environ, env, clear=True):
+        with unittest.mock.patch.dict(os.environ, env, clear=True):
             config = get_celery_config()
 
         self.assertEqual(DEFAULT_RABBITMQ_BROKER_URL, config["broker_url"])
         self.assertEqual("rpc://", config["result_backend"])
 
+    def test_module_level_app_imports_task_module_and_beat_schedule(self):
+        self.assertEqual(("tasks.celery_tasks",), celery_app.conf.imports)
+        self.assertIn("daily-summary", celery_app.conf.beat_schedule)
+        scheduled = celery_app.conf.beat_schedule["daily-summary"]
+        self.assertEqual("funding_bot.send_daily_summary", scheduled["task"])
+        self.assertEqual("lupael@i4e.com.bd", scheduled["kwargs"]["recipient"])
+
     def test_discovery_task_persists_opportunities(self):
         result = run_discovery_task.run(
+            None,
             db_path=str(self.db_path),
             keywords=["education"],
             trusted_sources=["Grants Portal", "CSR Network", "NGO Directory"],
+            idempotency_key="celery-config-discovery",
         )
 
         self.assertEqual(1, result["count"])
         bot = FundingBot(db_path=self.db_path)
         try:
             self.assertEqual(1, len(bot.list_opportunities()))
+            task_run = bot.get_task_run("celery-config-discovery")
+            self.assertEqual("completed", task_run["status"])
         finally:
             bot.close()
 
     def test_daily_summary_task_supports_dry_run(self):
         bot = FundingBot(db_path=self.db_path)
         try:
+            bot.store_organization_profile(
+                {
+                    "name": "i4Edu",
+                    "mission": "Expand access to equitable education.",
+                    "registration_number": "NP-42",
+                }
+            )
             opportunity = bot.discover_opportunities(
                 [
                     {
@@ -84,9 +102,11 @@ class CeleryConfigurationTests(unittest.TestCase):
             bot.close()
 
         result = send_daily_summary_task.run(
+            None,
             recipient="ops@example.org",
             db_path=str(self.db_path),
             dry_run=True,
+            idempotency_key="celery-config-summary",
         )
         self.assertTrue(result["dry_run"])
         self.assertEqual("ops@example.org", result["recipient"])

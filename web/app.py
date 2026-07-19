@@ -48,6 +48,13 @@ TASK_SORT_OPTIONS = (
     ("due_date", "Due date (earliest first)"),
     ("-due_date", "Due date (latest first)"),
 )
+TASK_BOARD_COLUMNS = (
+    {"key": "pending", "label": "Todo", "request_status": "todo"},
+    {"key": "in_progress", "label": "In Progress", "request_status": "in-progress"},
+    {"key": "completed", "label": "Done", "request_status": "done"},
+    {"key": "blocked", "label": "Blocked", "request_status": "blocked"},
+)
+TASK_STATUS_LABELS = {column["key"]: column["label"] for column in TASK_BOARD_COLUMNS}
 
 ROLE_PASSWORD_ENV_VARS = {
     "admin": "ADMIN_PASSWORD",
@@ -332,6 +339,10 @@ def _can_move_task(role: str | None, task: dict[str, Any]) -> bool:
     return role == "admin" or task.get("assignee") == role
 
 
+def _task_status_label(status: str) -> str:
+    return TASK_STATUS_LABELS.get(status, status.replace("_", " ").replace("-", " ").title())
+
+
 def _serialize_translation_review(review: Any) -> dict[str, Any]:
     data = dict(review)
     if "locale_metadata" not in data:
@@ -514,6 +525,8 @@ def _task_dashboard_context(filters: dict[str, str | None]) -> dict[str, Any]:
         "task_counts": counts,
         "total_tasks": len(tasks),
         "task_filters": filters,
+        "task_board_columns": TASK_BOARD_COLUMNS,
+        "task_status_labels": TASK_STATUS_LABELS,
         "task_sort_options": TASK_SORT_OPTIONS,
         "task_assignee_options": _task_assignee_options(),
         "can_filter_all_assignees": current_role in {"admin", "auditor"},
@@ -1166,7 +1179,7 @@ def send_test_outreach() -> Response:
 @app.get("/tasks")
 @app.get("/task-directory")
 @require_role("staff", "admin", "auditor")
-def list_tasks_directory_route() -> Response:
+def list_tasks_route() -> Response:
     current_role = getattr(g, "current_role", None)
     assigned_to = request.args.get("assigned_to") or request.args.get("assignee")
     if current_role not in {"admin", "auditor"}:
@@ -1192,7 +1205,7 @@ def list_tasks_directory_route() -> Response:
 @app.post("/tasks")
 @app.post("/task-directory")
 @require_role("admin")
-def create_task_directory_route() -> Response:
+def create_task_route() -> Response:
     payload = _get_request_json()
     title = str(payload.get("title", "")).strip()
     assigned_to = str(payload.get("assignee", payload.get("assigned_to", ""))).strip()
@@ -1239,12 +1252,14 @@ def update_task_route(task_id: int) -> Response:
 @app.get("/tasks/<int:task_id>")
 @app.get("/task-directory/<int:task_id>")
 @require_role("staff", "admin", "auditor")
-def get_task_directory_route(task_id: int) -> Response:
+def get_task_route(task_id: int) -> Response:
     task = _bot().get_task(task_id, viewer_email=request.args.get("viewer_email"))
     current_role = getattr(g, "current_role", None)
     if current_role not in {"admin", "auditor"} and task["assigned_to"] != current_role:
         return _json_error("Forbidden", 403)
-    return jsonify({"task": task})
+    payload = {"task": task}
+    payload.update(task)
+    return jsonify(payload)
 
 
 @app.get("/api/tasks/export")
@@ -1289,7 +1304,7 @@ def import_tasks_route() -> Response:
 @app.post("/tasks/<int:task_id>/assignment")
 @app.post("/task-directory/<int:task_id>/assignment")
 @require_role("admin")
-def assign_task_directory_route(task_id: int) -> Response:
+def assign_task_route(task_id: int) -> Response:
     payload = _get_request_json()
     assigned_to = str(payload.get("assigned_to", "")).strip()
     if not assigned_to:

@@ -117,7 +117,7 @@ class CollaborationModelTests(unittest.TestCase):
         )
 
         self.assertEqual("auditor", synced[0]["assigned_to"])
-        self.assertEqual("in_progress", synced[0]["status"])
+        self.assertEqual("in-progress", synced[0]["status"])
         actions = [entry["action"] for entry in self.bot.list_audit_logs(limit=10)]
         self.assertIn("task_updated", actions)
         self.assertIn("task_assignment_changed", actions)
@@ -141,7 +141,7 @@ class CollaborationModelTests(unittest.TestCase):
 
 class CollaborationApiTests(unittest.TestCase):
     def setUp(self):
-        self.db_path = Path(".test_collaboration.db")
+        self.db_path = Path(f".test_collaboration_{self._testMethodName}.db")
         if self.db_path.exists():
             self.db_path.unlink()
         os.environ["BOT_DB_PATH"] = str(self.db_path)

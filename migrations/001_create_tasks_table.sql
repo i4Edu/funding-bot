@@ -5,7 +5,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     description TEXT NOT NULL DEFAULT '',
     assignee TEXT NOT NULL,
     status TEXT NOT NULL,
-    due_date TEXT NOT NULL,
+    due_date TEXT,
     source TEXT NOT NULL DEFAULT 'manual',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,

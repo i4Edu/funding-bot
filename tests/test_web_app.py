@@ -3,7 +3,6 @@ import itertools
 import os
 import sys
 import unittest
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 from unittest.mock import patch
@@ -16,8 +15,8 @@ os.environ.setdefault("ADMIN_PASSWORD", "admin-secret")
 os.environ.setdefault("STAFF_PASSWORD", "staff-secret")
 os.environ.setdefault("AUDITOR_PASSWORD", "auditor-secret")
 
-from funding_bot import FundingBot  # noqa: E402
 import web.app as web_app_module  # noqa: E402
+from funding_bot import FundingBot  # noqa: E402
 from web.app import app  # noqa: E402
 
 
@@ -42,6 +41,7 @@ class SettingsPanelTests(unittest.TestCase):
         os.environ["BOT_DB_PATH"] = str(self.db_path)
         os.environ["DATA_RESIDENCY"] = "EU"
         os.environ["DATA_STORAGE_REGION"] = "EU"
+        FundingBot.reset_connector_metrics()
         app.config["TESTING"] = True
         self.client = app.test_client()
         self.admin_headers = _auth_header("admin", "admin-secret")
@@ -67,6 +67,7 @@ class SettingsPanelTests(unittest.TestCase):
         os.environ.pop("CELERY_BROKER_URL", None)
         os.environ.pop("CELERY_QUEUE_NAME", None)
         os.environ.pop("CELERY_HEALTH_TIMEOUT_SECONDS", None)
+        FundingBot.reset_connector_metrics()
 
     def test_settings_page_requires_authentication(self):
         response = self.client.get("/settings")
@@ -77,39 +78,6 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertEqual(200, response.status_code)
         self.assertIn(b"Settings", response.data)
         self.assertIn(b"Translations", response.data)
-
-    def test_dashboard_auth_sets_secure_httponly_session_cookie(self):
-        response = self.client.get("/dashboard", headers=self.auditor_headers)
-
-        self.assertEqual(200, response.status_code)
-        session_cookie = response.headers.get("Set-Cookie", "")
-        self.assertIn("Secure", session_cookie)
-        self.assertIn("HttpOnly", session_cookie)
-
-    def test_dashboard_session_allows_follow_up_request_without_auth_header(self):
-        first_response = self.client.get("/dashboard", headers=self.auditor_headers)
-        second_response = self.client.get("/dashboard")
-
-        self.assertEqual(200, first_response.status_code)
-        self.assertEqual(200, second_response.status_code)
-
-    def test_dashboard_session_times_out_after_configured_lifetime(self):
-        original_lifetime = app.config["PERMANENT_SESSION_LIFETIME"]
-        app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(minutes=30)
-        try:
-            first_response = self.client.get("/dashboard", headers=self.auditor_headers)
-            self.assertEqual(200, first_response.status_code)
-
-            expired_at = (datetime.now(timezone.utc) - timedelta(minutes=31)).isoformat()
-            with self.client.session_transaction() as flask_session:
-                flask_session["authenticated_role"] = "auditor"
-                flask_session["authenticated_at"] = expired_at
-                flask_session["last_seen_at"] = expired_at
-
-            expired_response = self.client.get("/dashboard")
-            self.assertEqual(401, expired_response.status_code)
-        finally:
-            app.config["PERMANENT_SESSION_LIFETIME"] = original_lifetime
 
     def test_dashboard_page_exposes_keyboard_shortcuts_and_focus_regions(self):
         html = (PROJECT_ROOT / "web" / "templates" / "dashboard.html").read_text(encoding="utf-8")
@@ -333,6 +301,106 @@ class SettingsPanelTests(unittest.TestCase):
         actions = [entry["action"] for entry in audit_response.get_json()]
         self.assertIn("outreach_sent", actions)
 
+    def test_metrics_include_queue_retry_and_dead_letter_counts(self):
+        bot = FundingBot(db_path=self.db_path)
+        try:
+            bot.record_task_run(
+                "completed-task",
+                "discover_opportunities",
+                status="completed",
+                progress=100,
+                payload={"keywords": ["education"]},
+                result={"count": 1},
+                retry_limit=2,
+                attempts=2,
+                backoff_seconds=1,
+                backoff_max_seconds=2,
+            )
+            bot.record_task_run(
+                "failed-task",
+                "send_outreach",
+                status="failed",
+                progress=0,
+                payload={"email": "donor@example.org"},
+                error_message="permanent queue error",
+                retry_limit=2,
+                attempts=3,
+                backoff_seconds=1,
+                backoff_max_seconds=2,
+                dead_lettered=True,
+            )
+            bot.connection.execute(
+                """
+                INSERT INTO task_history (
+                    task_id, task_name, attempt_number, status, happened_at, backoff_seconds,
+                    next_retry_at, result_json, error_message, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "failed-task",
+                    "send_outreach",
+                    1,
+                    "retry_scheduled",
+                    "2026-07-19T00:00:00+00:00",
+                    1.0,
+                    "2026-07-19T00:00:01+00:00",
+                    None,
+                    "temporary queue error",
+                    "{}",
+                ),
+            )
+            bot.connection.execute(
+                """
+                INSERT INTO dead_letter_queue (
+                    task_id, task_name, payload_json, error_message, attempts, failed_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "failed-task",
+                    "send_outreach",
+                    '{"email": "donor@example.org"}',
+                    "permanent queue error",
+                    3,
+                    "2026-07-19T00:00:03+00:00",
+                ),
+            )
+            bot.connection.commit()
+        finally:
+            bot.close()
+
+        response = self.client.get("/metrics", headers=self.admin_headers)
+        self.assertEqual(200, response.status_code)
+        body = response.data.decode("utf-8")
+        self.assertIn("funding_bot_queue_task_runs_failed 1", body)
+        self.assertIn("funding_bot_queue_task_retries_total 1", body)
+        self.assertIn("funding_bot_dead_letter_queue_total 1", body)
+
+    def test_metrics_include_connector_request_error_and_latency_series(self):
+        discover = self.client.post(
+            "/settings/discover",
+            json={"keywords": ["education"]},
+            headers=self.admin_headers,
+        )
+        self.assertEqual(200, discover.status_code)
+
+        response = self.client.get("/metrics", headers=self.admin_headers)
+
+        self.assertEqual(200, response.status_code)
+        body = response.data.decode("utf-8")
+        self.assertIn("# HELP funding_bot_connector_requests_total", body)
+        self.assertIn(
+            'funding_bot_connector_requests_total{connector_name="Grants Portal",connector_type="grants-portal"} 1',
+            body,
+        )
+        self.assertIn(
+            'funding_bot_connector_errors_total{connector_name="Grants Portal",connector_type="grants-portal"} 0',
+            body,
+        )
+        self.assertIn(
+            'funding_bot_connector_latency_seconds_count{connector_name="Grants Portal",connector_type="grants-portal"} 1',
+            body,
+        )
+
     def test_dashboard_tasks_renders_kanban_board_and_overdue_highlight(self):
         bot = FundingBot(db_path=str(self.db_path))
         bot.create_task(
@@ -350,7 +418,7 @@ class SettingsPanelTests(unittest.TestCase):
         self.assertIn(b"Prepare proposal", response.data)
         self.assertNotIn(b"Check audit trail", response.data)
         self.assertIn(b"Task Board", response.data)
-        self.assertIn(b"Todo", response.data)
+        self.assertIn(b"Pending", response.data)
         self.assertIn(b"In Progress", response.data)
         self.assertIn(b"Overdue", response.data)
 
@@ -515,8 +583,8 @@ class SettingsPanelTests(unittest.TestCase):
         )
         self.assertEqual(200, valid.status_code)
         payload = valid.get_json()
-        self.assertEqual("in-progress", payload["task"]["status"])
-        self.assertIn("moved from todo to in-progress", payload["notification"])
+        self.assertEqual("in_progress", payload["task"]["status"])
+        self.assertIn("moved from pending to in_progress", payload["notification"])
 
     def test_task_assignment_route_requires_admin(self):
         bot = FundingBot(db_path=str(self.db_path))

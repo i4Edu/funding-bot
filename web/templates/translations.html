@@ -188,13 +188,13 @@
                         {% if current_role in ("staff", "admin") %}
                         <form class="decision-form rtl-safe" data-review-id="{{ review.id }}">
                           <div class="mb-2">
-                            <select class="form-select form-select-sm" name="status" {{ "disabled" if review.status != "pending" }}>
+                            <select class="form-select form-select-sm" name="status" aria-label="Review decision" {{ "disabled" if review.status != "pending" }}>
                               <option value="approved">Approve</option>
                               <option value="rejected">Reject</option>
                             </select>
                           </div>
                           <div class="mb-2">
-                            <textarea class="form-control form-control-sm" name="reviewer_notes" rows="2" placeholder="Optional reviewer notes" {{ "disabled" if review.status != "pending" }}></textarea>
+                            <textarea class="form-control form-control-sm" name="reviewer_notes" rows="2" placeholder="Optional reviewer notes" aria-label="Reviewer notes" {{ "disabled" if review.status != "pending" }}></textarea>
                           </div>
                           <button type="submit" class="btn btn-sm btn-outline-primary" {{ "disabled" if review.status != "pending" }}>Save</button>
                         </form>

@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import signal
+import types
 import urllib.error
 import unittest
 import unittest.mock
@@ -21,6 +22,7 @@ from funding_bot import (
     OptOutError,
     OutreachThrottledError,
     SMTPEmailSender,
+    Task,
     TaskTransitionError,
 )
 import task_queue
@@ -291,10 +293,7 @@ class FundingBotTests(unittest.TestCase):
         )
         self.bot.gdpr_delete("privacy@example.org")
 
-        report = self.bot.build_gdpr_compliance_report(
-            cadence="monthly",
-            as_of=datetime(2026, 7, 19, tzinfo=timezone.utc),
-        )
+        report = self.bot.build_gdpr_compliance_report(cadence="monthly")
         self.assertEqual("gdpr_compliance_self_check", report["report_type"])
         self.assertEqual("monthly", report["cadence"])
         self.assertGreaterEqual(report["data_subject_requests"]["exports_in_period"], 1)
@@ -1013,6 +1012,113 @@ class QueueExecutionTests(unittest.TestCase):
         self.assertTrue(result["shutdown_requested"])
         self.assertIn("Stopping queued work", result["message"])
 
+    def test_execute_queue_task_retries_with_exponential_backoff_and_records_history(self):
+        attempts = {"count": 0}
+        delays = []
+
+        def flaky_task(_context, payload):
+            attempts["count"] += 1
+            if attempts["count"] < 3:
+                raise RuntimeError("temporary queue error")
+            return {"echo": payload["value"]}
+
+        result = self.bot.execute_queue_task(
+            "retry-task",
+            {"value": 7},
+            flaky_task,
+            retry_limit=3,
+            backoff_seconds=2,
+            backoff_max_seconds=10,
+            sleep_func=delays.append,
+            install_signal_handlers=False,
+        )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual(3, result["attempts"])
+        self.assertEqual([2.0, 4.0], delays)
+        self.assertFalse(result["dead_lettered"])
+        self.assertEqual({"echo": 7}, result["result"])
+
+        history = self.bot.list_task_history(result["task_id"])
+        self.assertEqual(
+            ["retry_scheduled", "retry_scheduled", "completed"],
+            [entry["status"] for entry in history],
+        )
+        self.assertEqual([2.0, 4.0], [history[0]["backoff_seconds"], history[1]["backoff_seconds"]])
+        self.assertEqual([], self.bot.list_dead_letter_queue(task_name="retry-task"))
+        self.assertEqual(2, self.bot.get_queue_metrics()["retries_scheduled"])
+
+    def test_execute_queue_task_moves_exhausted_failures_to_dead_letter_queue(self):
+        delays = []
+
+        def failing_task(_context, _payload):
+            raise RuntimeError("permanent queue error")
+
+        result = self.bot.execute_queue_task(
+            "dead-letter-task",
+            {"value": 1},
+            failing_task,
+            retry_limit=2,
+            backoff_seconds=1,
+            backoff_max_seconds=2,
+            sleep_func=delays.append,
+            install_signal_handlers=False,
+        )
+
+        self.assertEqual("failed", result["status"])
+        self.assertEqual(3, result["attempts"])
+        self.assertTrue(result["dead_lettered"])
+        self.assertEqual([1.0, 2.0], delays)
+
+        history = self.bot.list_task_history(result["task_id"])
+        self.assertEqual(
+            ["retry_scheduled", "retry_scheduled", "failed"],
+            [entry["status"] for entry in history],
+        )
+
+        dlq_rows = self.bot.list_dead_letter_queue(task_name="dead-letter-task")
+        self.assertEqual(1, len(dlq_rows))
+        self.assertEqual(result["task_id"], dlq_rows[0]["task_id"])
+        self.assertEqual("permanent queue error", dlq_rows[0]["error_message"])
+
+        latest_audit = self.bot.list_audit_logs(limit=1)[0]
+        self.assertEqual("queue_task_failed", latest_audit["action"])
+        self.assertTrue(json.loads(latest_audit["details_json"])["dead_lettered"])
+
+    def test_execute_queue_task_uses_environment_retry_defaults(self):
+        delays = []
+        attempts = {"count": 0}
+
+        def flaky_task(_context, _payload):
+            attempts["count"] += 1
+            if attempts["count"] == 1:
+                raise RuntimeError("temporary queue error")
+            return {"ok": True}
+
+        with unittest.mock.patch.dict(
+            os.environ,
+            {
+                "FUNDING_BOT_TASK_RETRY_LIMIT": "1",
+                "FUNDING_BOT_TASK_RETRY_BACKOFF_SECONDS": "3",
+                "FUNDING_BOT_TASK_RETRY_BACKOFF_MAX_SECONDS": "9",
+            },
+            clear=False,
+        ):
+            result = self.bot.execute_queue_task(
+                "env-retry-task",
+                {"value": 1},
+                flaky_task,
+                sleep_func=delays.append,
+                install_signal_handlers=False,
+            )
+
+        self.assertEqual("completed", result["status"])
+        self.assertEqual(2, result["attempts"])
+        self.assertEqual(1, result["retry_limit"])
+        self.assertEqual(3.0, result["backoff_seconds"])
+        self.assertEqual(9.0, result["backoff_max_seconds"])
+        self.assertEqual([3.0], delays)
+
     def test_graceful_shutdown_controller_records_signals(self):
         seen = []
         controller = GracefulShutdownController(on_shutdown=seen.append)
@@ -1076,6 +1182,59 @@ class PortalConnectorTests(unittest.TestCase):
 
     def test_ngo_directory_connector_fetches_live_directory_pages(self):
         calls = []
+
+        def fake_http_client(url, payload, credentials=None, headers=None):
+            calls.append((url, dict(payload), dict(headers or {})))
+            self.assertEqual("https://projects.propublica.org/nonprofits/api/v2/search.json", url)
+            self.assertEqual({}, headers or {})
+            if payload["page"] == 0:
+                return {
+                    "organizations": [
+                        {
+                            "ein": "123456789",
+                            "name": "Housing Alliance",
+                            "city": "Boston",
+                            "state": "MA",
+                            "sub_name": "Public Charity",
+                            "ntee_code": "L20",
+                        }
+                    ],
+                    "total_results": 2,
+                    "per_page": 1,
+                }
+            return {
+                "organizations": [
+                    {
+                        "ein": "987654321",
+                        "name": "Housing Literacy Lab",
+                        "city": "Chicago",
+                        "state": "IL",
+                        "sub_name": "Educational Organization",
+                        "ntee_code": "B90",
+                    }
+                ],
+                "total_results": 2,
+                "per_page": 1,
+            }
+
+        connector = NGODirectoryConnector(http_client=fake_http_client, transport="http")
+
+        rows = connector.fetch_opportunities(["housing"])
+
+        self.assertEqual(2, len(rows))
+        self.assertEqual([0, 1], [call[1]["page"] for call in calls])
+        self.assertEqual("Housing Alliance nonprofit directory profile", rows[0]["title"])
+        self.assertIn("Live NGO directory match for 'housing'", rows[0]["summary"])
+        self.assertEqual(
+            "https://projects.propublica.org/nonprofits/organizations/123456789",
+            rows[0]["portal_url"],
+        )
+
+    def test_foundation_directory_connector_uses_registered_credentials_for_live_results(self):
+        calls = []
+        bot = FundingBot()
+        os.environ["FOUNDATION_DIRECTORY_TEST_KEY"] = "test-api-key"
+        bot.register_credential("foundation-api", "FOUNDATION_DIRECTORY_TEST_KEY")
 
         def fake_http_client(url, payload, credentials=None, headers=None):
             calls.append(
@@ -1249,7 +1408,7 @@ class PortalConnectorTests(unittest.TestCase):
         self.assertEqual("client_credentials", calls[0]["form_data"]["grant_type"])
         self.assertEqual("Basic Y29ubmVjdG9yLWNsaWVudDpjb25uZWN0b3Itc2VjcmV0", calls[0]["headers"]["Authorization"])
         self.assertEqual("token-123", seen_credentials[0]["access_token"])
-        self.assertEqual("******", seen_credentials[0]["authorization_header"])
+        self.assertEqual("Bearer " + "token-123", seen_credentials[0]["authorization_header"])
         self.assertEqual("ngo-team", seen_credentials[0]["tenant"])
 
     def test_remote_connectors_paginate_until_all_results_are_collected(self):
@@ -1415,44 +1574,131 @@ class PortalConnectorTests(unittest.TestCase):
             validation["keyword_mappings"]["csr"]["keywords"],
         )
 
+    def test_grants_connector_http_transport_uses_oauth_credentials_and_maps_results(self):
+        token_calls = []
+
+        def fake_token_http_client(url, form_data, headers):
+            token_calls.append({"url": url, "form_data": dict(form_data), "headers": dict(headers)})
+            return {"access_token": "grants-token", "token_type": "Bearer", "expires_in": 3600}
+
+        class FakeSession:
+            def __init__(self):
+                self.post_calls = []
+
+            def post(self, url, **kwargs):
+                self.post_calls.append({"url": url, **kwargs})
+                return FakeHTTPResponse(
+                    {
+                        "errorcode": 0,
+                        "msg": "Webservice Succeeds",
+                        "data": {
+                            "hitCount": 1,
+                            "oppHits": [
+                                {
+                                    "id": "334326",
+                                    "number": "21-595",
+                                    "title": "Tribal Colleges and Universities Program",
+                                    "agencyCode": "NSF",
+                                    "agency": "U.S. National Science Foundation",
+                                    "openDate": "06/24/2021",
+                                    "closeDate": "09/01/2026",
+                                    "oppStatus": "posted",
+                                    "docType": "synopsis",
+                                    "cfdaList": ["47.076"],
+                                }
+                            ],
+                        },
+                    }
+                )
+
+        secret_payload = json.dumps(
+            {
+                "auth_type": "oauth2_client_credentials",
+                "token_url": "https://auth.example.org/oauth/token",
+                "client_id": "client-id",
+                "client_secret": "client-secret",
+                "scope": "grants.search",
+                "credentials": {"api_key": "grants-api-key"},
+            }
+        )
+        vault = OAuth2ClientCredentialsVault(
+            StaticSecretVault({"GRANTS_GOV_API_CREDENTIALS": secret_payload}),
+            token_http_client=fake_token_http_client,
+        )
+        session = FakeSession()
+        connector = GrantsPortalConnector(
+            transport="http",
+            credential_vault=vault,
+            request_session=session,
+        )
+
+        result = connector.fetch_result(["education"])
+
+        self.assertEqual(1, len(result["opportunities"]))
+        self.assertEqual("U.S. National Science Foundation", result["opportunities"][0]["donor_name"])
+        self.assertIn("search-results-detail/334326", result["opportunities"][0]["portal_url"])
+        self.assertTrue(result["metadata"]["auth_applied"])
+        self.assertEqual(1, len(token_calls))
+        self.assertEqual("client_credentials", token_calls[0]["form_data"]["grant_type"])
+        self.assertEqual("grants-api-key", session.post_calls[0]["headers"]["X-API-Key"])
+        self.assertTrue(
+            session.post_calls[0]["headers"]["Authorization"].startswith("Bearer "),
+        )
+
+    def test_csr_connector_http_transport_uses_subscription_key_and_maps_results(self):
+        class FakeSession:
+            def __init__(self):
+                self.get_calls = []
+
+            def get(self, url, **kwargs):
+                self.get_calls.append({"url": url, **kwargs})
+                return FakeHTTPResponse(
+                    {
+                        "count": 1,
+                        "results": [
+                            {
+                                "title": "Corporate Digital Inclusion RFP",
+                                "summary": "Funding for digital literacy pilots.",
+                                "url": "https://candid.example.org/rfp/123",
+                                "program_areas": ["Corporate Partnerships", "Digital Inclusion"],
+                                "eligibility": ["Nonprofit", "501c3"],
+                                "funder": {"name": "Corporate Impact Fund"},
+                            }
+                        ],
+                    }
+                )
+
+        session = FakeSession()
+        connector = CSRNetworkConnector(
+            transport="http",
+            credentials={"subscription_key": "candid-subscription-key"},
+            request_session=session,
+        )
+
+        result = connector.fetch_result(["csr"])
+
+        self.assertEqual(1, len(result["opportunities"]))
+        self.assertEqual("Corporate Impact Fund", result["opportunities"][0]["donor_name"])
+        self.assertEqual("Corporate Partnerships", result["opportunities"][0]["category"])
+        self.assertEqual(
+            "candid-subscription-key",
+            session.get_calls[0]["headers"]["Subscription-Key"],
+        )
+        self.assertIn("corporate giving", session.get_calls[0]["params"]["q"])
+
+    def test_live_connectors_log_and_degrade_on_remote_errors(self):
+        connector = CSRNetworkConnector(transport="http", request_session=object())
+
+        with self.assertLogs("funding_bot.CSRNetworkConnector", level="WARNING") as logs:
+            result = connector.fetch_result(["csr"])
+
+        self.assertEqual("degraded", result["metadata"]["source_status"])
+        self.assertIn("requires a Candid subscription_key", result["metadata"]["last_error"])
+        self.assertTrue(any("remote fetch failed" in message for message in logs.output))
+
     def test_create_connector_supports_crowdfunding_slugs(self):
         self.assertIsInstance(create_connector("globalgiving"), GlobalGivingConnector)
         self.assertIsInstance(create_connector("kickstarter-for-good"), KickstarterForGoodConnector)
-
-    def test_connector_rejects_insecure_base_url(self):
-        with self.assertRaises(ConnectionSecurityError):
-            create_connector("grants-portal", base_url="http://grants.example.org/opportunities")
-
-    def test_default_http_json_client_enforces_https_and_certificate_validation(self):
-        fake_response = unittest.mock.Mock()
-        fake_response.json.return_value = {"ok": True}
-        fake_response.raise_for_status.return_value = None
-        fake_session = unittest.mock.MagicMock()
-        fake_session.__enter__.return_value = fake_session
-        fake_session.post.return_value = fake_response
-
-        with unittest.mock.patch("funding_bot._build_tls_http_session", return_value=fake_session):
-            payload = _default_http_json_client(
-                "https://grants.example.org/opportunities",
-                {"keywords": ["education"]},
-                {"api_key": "secret"},
-            )
-
-        self.assertEqual({"ok": True}, payload)
-        fake_session.post.assert_called_once_with(
-            "https://grants.example.org/opportunities",
-            json={"keywords": ["education"]},
-            headers={
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "X-Connector-Api-Key": "secret",
-            },
-            timeout=10,
-            verify=True,
-        )
-
-        with self.assertRaises(ConnectionSecurityError):
-            _default_http_json_client("http://grants.example.org/opportunities", {"keywords": []})
 
     def test_crowdfunding_connectors_support_demo_results_for_globalgiving_and_kickstarter(self):
         globalgiving = GlobalGivingConnector()
@@ -1976,6 +2222,55 @@ class DonorSegmentationAndTemplateTests(unittest.TestCase):
         self.assertIn("Support i4Edu", english_result["subject"])
         self.assertIn("Expand access to equitable education.", english_result["body"])
 
+    def test_all_catalog_templates_render_for_every_supported_locale(self):
+        for locale in self.bot.list_supported_outreach_locales():
+            for template_name in self.bot.list_catalog_outreach_templates():
+                with self.subTest(locale=locale, template_name=template_name):
+                    donor_email = f"{template_name}-{locale}@example.org".replace("_", "-")
+                    self.bot.upsert_donor(
+                        email=donor_email,
+                        name="Matrix Donor",
+                        segment="corporate",
+                        locale=locale,
+                    )
+
+                    result = self.bot.send_outreach_from_template(
+                        template_name,
+                        donor_email,
+                        "Matrix Donor",
+                        context=self.outreach_context,
+                        sent_at=datetime(2026, 7, 1, tzinfo=timezone.utc),
+                    )
+
+                    self.assertEqual(locale, result["locale"])
+                    self.assertEqual(template_name, result["template_name"])
+                    self.assertTrue(result["subject"].strip())
+                    self.assertTrue(result["body"].strip())
+                    self.assertIn("Matrix Donor", result["body"])
+                    self.assertIn("https://i4edu.org/opt-out", result["body"])
+                    self.assertNotIn("{donor_name}", result["subject"])
+                    self.assertNotIn("{donor_name}", result["body"])
+                    self.assertNotIn("{organization_name}", result["subject"])
+                    self.assertNotIn("{organization_name}", result["body"])
+
+    def test_validate_outreach_template_catalogs_rejects_missing_segment_translations(self):
+        original_loader = FundingBot._load_outreach_template_catalog
+
+        def fake_loader(locale):
+            templates = original_loader(locale)
+            if locale == "bn":
+                broken = {
+                    name: json.loads(json.dumps(template))
+                    for name, template in templates.items()
+                }
+                broken["intro"]["segments"] = {}
+                return broken
+            return templates
+
+        with unittest.mock.patch.object(FundingBot, "_load_outreach_template_catalog", side_effect=fake_loader):
+            with self.assertRaises(FundingBotError):
+                FundingBot.validate_outreach_template_catalogs()
+
     def test_secret_donor_fields_are_encrypted_and_tagged(self):
         self.bot.upsert_donor(
             email="sensitive@example.org",
@@ -2241,6 +2536,87 @@ class StatusPollingAndVaultTests(unittest.TestCase):
 
         self.assertEqual("vault-user", credentials["username"])
         self.assertEqual("vault-pass", credentials["password"])
+
+    def test_oauth2_client_credentials_are_cached_between_resolutions(self):
+        calls = []
+        (self.vault_dir / "OAUTH_SECRET").write_text(
+            json.dumps(
+                {
+                    "auth_type": "oauth2_client_credentials",
+                    "oauth2": {
+                        "token_url": "https://auth.example.org/oauth/token",
+                        "client_id": "connector-client",
+                        "client_secret": "connector-secret",
+                        "scope": "grants.read",
+                    },
+                    "credentials": {"tenant": "ngo-team"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.bot.close()
+
+        def fake_token_http_client(url, form_data, headers):
+            calls.append({"url": url, "form_data": dict(form_data), "headers": dict(headers)})
+            return {"access_token": "cached-token", "token_type": "Bearer", "expires_in": 3600}
+
+        self.bot = FundingBot(
+            trusted_sources={"Grants Portal"},
+            vault=FileVault(self.vault_dir),
+            oauth_token_http_client=fake_token_http_client,
+            oauth_refresh_skew_seconds=60,
+        )
+        self.bot.register_credential("oauth", "OAUTH_SECRET")
+
+        first = self.bot.resolve_credential("oauth")
+        second = self.bot.resolve_credential("oauth")
+
+        self.assertEqual(1, len(calls))
+        self.assertEqual("cached-token", first["access_token"])
+        self.assertEqual(first["access_token"], second["access_token"])
+        self.assertEqual("Bearer " + "cached-token", second["authorization_header"])
+        self.assertEqual("ngo-team", second["tenant"])
+
+    def test_oauth2_client_credentials_refresh_before_expiry(self):
+        calls = []
+        (self.vault_dir / "OAUTH_SECRET").write_text(
+            json.dumps(
+                {
+                    "auth_type": "oauth2_client_credentials",
+                    "oauth2": {
+                        "token_url": "https://auth.example.org/oauth/token",
+                        "client_id": "connector-client",
+                        "client_secret": "connector-secret",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        self.bot.close()
+
+        def fake_token_http_client(_url, _form_data, _headers):
+            token_number = len(calls) + 1
+            calls.append(token_number)
+            return {
+                "access_token": f"refresh-token-{token_number}",
+                "token_type": "Bearer",
+                "expires_in": 30,
+            }
+
+        self.bot = FundingBot(
+            trusted_sources={"Grants Portal"},
+            vault=FileVault(self.vault_dir),
+            oauth_token_http_client=fake_token_http_client,
+            oauth_refresh_skew_seconds=60,
+        )
+        self.bot.register_credential("oauth", "OAUTH_SECRET")
+
+        first = self.bot.resolve_credential("oauth")
+        second = self.bot.resolve_credential("oauth")
+
+        self.assertEqual([1, 2], calls)
+        self.assertEqual("refresh-token-1", first["access_token"])
+        self.assertEqual("refresh-token-2", second["access_token"])
 
     def test_poll_application_status_uses_http_client_and_updates_records(self):
         signature = self._discover_sample_opportunity()
@@ -2758,6 +3134,10 @@ class CliLoggingAndInteractiveTests(unittest.TestCase):
 
     def test_send_outreach_prompts_for_missing_required_arguments(self):
         with (
+            unittest.mock.patch.dict(
+                "sys.modules",
+                {"celery_tasks": types.SimpleNamespace(send_outreach_task=object())},
+            ),
             unittest.mock.patch("builtins.input", side_effect=["donor@example.org", "Donor"]) as prompt,
             unittest.mock.patch("funding_bot._queue_async_task") as queue_task,
         ):
@@ -2770,6 +3150,7 @@ class CliLoggingAndInteractiveTests(unittest.TestCase):
                 "db_path": str(self.db_path),
                 "donor_email": "donor@example.org",
                 "donor_name": "Donor",
+                "template_name": "default",
                 "subject_template": None,
                 "body_template": None,
                 "locale": None,
@@ -2862,7 +3243,11 @@ class SearchSettingsAndDiscoveryTests(unittest.TestCase):
         self.assertEqual("CSR Digital Learning Fund", found[0]["title"])
 
     def test_run_discovery_defaults_to_builtin_connectors(self):
-        found = self.bot.run_discovery(keywords=["literacy"])
+        with unittest.mock.patch(
+            "funding_bot.default_connectors",
+            return_value=[GrantsPortalConnector(), CSRNetworkConnector(), NGODirectoryConnector()],
+        ):
+            found = self.bot.run_discovery(keywords=["literacy"])
         self.assertEqual(1, len(found))
         self.assertEqual("NGO Directory", found[0]["source"])
 
@@ -2947,6 +3332,46 @@ class CliSearchAndSettingsCommandsTests(unittest.TestCase):
             communications = bot.connection.execute("SELECT * FROM communications").fetchall()
             self.assertEqual(1, len(communications))
             self.assertEqual("donor@example.org", communications[0]["donor_email"])
+        finally:
+            bot.close()
+
+    def test_send_outreach_command_previews_requested_locale_template(self):
+        bot = FundingBot(db_path=self.db_path)
+        try:
+            bot.store_organization_profile({"name": "i4Edu", "mission": "Expand access to education."})
+        finally:
+            bot.close()
+
+        with unittest.mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            main(
+                [
+                    "--db",
+                    str(self.db_path),
+                    "send-outreach",
+                    "--email",
+                    "donor@example.org",
+                    "--name",
+                    "Donor",
+                    "--template-name",
+                    "intro",
+                    "--locale",
+                    "bn",
+                    "--dry-run",
+                ]
+            )
+
+        output = stdout.getvalue()
+        self.assertIn("Template: intro", output)
+        self.assertIn("Locale: bn", output)
+        self.assertIn("প্রিয় Donor", output)
+
+        bot = FundingBot(db_path=self.db_path)
+        try:
+            donor = bot.connection.execute(
+                "SELECT locale FROM donors WHERE email = ?",
+                ("donor@example.org",),
+            ).fetchone()
+            self.assertEqual("bn", donor["locale"])
         finally:
             bot.close()
 

@@ -3009,21 +3009,21 @@ class SMTPEmailSender:
 
 
 class FundingBot:
-    TASK_STATUSES = ("pending", "in_progress", "completed", "blocked")
+    TASK_STATUSES = ("todo", "in-progress", "done", "blocked")
     TASK_STATUS_ALIASES = {
-        "todo": "pending",
-        "pending": "pending",
-        "in-progress": "in_progress",
-        "in_progress": "in_progress",
-        "done": "completed",
-        "completed": "completed",
+        "todo": "todo",
+        "pending": "todo",
+        "in-progress": "in-progress",
+        "in_progress": "in-progress",
+        "done": "done",
+        "completed": "done",
         "blocked": "blocked",
     }
     TASK_STATUS_TRANSITIONS = {
-        "pending": frozenset({"in_progress", "blocked"}),
-        "in_progress": frozenset({"pending", "completed", "blocked"}),
-        "blocked": frozenset({"pending", "in_progress"}),
-        "completed": frozenset(),
+        "todo": frozenset({"in-progress", "blocked"}),
+        "in-progress": frozenset({"todo", "done", "blocked"}),
+        "blocked": frozenset({"todo", "in-progress"}),
+        "done": frozenset(),
     }
     DEFAULT_QUEUE_RETRY_LIMIT = 3
     DEFAULT_QUEUE_RETRY_BACKOFF_SECONDS = 5.0
@@ -3331,7 +3331,7 @@ class FundingBot:
                 description TEXT NOT NULL DEFAULT '',
                 assignee TEXT NOT NULL,
                 status TEXT NOT NULL,
-                due_date TEXT NOT NULL,
+                due_date TEXT,
                 source TEXT NOT NULL DEFAULT 'manual',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -3617,7 +3617,7 @@ class FundingBot:
                     description TEXT NOT NULL DEFAULT '',
                     assignee TEXT NOT NULL,
                     status TEXT NOT NULL,
-                    due_date TEXT NOT NULL,
+                    due_date TEXT,
                     source TEXT NOT NULL DEFAULT 'manual',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
@@ -3635,12 +3635,12 @@ class FundingBot:
                     COALESCE(description, ''),
                     LOWER(assigned_to),
                     CASE LOWER(status)
-                        WHEN 'todo' THEN 'pending'
-                        WHEN 'in-progress' THEN 'in_progress'
-                        WHEN 'done' THEN 'completed'
-                        ELSE REPLACE(LOWER(status), '-', '_')
+                        WHEN 'pending' THEN 'todo'
+                        WHEN 'in_progress' THEN 'in-progress'
+                        WHEN 'completed' THEN 'done'
+                        ELSE LOWER(status)
                     END,
-                    COALESCE(date(due_date), date(updated_at), date(created_at), date('now')),
+                    date(due_date),
                     COALESCE(source, 'manual'),
                     created_at,
                     updated_at,
@@ -4373,12 +4373,12 @@ class FundingBot:
     @staticmethod
     def _normalize_due_date(due_date: datetime | str | None) -> str | None:
         if due_date is None:
-            return FundingBot._as_utc().date().isoformat()
+            return None
         if isinstance(due_date, datetime):
             return FundingBot._as_utc(due_date).date().isoformat()
         normalized = str(due_date).strip()
         if not normalized:
-            return FundingBot._as_utc().date().isoformat()
+            return None
         try:
             return datetime.fromisoformat(normalized).date().isoformat()
         except ValueError:
@@ -4397,7 +4397,7 @@ class FundingBot:
         task["due_date"] = FundingBot._normalize_task_due_date(task.get("due_date"))
         today = FundingBot._as_utc().date().isoformat()
         task["is_overdue"] = bool(
-            task["due_date"] and task["status"] != "completed" and task["due_date"] < today
+            task["due_date"] and task["status"] != "done" and task["due_date"] < today
         )
         task["unread_comment_count"] = int(task.get("unread_comment_count", 0) or 0)
         return task
@@ -4405,10 +4405,10 @@ class FundingBot:
     @staticmethod
     def _normalize_task_due_date(due_date: str | None) -> str | None:
         if due_date is None:
-            return FundingBot._as_utc().date().isoformat()
+            return None
         normalized = str(due_date).strip()
         if not normalized:
-            return FundingBot._as_utc().date().isoformat()
+            return None
         try:
             return datetime.fromisoformat(normalized).date().isoformat()
         except ValueError as exc:
@@ -5255,6 +5255,9 @@ class FundingBot:
                 controller.restore()
             return task_run
 
+        self._active_queue_controllers.pop(normalized_idempotency_key, None)
+        if install_signal_handlers:
+            controller.restore()
         raise FundingBotError(
             f"Queue task {normalized_task_name!r} did not record a terminal state."
         )

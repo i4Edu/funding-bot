@@ -1,18 +1,25 @@
 import json
 import os
+import urllib.error
 import unittest
 from unittest import mock
 
+import requests
+
 from funding_bot import (
     CSRNetworkConnector,
+    CredentialNotFoundError,
     ConnectionSecurityError,
     ConnectorConfigError,
     ConnectorRegistry,
     CrowdfundingConnector,
+    FoundationDirectoryConnector,
+    FundingBotError,
     GlobalGivingConnector,
     GrantsPortalConnector,
     KickstarterForGoodConnector,
     NGODirectoryConnector,
+    OAuth2ClientCredentialsVault,
     TokenBucketRateLimiter,
     _BasePortalConnector,
     _default_http_json_client,
@@ -56,6 +63,12 @@ class MinimalConnector(_BasePortalConnector):
                 "tags": ["education"],
             }
         ]
+
+
+class NoDemoConnector(_BasePortalConnector):
+    connector_slug = "no-demo"
+    source_name = "No Demo"
+    base_url = "https://no-demo.example.org"
 
 
 class ConnectorCoverageTests(unittest.TestCase):
@@ -136,6 +149,47 @@ class ConnectorCoverageTests(unittest.TestCase):
         self.assertEqual(5.0, connector.rate_limit_config["capacity"])
         self.assertEqual(1.0, connector.rate_limit_config["refill_rate"])
 
+    def test_base_connector_helpers_cover_vault_and_request_session_branches(self):
+        class StaticVault:
+            def get_secret(self, name):
+                return json.dumps({"token": f"{name}-token", "api_key": "vault-key"})
+
+        oauth_vault = OAuth2ClientCredentialsVault(StaticVault())
+        wrapped = MinimalConnector._wrap_credential_vault(oauth_vault)
+        connector = MinimalConnector(
+            credential_name="MINIMAL_SECRET",
+            credential_vault=StaticVault(),
+            credentials={"api_key": "inline-key"},
+            request_session="session-object",
+            request_timeout=0.1,
+        )
+
+        self.assertIs(wrapped, oauth_vault)
+        self.assertEqual("session-object", connector._get_request_session())
+        self.assertEqual(1.0, connector.request_timeout)
+        self.assertEqual(
+            {"token": "MINIMAL_SECRET-token", "api_key": "inline-key"},
+            connector._get_resolved_credentials(),
+        )
+
+        with mock.patch("funding_bot.requests", None):
+            with self.assertRaises(FundingBotError):
+                MinimalConnector()._get_request_session()
+
+    def test_base_connector_supports_empty_filters_and_missing_demo_implementation(self):
+        connector = MinimalConnector()
+        self.assertEqual(
+            connector._demo_data(),
+            connector._filter_opportunities(connector._demo_data(), None),
+        )
+        self.assertEqual(
+            connector._demo_data(),
+            connector.default_fallback_results(["education"]),
+        )
+
+        with self.assertRaises(NotImplementedError):
+            NoDemoConnector()._demo_data()
+
     def test_fetch_opportunities_gracefully_degrades_on_remote_error(self):
         connector = GrantsPortalConnector(
             http_client=lambda _url, _payload, _credentials=None: (_ for _ in ()).throw(
@@ -196,6 +250,50 @@ class ConnectorCoverageTests(unittest.TestCase):
         self.assertIsNone(has_more_payload[3])
         self.assertEqual(2, list_payload[3])
 
+    def test_fetch_remote_result_tracks_pagination_and_schema_migration(self):
+        calls = []
+
+        def fake_http_client(_url, payload, _credentials=None):
+            calls.append(dict(payload))
+            if payload["page"] == 1:
+                return {
+                    "items": [
+                        {
+                            "funder": "Legacy Donor",
+                            "title": "Legacy Education Grant",
+                            "link": "https://example.org/legacy",
+                            "description": "Legacy payload",
+                            "type": "Education",
+                            "topics": ["education"],
+                        }
+                    ],
+                    "schema_version": 1,
+                    "total_pages": 2,
+                }
+            return {
+                "items": [
+                    {
+                        "source": "Grants Portal",
+                        "donor_name": "Current Donor",
+                        "title": "Current Education Grant",
+                        "portal_url": "https://example.org/current",
+                        "summary": "Current payload",
+                        "category": "Education",
+                        "tags": ["education"],
+                    }
+                ],
+                "result_schema_version": 2,
+                "next_page": None,
+            }
+
+        connector = GrantsPortalConnector(http_client=fake_http_client, page_size=1, max_retries=0)
+        result = connector._fetch_remote_result(["education"])
+
+        self.assertEqual(2, len(result["opportunities"]))
+        self.assertEqual(2, result["metadata"]["detected_schema_version"])
+        self.assertEqual(2, result["metadata"]["pages_fetched"])
+        self.assertEqual([1, 2], [call["page"] for call in calls])
+
     def test_invoke_http_get_client_supports_multiple_custom_signatures(self):
         connector = GrantsPortalConnector(http_client=lambda url, params, headers=None: {"ok": headers})
         payload = connector._invoke_http_get_client(
@@ -231,6 +329,36 @@ class ConnectorCoverageTests(unittest.TestCase):
         self.assertEqual("GET", request.get_method())
         self.assertEqual({"ok": True}, payload)
 
+    def test_fetch_remote_json_handles_http_429_and_infinite_rate_limits(self):
+        clock = FakeClock()
+        response_headers = {"Retry-After": "2.5"}
+        error = urllib.error.HTTPError(
+            "https://example.org/search",
+            429,
+            "too many requests",
+            response_headers,
+            None,
+        )
+        connector = GrantsPortalConnector(max_retries=0, sleep_func=clock.sleep)
+        with mock.patch.object(connector, "_invoke_http_get_client", side_effect=error):
+            with self.assertRaises(ConnectionError):
+                connector._fetch_remote_json("https://example.org/search", {"q": "education"})
+
+        self.assertEqual([2.5], clock.sleeps)
+        self.assertEqual(2, connector.get_failure_metrics()["rate_limited_requests"])
+
+        class NeverRecoversRateLimiter:
+            def consume(self, tokens=1.0):
+                return False, float("inf")
+
+            @property
+            def available_tokens(self):
+                return 0.0
+
+        limited_connector = GrantsPortalConnector(rate_limiter=NeverRecoversRateLimiter())
+        with self.assertRaises(Exception):
+            limited_connector._throttle_remote_request()
+
     def test_schema_detection_and_migration_normalize_legacy_rows(self):
         connector = CSRNetworkConnector()
         legacy_rows = [
@@ -254,6 +382,164 @@ class ConnectorCoverageTests(unittest.TestCase):
         self.assertEqual("Legacy Donor", migrated[0]["donor_name"])
         self.assertEqual("https://csr.example.org/legacy", migrated[0]["portal_url"])
         self.assertEqual(["a", "b"], normalized["tags"])
+
+    def test_live_grants_portal_connector_formats_request_and_response(self):
+        connector = GrantsPortalConnector(
+            credentials={
+                "authorization_header": "******",
+                "api_key": "demo-key",
+                "sort_by": "openDate",
+                "agencies": ["DOE", "USAID"],
+                "funding_categories": ["Education", "Youth"],
+                "start_record_num": 10,
+            },
+            transport="http",
+            request_session="session",
+        )
+        with mock.patch("funding_bot._perform_json_request") as request:
+            request.return_value = {
+                "data": {
+                    "hitCount": 1,
+                    "oppHits": [
+                        {
+                            "id": "123",
+                            "number": "DOE-42",
+                            "agency": "Department of Education",
+                            "agencyCode": "DOE",
+                            "title": "Student Success Grant",
+                            "openDate": "2026-01-01",
+                            "closeDate": "2026-02-01",
+                            "oppStatus": "posted",
+                            "docType": "Education",
+                            "cfdaList": ["84.123"],
+                        }
+                    ],
+                }
+            }
+
+            result = connector._fetch_remote_result(["education"])
+
+        self.assertEqual("POST", request.call_args.args[0])
+        self.assertEqual("https://api.grants.gov/v1/api/search2", request.call_args.args[1])
+        self.assertEqual("session", request.call_args.kwargs["session"])
+        self.assertEqual("******", request.call_args.kwargs["headers"]["Authorization"])
+        self.assertEqual("demo-key", request.call_args.kwargs["headers"]["X-API-Key"])
+        self.assertEqual("DOE|USAID", request.call_args.kwargs["json_payload"]["agencies"])
+        self.assertEqual("Education|Youth", request.call_args.kwargs["json_payload"]["fundingCategories"])
+        self.assertEqual("Student Success Grant", result["opportunities"][0]["title"])
+        self.assertEqual("grants.gov", result["metadata"]["provider"])
+        self.assertTrue(result["metadata"]["auth_applied"])
+
+    def test_live_csr_connector_requires_credentials_and_normalizes_payload(self):
+        with self.assertRaises(CredentialNotFoundError):
+            CSRNetworkConnector(transport="http")._fetch_remote_result(["csr"])
+
+        connector = CSRNetworkConnector(
+            credentials={"subscriptionKey": "sub-key"},
+            transport="http",
+            request_session="session",
+        )
+        with mock.patch("funding_bot._perform_json_request") as request:
+            request.return_value = {
+                "items": [
+                    {
+                        "funder": {"name": "Corporate Fund", "url": "https://fund.example.org"},
+                        "program_areas": ["Corporate Partnerships"],
+                        "eligibility": ["Nonprofits"],
+                        "tags": "education",
+                        "description": "Description fallback",
+                    }
+                ]
+            }
+
+            result = connector._fetch_remote_result(["csr"])
+
+        self.assertEqual("GET", request.mock_calls[0].args[0])
+        self.assertEqual("sub-key", request.mock_calls[0].kwargs["headers"]["Subscription-Key"])
+        self.assertEqual("Corporate Fund", result["opportunities"][0]["donor_name"])
+        self.assertEqual("Untitled CSR opportunity", result["opportunities"][0]["title"])
+        self.assertEqual("https://fund.example.org", result["opportunities"][0]["portal_url"])
+        self.assertEqual("Description fallback", result["opportunities"][0]["summary"])
+        self.assertEqual("Corporate Partnerships", result["opportunities"][0]["category"])
+
+    def test_live_ngo_directory_connector_deduplicates_and_normalizes_results(self):
+        connector = NGODirectoryConnector()
+        responses = {
+            ("literacy", 0): {
+                "organizations": [
+                    {
+                        "name": "Readers United",
+                        "ein": "12-3456789",
+                        "city": "Boston",
+                        "state": "MA",
+                        "ntee_code": "B90",
+                        "subseccd": "3",
+                    }
+                ],
+                "total_results": 2,
+                "per_page": 1,
+            },
+            ("literacy", 1): {
+                "organizations": [
+                    {
+                        "name": "Readers United",
+                        "ein": "123456789",
+                        "city": "Boston",
+                        "state": "MA",
+                        "raw_ntee_code": "B91",
+                        "sub_name": "Registered charity",
+                    }
+                ],
+                "total_results": 2,
+                "per_page": 1,
+            },
+            ("community engagement", 0): {
+                "organizations": [
+                    {
+                        "organization_name": "Community Library",
+                        "strein": "98-7654321",
+                        "state": "CA",
+                    }
+                ],
+                "total_results": 1,
+                "per_page": 25,
+            },
+        }
+
+        connector._fetch_remote_json = lambda _url, params: responses[(params["q"], params["page"])]
+        result = connector._fetch_remote_result(["literacy", "community engagement"])
+
+        self.assertEqual(2, len(result["opportunities"]))
+        self.assertEqual(3, result["metadata"]["pages_fetched"])
+        self.assertEqual("B90", result["opportunities"][0]["category"])
+        self.assertIn("501(c)(3) organization", result["opportunities"][0]["summary"])
+        self.assertIn("987654321", result["opportunities"][1]["portal_url"])
+
+    def test_foundation_directory_connector_requires_api_key_and_normalizes_rows(self):
+        with self.assertRaises(ConnectorConfigError):
+            FoundationDirectoryConnector()._fetch_remote_result(["foundation"])
+
+        connector = FoundationDirectoryConnector(credentials={"api_key": "fd-key"})
+        connector._fetch_remote_json = lambda _url, _params, headers=None: {
+            "opportunities": [
+                {
+                    "grantmaker_name": "Heritage Foundation",
+                    "recipient": {"name": "Rural Schools"},
+                    "program_name": "Education Access",
+                    "summary": "Support for classroom technology",
+                    "links": {"self": "https://foundation.example.org/grant/1"},
+                    "support_strategy": "Education",
+                }
+            ],
+            "next_page": None,
+        }
+
+        result = connector._fetch_remote_result(["foundation"])
+
+        self.assertEqual("Heritage Foundation", result["opportunities"][0]["donor_name"])
+        self.assertEqual("Education Access", result["opportunities"][0]["title"])
+        self.assertEqual("https://foundation.example.org/grant/1", result["opportunities"][0]["portal_url"])
+        self.assertEqual("Education", result["opportunities"][0]["category"])
 
     def test_call_with_retry_tracks_backoff_and_failure_metrics(self):
         clock = FakeClock()
@@ -440,9 +726,9 @@ class ConnectorCoverageTests(unittest.TestCase):
 
         broken_session = mock.MagicMock()
         broken_session.__enter__.return_value = broken_session
-        broken_session.post.side_effect = Exception("boom")
+        broken_session.post.side_effect = requests.RequestException("boom")
         with mock.patch("funding_bot._build_tls_http_session", return_value=broken_session):
-            with self.assertRaises(Exception):
+            with self.assertRaises(FundingBotError):
                 _default_http_json_client(
                     "https://grants.example.org/opportunities",
                     {"keywords": ["education"]},
@@ -509,11 +795,16 @@ class ConnectorCoverageTests(unittest.TestCase):
                 "grants-portal",
                 "csr-network",
                 "ngo-directory",
+                "foundation-directory",
                 "globalgiving",
                 "kickstarter-for-good",
             }.issubset({connector.connector_slug for connector in builtins})
         )
         self.assertEqual("grants-portal", create_connector("grants-portal").connector_slug)
+        self.assertEqual(
+            "foundation-directory",
+            create_connector("foundation-directory", credentials={"api_key": "demo"}).connector_slug,
+        )
 
         with self.assertRaises(ConnectionSecurityError):
             create_connector("grants-portal", base_url="http://grants.example.org/opportunities")

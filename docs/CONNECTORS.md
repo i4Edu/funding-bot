@@ -7,8 +7,8 @@ keyword/category mappings, and validate the connector from the CLI.
 
 | CLI slug | Class | Source | Default mode |
 | --- | --- | --- | --- |
-| `grants-portal` | `GrantsPortalConnector` | Grants Portal | Demo data unless an `http_client` is supplied |
-| `csr-network` | `CSRNetworkConnector` | CSR Network | Demo data unless an `http_client` is supplied |
+| `grants-portal` | `GrantsPortalConnector` | Grants.gov | Demo by default; live mode uses `transport="http"` plus optional OAuth2/API-key credentials from `GRANTS_GOV_API_CREDENTIALS` |
+| `csr-network` | `CSRNetworkConnector` | Candid Open RFP Opportunities | Demo by default; live mode uses `transport="http"` plus `CSR_NETWORK_API_CREDENTIALS` |
 | `ngo-directory` | `NGODirectoryConnector` | NGO Directory | Demo data unless an `http_client` is supplied |
 
 ## Available keyword mappings
@@ -116,6 +116,14 @@ The command returns JSON with:
 
 If a connector raises an exception, the JSON response includes `status: "error"`
 and an `error` field for troubleshooting.
+
+## Live connector credentials
+
+- `GRANTS_GOV_API_CREDENTIALS` may contain an `api_key`, a pre-issued
+  `access_token`, or an OAuth2 client-credentials document supported by
+  `OAuth2ClientCredentialsVault`.
+- `CSR_NETWORK_API_CREDENTIALS` should contain a Candid
+  `subscription_key`/`api_key`.
 
 ## Fallback and result schema migrations
 

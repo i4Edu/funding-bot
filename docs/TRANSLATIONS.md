@@ -9,12 +9,12 @@ The project currently documents and reviews outreach copy for these locales:
 | Locale code | Language | Status | Notes |
 | --- | --- | --- | --- |
 | `en` | English | Default / fallback | Source copy for every template. |
-| `bn-BD` | Bengali (Bangladesh) | Supported for contributions | Keep a natural Bengali tone; only leave proper nouns and URLs in English. |
+| `bn` | Bengali | Supported for contributions | Keep a natural Bengali tone; only leave proper nouns and URLs in English. |
 
 ### Locale code rules
 
-- Use BCP 47 style locale codes.
-- Use lowercase language codes (`en`, `bn`) and uppercase region codes when present (`bn-BD`).
+- Use BCP 47 style locale codes when adding future locales.
+- Use lowercase language codes for the currently supported outreach locales (`en`, `bn`).
 - Keep English as the fallback source locale.
 - If you add a new locale later, document it in the table above and note whether it is a general language (`fr`) or region-specific variant (`pt-BR`).
 
@@ -62,7 +62,7 @@ Thank you for considering support for {organization_name}.
 To opt out of future outreach, visit {opt_out_url}.
 ```
 
-### Bengali example (`bn-BD`)
+### Bengali example (`bn`)
 
 **Subject**
 
@@ -103,6 +103,7 @@ python -m unittest discover -s tests
 When translation behavior changes, add or update tests in `tests/test_funding_bot.py` to cover:
 
 - successful rendering of the translated subject and body
+- successful rendering of every built-in template for every supported locale
 - placeholder substitution for required fields
 - fallback to the default English template when a translation is missing
 - segment-specific template selection when applicable
@@ -115,8 +116,8 @@ Preview the copy without sending email:
 python funding_bot.py send-outreach \
   --email donor@example.org \
   --name "Example Donor" \
-  --subject "{organization_name}-এর উদ্যোগে আপনার সহযোগিতা কামনা করছি" \
-  --body "প্রিয় {donor_name},\n\n{mission}\n\nভবিষ্যতে এমন বার্তা না চাইলে এখানে দেখুন: {opt_out_url}" \
+  --template-name intro \
+  --locale bn \
   --dry-run
 ```
 
@@ -131,7 +132,7 @@ Check that:
 
 Use this checklist before submitting a PR:
 
-- [ ] Locale code follows the repository convention (`en`, `bn-BD`, `pt-BR`, etc.)
+- [ ] Locale code follows the repository convention (`en`, `bn`, `pt-BR`, etc.)
 - [ ] English source template exists or was updated first
 - [ ] All placeholders are preserved exactly
 - [ ] Tone, grammar, punctuation, and line breaks were reviewed by a fluent speaker
